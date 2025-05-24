@@ -1,1 +1,1 @@
-# time-sync-script
+# time-sync

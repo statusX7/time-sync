@@ -20,6 +20,15 @@ print_error() {
 }
 
 sync_time() {
+  print_info "正在检查 ntpdate 是否安装..."
+  if ! command -v ntpdate &> /dev/null; then
+    print_info "ntpdate 未安装，正在安装..."
+    yum install -y ntpdate
+  else
+    print_info "ntpdate 已安装，检查是否为最新版本..."
+    yum update -y ntpdate
+  fi
+
   print_info "正在设置每30分钟自动同步时间..."
   echo '*/30 * * * * /usr/sbin/ntpdate time.google.com &> /dev/null && echo "时间已同步: $(date)"' > /etc/cron.d/time-sync
   chmod 644 /etc/cron.d/time-sync
@@ -95,23 +104,23 @@ unlock_media() {
 
 show_system_info() {
   print_info "系统基本信息如下："
-  echo -e "\n==================== CPU 信息 ===================="
-  lscpu | grep -E 'Model name|Socket|Thread|Core|MHz|Cache'
+  echo -e "\n\033[1;36m==== 🧠 CPU 信息 ===\033[0m"
+  lscpu | grep -E 'Model name|CPU\(s\):|MHz|Cache' | sed 's/^/  /'
 
-  echo -e "\n==================== 硬盘信息 ===================="
-  df -h | grep -E '^/dev/'
+  echo -e "\n\033[1;36m==== 💽 硬盘使用 ===\033[0m"
+  df -h --total | grep -E 'Filesystem|total' | sed 's/^/  /'
 
-  echo -e "\n==================== 内存信息 ===================="
-  free -h
+  echo -e "\n\033[1;36m==== 🧮 内存与 Swap ===\033[0m"
+  free -h | sed 's/^/  /'
 
-  echo -e "\n==================== 在线时间与负载 ===================="
-  uptime
+  echo -e "\n\033[1;36m==== ⏱️ 在线时间与负载 ===\033[0m"
+  uptime | sed 's/^/  /'
 
-  echo -e "\n==================== 系统版本 ===================="
-  cat /etc/redhat-release 2>/dev/null || cat /etc/os-release
+  echo -e "\n\033[1;36m==== 🖥️ 系统版本 ===\033[0m"
+  (cat /etc/redhat-release 2>/dev/null || cat /etc/os-release) | sed 's/^/  /'
 
-  echo -e "\n==================== 虚拟化支持 ===================="
-  egrep -c '(vmx|svm)' /proc/cpuinfo && echo "(0 表示不支持虚拟化)"
+  echo -e "\n\033[1;36m==== ⚙️ 虚拟化支持 ===\033[0m"
+  grep -E -c 'vmx|svm' /proc/cpuinfo | awk '{print "  虚拟化支持线程数: "$1}'
 }
 
 yabs_test() {

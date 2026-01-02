@@ -300,6 +300,86 @@ uninstall_nezha() {
 # ========== 12. IP 质量检测 ==========
 check_ip_quality() { bash <(curl -Ls IP.Check.Place); }
 
+# ========== 13. IPv6 一键开启/关闭 ==========
+manage_ipv6() {
+  echo_color "IPv6 一键开启/关闭"
+  echo_warn  "提示：开启 IPv6 只是允许系统使用 IPv6；是否获得 IPv6 地址取决于服务商是否分配/路由。"
+
+  # /proc 是否存在（模块/内核支持检查）
+  if [ ! -d /proc/sys/net/ipv6 ]; then
+    echo_warn "检测到 /proc/sys/net/ipv6 不存在，尝试加载 ipv6 模块..."
+    modprobe ipv6 2>/dev/null || true
+  fi
+  if [ ! -d /proc/sys/net/ipv6 ]; then
+    echo_error "当前内核/环境不支持 IPv6（或已被禁用到无法加载）。"
+    return 1
+  fi
+
+  local cur_all cur_def cur_lo
+  cur_all="$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo "N/A")"
+  cur_def="$(sysctl -n net.ipv6.conf.default.disable_ipv6 2>/dev/null || echo "N/A")"
+  cur_lo="$(sysctl -n net.ipv6.conf.lo.disable_ipv6 2>/dev/null || echo "N/A")"
+
+  echo_color "当前状态："
+  echo "  all.disable_ipv6     = $cur_all  (0=启用, 1=禁用)"
+  echo "  default.disable_ipv6 = $cur_def  (0=启用, 1=禁用)"
+  echo "  lo.disable_ipv6      = $cur_lo   (0=启用, 1=禁用)"
+  echo
+
+  echo "1) 一键开启 IPv6"
+  echo "2) 一键关闭 IPv6"
+  echo "3) 查看 IPv6 地址（ip -6 addr）"
+  echo "0) 返回"
+  read -p "请选择: " ipv6_opt
+
+  local conf="/etc/sysctl.d/99-server-toolkit-ipv6.conf"
+  case "$ipv6_opt" in
+    1)
+      echo_color "正在开启 IPv6（立即生效 + 持久化）..."
+      sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1 || true
+      sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1 || true
+      sysctl -w net.ipv6.conf.lo.disable_ipv6=0 >/dev/null 2>&1 || true
+
+      cat > "$conf" <<EOF
+# server-toolkit: ipv6
+net.ipv6.conf.all.disable_ipv6=0
+net.ipv6.conf.default.disable_ipv6=0
+net.ipv6.conf.lo.disable_ipv6=0
+EOF
+      sysctl --system >/dev/null 2>&1 || sysctl -p "$conf" >/dev/null 2>&1 || true
+
+      echo_color "IPv6 已设置为开启。"
+      echo_warn  "如仍未分配 IPv6 地址，请检查服务商是否提供 IPv6 / 是否需要在面板开启 / 是否有 RA 或静态 IPv6。"
+      ;;
+    2)
+      echo_color "正在关闭 IPv6（立即生效 + 持久化）..."
+      sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null 2>&1 || true
+      sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null 2>&1 || true
+      sysctl -w net.ipv6.conf.lo.disable_ipv6=1 >/dev/null 2>&1 || true
+
+      cat > "$conf" <<EOF
+# server-toolkit: ipv6
+net.ipv6.conf.all.disable_ipv6=1
+net.ipv6.conf.default.disable_ipv6=1
+net.ipv6.conf.lo.disable_ipv6=1
+EOF
+      sysctl --system >/dev/null 2>&1 || sysctl -p "$conf" >/dev/null 2>&1 || true
+
+      echo_color "IPv6 已设置为关闭。"
+      ;;
+    3)
+      echo_color "当前 IPv6 地址信息："
+      ip -6 addr || true
+      ;;
+    0)
+      return 0
+      ;;
+    *)
+      echo_error "无效选项"
+      ;;
+  esac
+}
+
 # ========== 菜单 ==========
 require_root
 
@@ -317,6 +397,7 @@ while true; do
   echo "10) 设置定时重启"
   echo "11) 卸载哪吒面板"
   echo "12) IP 质量检测"
+  echo "13) IPv6 一键开启/关闭"
   echo "0) 退出"
   read -p "请选择一个操作: " option
 
@@ -333,6 +414,7 @@ while true; do
     10) setup_cron_reboot;;
     11) uninstall_nezha;;
     12) check_ip_quality;;
+    13) manage_ipv6;;
     0) echo_color "退出"; exit 0;;
     *) echo_error "无效的选项，请重新输入";;
   esac

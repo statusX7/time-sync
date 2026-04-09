@@ -1,10 +1,13 @@
 #!/bin/bash
 set -u
 
+SERVER_TOOLKIT_VERSION="v1.3"
+
 # ========== 彩色输出 ==========
 echo_color() { echo -e "\e[1;32m$1\e[0m"; }
 echo_warn()  { echo -e "\e[1;33m$1\e[0m"; }
 echo_error() { echo -e "\e[1;31m$1\e[0m"; }
+echo_info()  { echo -e "\e[1;36m$1\e[0m"; }
 
 # ========== 基础检测 ==========
 require_root() {
@@ -17,7 +20,6 @@ require_root() {
 is_redhat() { [ -f /etc/redhat-release ]; }
 
 ssh_service_name() {
-  # Debian/Ubuntu 通常是 ssh；RHEL/CentOS 通常是 sshd
   if systemctl list-unit-files | grep -q '^ssh\.service'; then
     echo "ssh"
   else
@@ -65,7 +67,6 @@ time_sync() {
 
   ntpdate time.google.com || echo_warn "ntpdate 同步失败（可能被阻断/解析异常），稍后可再试。"
 
-  # 幂等：加 marker，避免重复写入
   local marker="# server-toolkit: time_sync"
   crontab -l 2>/dev/null | grep -v "$marker" > /tmp/cron.tmp || true
   echo "*/30 * * * * /usr/sbin/ntpdate time.google.com >/dev/null 2>&1 $marker" >> /tmp/cron.tmp
@@ -105,7 +106,6 @@ secure_ssh() {
 
   cp "$SSH_CONFIG_FILE" "${SSH_CONFIG_FILE}.bak.$(date +%F_%T)"
 
-  # 安全写入：存在就替换，不存在就追加
   set_kv() {
     local key="$1" val="$2" file="$3"
     if grep -Eq "^[#[:space:]]*$key[[:space:]]+" "$file"; then
@@ -115,7 +115,6 @@ secure_ssh() {
     fi
   }
 
-  # Protocol 2 在新 OpenSSH 上通常默认就是 2（可能被忽略），但写上无害
   set_kv "Protocol" "2" "$SSH_CONFIG_FILE"
   set_kv "LoginGraceTime" "30" "$SSH_CONFIG_FILE"
   set_kv "MaxAuthTries" "3" "$SSH_CONFIG_FILE"
@@ -160,42 +159,73 @@ EOF
   echo_color "Fail2Ban 安装并配置完成（maxretry=3，bantime=3600s）。"
 }
 
-# ========== 6. 修改 SSH 端口和密码（重点修复） ==========
+# ========== 6. 修改 SSH 端口和密码 ==========
 change_ssh_port_password() {
   echo_color "请不要关闭当前 SSH 连接，另开终端测试新连接是否成功！"
 
   local SSH_CONFIG_FILE="/etc/ssh/sshd_config"
   [ -f "$SSH_CONFIG_FILE" ] || { echo_error "找不到 $SSH_CONFIG_FILE"; return 1; }
 
-  read -p "请输入新的 SSH 端口 (1-65535): " new_port
-  if ! [[ "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -lt 1 ] || [ "$new_port" -gt 65535 ]; then
-    echo_error "端口不合法。"
-    return 1
+  echo "1) 只修改 SSH 端口"
+  echo "2) 只修改 root 密码"
+  echo "3) 同时修改端口和密码"
+  echo "0) 取消"
+  read -p "请选择: " mode
+
+  case "$mode" in
+    0)
+      echo_warn "已取消修改。"
+      return 0
+      ;;
+    1|2|3)
+      ;;
+    *)
+      echo_error "无效选项。"
+      return 1
+      ;;
+  esac
+
+  local new_port=""
+  local new_password=""
+
+  if [[ "$mode" == "1" || "$mode" == "3" ]]; then
+    read -p "请输入新的 SSH 端口 (1-65535，输入 q 取消): " new_port
+    if [[ "$new_port" == "q" || "$new_port" == "Q" ]]; then
+      echo_warn "已取消修改。"
+      return 0
+    fi
+    if ! [[ "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -lt 1 ] || [ "$new_port" -gt 65535 ]; then
+      echo_error "端口不合法。"
+      return 1
+    fi
+
+    if ss -lnt | awk '{print $4}' | grep -Eq "[:.]${new_port}$"; then
+      echo_error "端口 $new_port 已被占用，请换一个。"
+      return 1
+    fi
   fi
 
-  # 端口占用检查
-  if ss -lnt | awk '{print $4}' | grep -Eq "[:.]${new_port}$"; then
-    echo_error "端口 $new_port 已被占用，请换一个。"
-    return 1
-  fi
-
-  read -s -p "请输入 root 新密码: " new_password
-  echo
-  if [ -z "$new_password" ]; then
-    echo_error "密码不能为空。"
-    return 1
+  if [[ "$mode" == "2" || "$mode" == "3" ]]; then
+    read -s -p "请输入 root 新密码（直接回车取消）: " new_password
+    echo
+    if [ -z "$new_password" ]; then
+      echo_warn "密码为空，已取消本次密码修改。"
+      if [[ "$mode" == "2" ]]; then
+        return 0
+      fi
+    fi
   fi
 
   cp "$SSH_CONFIG_FILE" "${SSH_CONFIG_FILE}.bak.$(date +%F_%T)"
 
-  # 更稳的 Port 修改：替换任何 Port 行（含注释/空格），不存在则追加
-  if grep -Eq "^[#[:space:]]*Port[[:space:]]+" "$SSH_CONFIG_FILE"; then
-    sed -i -E "s|^[#[:space:]]*Port[[:space:]]+.*|Port ${new_port}|g" "$SSH_CONFIG_FILE"
-  else
-    echo "Port ${new_port}" >> "$SSH_CONFIG_FILE"
+  if [[ -n "$new_port" ]]; then
+    if grep -Eq "^[#[:space:]]*Port[[:space:]]+" "$SSH_CONFIG_FILE"; then
+      sed -i -E "s|^[#[:space:]]*Port[[:space:]]+.*|Port ${new_port}|g" "$SSH_CONFIG_FILE"
+    else
+      echo "Port ${new_port}" >> "$SSH_CONFIG_FILE"
+    fi
   fi
 
-  # 提醒：如果启用了 sshd_config.d，里面还有 Port 22 可能导致同时监听
   if [ -d /etc/ssh/sshd_config.d ]; then
     if grep -RInE "^[#[:space:]]*Port[[:space:]]+22\b" /etc/ssh/sshd_config.d 2>/dev/null | head -n 1 >/dev/null; then
       echo_warn "检测到 /etc/ssh/sshd_config.d 中可能存在 Port 22，可能导致同时监听旧端口。"
@@ -208,13 +238,21 @@ change_ssh_port_password() {
     return 1
   fi
 
-  echo "root:${new_password}" | chpasswd || { echo_error "修改密码失败"; return 1; }
+  if [[ -n "$new_password" ]]; then
+    echo "root:${new_password}" | chpasswd || { echo_error "修改密码失败"; return 1; }
+  fi
 
-  restart_ssh_service || return 1
+  if [[ -n "$new_port" ]]; then
+    restart_ssh_service || return 1
+    echo_color "SSH 端口已更新为：$new_port"
+    echo_color "请在新终端测试：ssh -p ${new_port} root@你的服务器IP"
+  fi
 
-  echo_color "SSH 端口和密码已更新。"
-  echo_color "请在新终端测试：ssh -p ${new_port} root@你的服务器IP"
-  echo_warn  "确认新端口可登录后，再考虑放行/关闭旧端口（若仍在监听）。"
+  if [[ -n "$new_password" ]]; then
+    echo_color "root 密码已更新。"
+  fi
+
+  echo_warn "确认新连接正常后，再关闭当前 SSH 会话。"
 }
 
 # ========== 7. 流媒体解锁检测 ==========
@@ -283,36 +321,79 @@ setup_cron_reboot() {
   echo_color "已设置每隔 $interval 小时自动重启系统。"
 }
 
-# ========== 11. 卸载哪吒面板 ==========
-uninstall_nezha() {
-  echo_color "正在卸载哪吒面板..."
-  systemctl stop nezha-agent 2>/dev/null || true
-  systemctl stop nezha-dashboard 2>/dev/null || true
-  systemctl disable nezha-agent 2>/dev/null || true
-  systemctl disable nezha-dashboard 2>/dev/null || true
-  rm -f /etc/systemd/system/nezha-agent.service
-  rm -f /etc/systemd/system/nezha-dashboard.service
-  rm -rf /opt/nezha /etc/nezha /var/log/nezha
-  systemctl daemon-reload
-  echo_color "哪吒面板已完全移除"
+# ========== 11. 哪吒面板管理 ==========
+manage_nezha() {
+  echo "1) 重启哪吒面板"
+  echo "2) 卸载哪吒面板"
+  echo "0) 返回"
+  read -p "请选择: " nezha_opt
+
+  case "$nezha_opt" in
+    1)
+      echo_color "正在重启哪吒面板..."
+      systemctl restart nezha-agent 2>/dev/null || true
+      systemctl restart nezha-dashboard 2>/dev/null || true
+      echo_color "哪吒相关服务已尝试重启。"
+      ;;
+    2)
+      echo_color "正在卸载哪吒面板..."
+      systemctl stop nezha-agent 2>/dev/null || true
+      systemctl stop nezha-dashboard 2>/dev/null || true
+      systemctl disable nezha-agent 2>/dev/null || true
+      systemctl disable nezha-dashboard 2>/dev/null || true
+      rm -f /etc/systemd/system/nezha-agent.service
+      rm -f /etc/systemd/system/nezha-dashboard.service
+      rm -rf /opt/nezha /etc/nezha /var/log/nezha
+      systemctl daemon-reload
+      echo_color "哪吒面板已完全移除"
+      ;;
+    0)
+      return 0
+      ;;
+    *)
+      echo_error "无效选项"
+      ;;
+  esac
 }
 
 # ========== 12. IP 质量检测 ==========
 check_ip_quality() { bash <(curl -Ls IP.Check.Place); }
 
 # ========== 13. IPv6 一键开启/关闭 ==========
+update_grub_ipv6_param() {
+  local mode="$1"
+  local grub_file="/etc/default/grub"
+
+  [ -f "$grub_file" ] || return 0
+
+  if [[ "$mode" == "disable" ]]; then
+    if grep -q '^GRUB_CMDLINE_LINUX=' "$grub_file"; then
+      if ! grep -q 'ipv6.disable=1' "$grub_file"; then
+        sed -i 's/^GRUB_CMDLINE_LINUX="/GRUB_CMDLINE_LINUX="ipv6.disable=1 /' "$grub_file"
+      fi
+    else
+      echo 'GRUB_CMDLINE_LINUX="ipv6.disable=1"' >> "$grub_file"
+    fi
+  else
+    sed -i 's/ipv6.disable=1//g' "$grub_file"
+    sed -i 's/  */ /g' "$grub_file"
+    sed -i 's/="\s*/="/g' "$grub_file"
+  fi
+
+  if command -v update-grub >/dev/null 2>&1; then
+    update-grub >/dev/null 2>&1 || true
+  elif command -v grub2-mkconfig >/dev/null 2>&1; then
+    grub2-mkconfig -o /boot/grub2/grub.cfg >/dev/null 2>&1 || true
+  fi
+}
+
 manage_ipv6() {
   echo_color "IPv6 一键开启/关闭"
-  echo_warn  "提示：开启 IPv6 只是允许系统使用 IPv6；是否获得 IPv6 地址取决于服务商是否分配/路由。"
+  echo_warn  "提示：关闭 IPv6 已加入更稳的持久化逻辑（sysctl + GRUB 参数）。"
 
-  # /proc 是否存在（模块/内核支持检查）
   if [ ! -d /proc/sys/net/ipv6 ]; then
     echo_warn "检测到 /proc/sys/net/ipv6 不存在，尝试加载 ipv6 模块..."
     modprobe ipv6 2>/dev/null || true
-  fi
-  if [ ! -d /proc/sys/net/ipv6 ]; then
-    echo_error "当前内核/环境不支持 IPv6（或已被禁用到无法加载）。"
-    return 1
   fi
 
   local cur_all cur_def cur_lo
@@ -346,10 +427,11 @@ net.ipv6.conf.all.disable_ipv6=0
 net.ipv6.conf.default.disable_ipv6=0
 net.ipv6.conf.lo.disable_ipv6=0
 EOF
+      update_grub_ipv6_param "enable"
       sysctl --system >/dev/null 2>&1 || sysctl -p "$conf" >/dev/null 2>&1 || true
 
       echo_color "IPv6 已设置为开启。"
-      echo_warn  "如仍未分配 IPv6 地址，请检查服务商是否提供 IPv6 / 是否需要在面板开启 / 是否有 RA 或静态 IPv6。"
+      echo_warn  "如之前通过 GRUB 完全禁用过，建议重启一次系统确保彻底恢复。"
       ;;
     2)
       echo_color "正在关闭 IPv6（立即生效 + 持久化）..."
@@ -363,9 +445,11 @@ net.ipv6.conf.all.disable_ipv6=1
 net.ipv6.conf.default.disable_ipv6=1
 net.ipv6.conf.lo.disable_ipv6=1
 EOF
+      update_grub_ipv6_param "disable"
       sysctl --system >/dev/null 2>&1 || sysctl -p "$conf" >/dev/null 2>&1 || true
 
       echo_color "IPv6 已设置为关闭。"
+      echo_warn  "为确保重启后仍保持关闭，已同时写入 GRUB 参数。建议重启一次系统。"
       ;;
     3)
       echo_color "当前 IPv6 地址信息："
@@ -380,11 +464,186 @@ EOF
   esac
 }
 
+# ========== 14. XrayR 资源限制管理 ==========
+xrayr_limit_manage() {
+  local SERVICE_CANDIDATES=("XrayR.service" "xrayr.service")
+  local DEFAULT_CPU_LIMIT_PER_CORE=80
+  local DEFAULT_MEM_LIMIT_PERCENT=90
+  local MIN_MEM_LIMIT_MB=256
+
+  local SERVICE=""
+  local CPU_CORES=1
+  local MEM_TOTAL_MB=0
+
+  find_xrayr_service() {
+    for svc in "${SERVICE_CANDIDATES[@]}"; do
+      if systemctl list-unit-files | grep -q "^${svc}"; then
+        SERVICE="$svc"
+        return 0
+      fi
+    done
+    return 1
+  }
+
+  load_xrayr_system_info() {
+    MEM_TOTAL_MB=$(( $(awk '/MemTotal/ {print $2}' /proc/meminfo) / 1024 ))
+    CPU_CORES=$(nproc --all 2>/dev/null || grep -c ^processor /proc/cpuinfo || echo 1)
+    [[ -n "${CPU_CORES}" && "${CPU_CORES}" -ge 1 ]] || CPU_CORES=1
+  }
+
+  xrayr_dropin_dir() {
+    echo "/etc/systemd/system/${SERVICE}.d"
+  }
+
+  xrayr_dropin_file() {
+    echo "$(xrayr_dropin_dir)/resource-limit.conf"
+  }
+
+  xrayr_write_limit_file() {
+    local cpu_per_core="$1"
+    local mem_percent="$2"
+
+    [[ "$cpu_per_core" =~ ^[0-9]+$ ]] || { echo_error "CPU 百分比必须是整数"; return 1; }
+    [[ "$mem_percent" =~ ^[0-9]+$ ]] || { echo_error "内存百分比必须是整数"; return 1; }
+
+    if (( cpu_per_core < 1 || cpu_per_core > 100 )); then
+      echo_error "CPU 百分比范围必须是 1-100"
+      return 1
+    fi
+
+    if (( mem_percent < 1 || mem_percent > 100 )); then
+      echo_error "内存百分比范围必须是 1-100"
+      return 1
+    fi
+
+    local cpu_quota=$((CPU_CORES * cpu_per_core))
+    local mem_limit_mb=$((MEM_TOTAL_MB * mem_percent / 100))
+
+    if (( mem_limit_mb < MIN_MEM_LIMIT_MB )); then
+      mem_limit_mb=$MIN_MEM_LIMIT_MB
+    fi
+
+    mkdir -p "$(xrayr_dropin_dir)"
+
+    cat > "$(xrayr_dropin_file)" <<EOF
+[Service]
+CPUAccounting=true
+MemoryAccounting=true
+CPUQuota=${cpu_quota}%
+MemoryLimit=${mem_limit_mb}M
+EOF
+
+    echo_color "已写入限制文件: $(xrayr_dropin_file)"
+    echo_info "CPU 核心数: ${CPU_CORES}"
+    echo_info "总内存: ${MEM_TOTAL_MB} MB"
+    echo_info "每核 CPU 限制: ${cpu_per_core}%"
+    echo_info "总 CPUQuota: ${cpu_quota}%"
+    echo_info "内存限制: ${mem_percent}% -> ${mem_limit_mb}M"
+
+    systemctl daemon-reload
+    systemctl restart "${SERVICE}"
+    echo_color "已重启 ${SERVICE}"
+  }
+
+  xrayr_show_current_limit() {
+    echo_info "服务名: ${SERVICE}"
+    echo "================ 当前限制 ================"
+    systemctl show "${SERVICE}" \
+      -p CPUAccounting \
+      -p MemoryAccounting \
+      -p CPUQuotaPerSecUSec \
+      -p MemoryLimit
+    echo "========================================="
+
+    if [[ -f "$(xrayr_dropin_file)" ]]; then
+      echo
+      echo_info "当前 drop-in 配置文件内容:"
+      cat "$(xrayr_dropin_file)"
+    else
+      echo
+      echo_warn "当前未发现自定义限制文件: $(xrayr_dropin_file)"
+    fi
+  }
+
+  xrayr_restore_default() {
+    if [[ -f "$(xrayr_dropin_file)" ]]; then
+      rm -f "$(xrayr_dropin_file)"
+      systemctl daemon-reload
+      systemctl restart "${SERVICE}"
+      echo_color "已恢复默认（删除资源限制）"
+    else
+      echo_warn "未发现限制文件，无需恢复"
+    fi
+  }
+
+  xrayr_apply_default_limit() {
+    xrayr_write_limit_file "$DEFAULT_CPU_LIMIT_PER_CORE" "$DEFAULT_MEM_LIMIT_PERCENT"
+  }
+
+  xrayr_apply_custom_cpu() {
+    local cpu_per_core
+    read -r -p "请输入每核 CPU 百分比（1-100，例如 80）: " cpu_per_core
+    xrayr_write_limit_file "$cpu_per_core" "$DEFAULT_MEM_LIMIT_PERCENT"
+  }
+
+  xrayr_apply_custom_mem() {
+    local mem_percent
+    read -r -p "请输入内存百分比（1-100，例如 90）: " mem_percent
+    xrayr_write_limit_file "$DEFAULT_CPU_LIMIT_PER_CORE" "$mem_percent"
+  }
+
+  xrayr_apply_custom_both() {
+    local cpu_per_core mem_percent
+    read -r -p "请输入每核 CPU 百分比（1-100，例如 80）: " cpu_per_core
+    read -r -p "请输入内存百分比（1-100，例如 90）: " mem_percent
+    xrayr_write_limit_file "$cpu_per_core" "$mem_percent"
+  }
+
+  if ! find_xrayr_service; then
+    echo_error "未找到 XrayR 的 systemd 服务"
+    echo "你可以手动查看：systemctl list-unit-files | grep -i xray"
+    return 1
+  fi
+
+  load_xrayr_system_info
+
+  while true; do
+    cat <<EOF
+================ XrayR 资源限制管理 ================
+服务名: ${SERVICE}
+CPU核心数: ${CPU_CORES}
+总内存: ${MEM_TOTAL_MB} MB
+
+1) 查看当前限制
+2) 一键应用默认限制（CPU每核80%，内存90%）
+3) 一键恢复默认（删除限制）
+4) 自定义 CPU 百分比（内存保持默认90%）
+5) 自定义内存百分比（CPU保持默认每核80%）
+6) 自定义 CPU + 内存百分比
+0) 返回
+===================================================
+EOF
+    read -r -p "请选择操作: " opt
+    echo
+    case "$opt" in
+      1) xrayr_show_current_limit ;;
+      2) xrayr_apply_default_limit ;;
+      3) xrayr_restore_default ;;
+      4) xrayr_apply_custom_cpu ;;
+      5) xrayr_apply_custom_mem ;;
+      6) xrayr_apply_custom_both ;;
+      0) return 0 ;;
+      *) echo_warn "无效选项" ;;
+    esac
+    echo
+  done
+}
+
 # ========== 菜单 ==========
 require_root
 
 while true; do
-  echo_color "\n=============== 服务器工具包菜单 ==============="
+  echo_color "\n=============== 服务器工具包菜单 ${SERVER_TOOLKIT_VERSION} ==============="
   echo "1) 时间同步"
   echo "2) 关闭防火墙"
   echo "3) 关闭SELinux"
@@ -395,9 +654,10 @@ while true; do
   echo "8) 显示服务器基本信息"
   echo "9) YABS 测试"
   echo "10) 设置定时重启"
-  echo "11) 卸载哪吒面板"
+  echo "11) 哪吒面板管理（重启/卸载）"
   echo "12) IP 质量检测"
   echo "13) IPv6 一键开启/关闭"
+  echo "14) XrayR CPU/RAM 限制管理"
   echo "0) 退出"
   read -p "请选择一个操作: " option
 
@@ -412,9 +672,10 @@ while true; do
     8) show_system_info;;
     9) yabs_test;;
     10) setup_cron_reboot;;
-    11) uninstall_nezha;;
+    11) manage_nezha;;
     12) check_ip_quality;;
     13) manage_ipv6;;
+    14) xrayr_limit_manage;;
     0) echo_color "退出"; exit 0;;
     *) echo_error "无效的选项，请重新输入";;
   esac

@@ -3,21 +3,18 @@ set -euo pipefail
 
 ############################################
 # DoH Manager PRO (All-in-One + allowlist.txt)
-# Version: v2.0
+# Version: v2.1
 # mosdns-x + unbound + nginx + acme.sh
 #
-# ✅ v2.0 新增：
-# 1) 明确版本号
-# 2) 启动服务
-# 3) 停止服务
-# 4) 重启服务
-# 5) 彻底卸载
+# ✅ v2.1 修复：
+# 1) 修复 bash 数组长度判断 bad substitution 问题
+# 2) 保留 v2.0 的启动/停止/重启/彻底卸载功能
 ############################################
 
 # ==========================================================
 # 固定路径（与原部署脚本一致）
 # ==========================================================
-SCRIPT_VERSION="v2.0"
+SCRIPT_VERSION="v2.1"
 
 MOSDNS_USER="mosdns"
 CONF_DIR="/etc/mosdns-x"
@@ -36,7 +33,6 @@ NGINX_LINK_DIR="/etc/nginx/sites-enabled"
 STATE_FILE="/etc/mosdns-x/doh-manager-pro.state"
 LOG_FILE="/var/log/doh-manager-pro.log"
 
-# allowlist.txt（大规模白名单文件）
 DEFAULT_ALLOWLIST_FILE="/etc/mosdns-x/allowlist.txt"
 
 # ========== 彩色输出 ==========
@@ -68,7 +64,7 @@ backup_file() {
 }
 
 # ==========================================================
-# ✅ 开源安全默认参数（首次运行写入 STATE_FILE）
+# 开源安全默认参数（首次运行写入 STATE_FILE）
 # ==========================================================
 DEFAULT_DOMAIN="example.com"
 DEFAULT_DOH_PATH="/dns-query"
@@ -199,7 +195,7 @@ load_state() {
   ALLOWLIST_FILE="${ALLOWLIST_FILE:-${DEFAULT_ALLOWLIST_FILE}}"
   NGINX_SSL_DIR="/etc/nginx/ssl/${DOMAIN}"
 
-  if [[ "${#UPSTREAM_DOT[@]:-0}" -le 0 ]]; then
+  if (( ${#UPSTREAM_DOT[@]} <= 0 )); then
     UPSTREAM_DOT=("${DEFAULT_UPSTREAM_DOT[@]}")
   fi
 
@@ -223,7 +219,8 @@ load_state() {
 
   SYNC_ENABLE="${SYNC_ENABLE:-${DEFAULT_SYNC_ENABLE}}"
   SYNC_CERTS="${SYNC_CERTS:-${DEFAULT_SYNC_CERTS}}"
-  if [[ "${#PEERS[@]:-0}" -le 0 ]]; then
+
+  if (( ${#PEERS[@]} <= 0 )); then
     PEERS=("${DEFAULT_PEERS[@]}")
   fi
 }
@@ -1316,39 +1313,39 @@ sync_push_to_peers() {
         continue
       }
 
-    for f in "${files_to_sync[@]}"; do
-      if [[ -f "${f}" ]]; then
-        rsync -az -e "ssh -o StrictHostKeyChecking=no -o ConnectTimeout=6" "${f}" "${peer}:${f}" >/dev/null 2>&1 || {
-          c_warn "同步失败：${peer} -> ${f}"
+      for f in "${files_to_sync[@]}"; do
+        if [[ -f "${f}" ]]; then
+          rsync -az -e "ssh -o StrictHostKeyChecking=no -o ConnectTimeout=6" "${f}" "${peer}:${f}" >/dev/null 2>&1 || {
+            c_warn "同步失败：${peer} -> ${f}"
+            continue
+          }
+        fi
+      done
+
+      if [[ "${SYNC_CERTS}" == "yes" ]]; then
+        if [[ -d "${NGINX_SSL_DIR}" ]]; then
+          rsync -az -e "ssh -o StrictHostKeyChecking=no -o ConnectTimeout=6" "${NGINX_SSL_DIR}/" "${peer}:${NGINX_SSL_DIR}/" >/dev/null 2>&1 || {
+            c_warn "证书同步失败：${peer}"
+          }
+        fi
+      fi
+
+      ssh -o StrictHostKeyChecking=no -o ConnectTimeout=6 "${peer}" "\
+        systemctl daemon-reload || true; \
+        ln -sf ${nginx_site} ${NGINX_LINK_DIR}/doh_${DOMAIN}.conf && \
+        nginx -t && \
+        systemctl restart unbound || true; \
+        systemctl restart mosdns || true; \
+        systemctl reload nginx || systemctl restart nginx || true" >/dev/null 2>&1 || {
+          c_warn "对端重载失败：${peer}"
           continue
         }
-      fi
+
+      c_ok "同步完成：${peer}"
+      log_action "sync push done -> ${peer}"
     done
 
-    if [[ "${SYNC_CERTS}" == "yes" ]]; then
-      if [[ -d "${NGINX_SSL_DIR}" ]]; then
-        rsync -az -e "ssh -o StrictHostKeyChecking=no -o ConnectTimeout=6" "${NGINX_SSL_DIR}/" "${peer}:${NGINX_SSL_DIR}/" >/dev/null 2>&1 || {
-          c_warn "证书同步失败：${peer}"
-        }
-      fi
-    fi
-
-    ssh -o StrictHostKeyChecking=no -o ConnectTimeout=6 "${peer}" "\
-      systemctl daemon-reload || true; \
-      ln -sf ${nginx_site} ${NGINX_LINK_DIR}/doh_${DOMAIN}.conf && \
-      nginx -t && \
-      systemctl restart unbound || true; \
-      systemctl restart mosdns || true; \
-      systemctl reload nginx || systemctl restart nginx || true" >/dev/null 2>&1 || {
-        c_warn "对端重载失败：${peer}"
-        continue
-      }
-
-    c_ok "同步完成：${peer}"
-    log_action "sync push done -> ${peer}"
-  done
-
-  c_ok "所有对端同步流程结束"
+    c_ok "所有对端同步流程结束"
 }
 
 # ==========================================================

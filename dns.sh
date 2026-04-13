@@ -3,19 +3,19 @@ set -euo pipefail
 
 ############################################
 # DoH Manager PRO (All-in-One + allowlist.txt)
-# Version: v2.2
+# Version: v2.3
 #
-# v2.2 更新：
-# 1) 删除双机同步全部内容
-# 2) 新增快速初始化向导（DOMAIN / DOH_PATH / allowlist.txt）
-# 3) 启动时显示安装状态与运行状态
-# 4) 简化 UI，保留中英文说明
+# v2.3 更新：
+# 1) 取消中英文互译
+# 2) 首次运行自动询问是否进入快速初始化向导
+# 3) 应用前自动检查 DOMAIN 证书是否存在
+# 4) 快速初始化向导初始化后自动尝试签发证书
 ############################################
 
 # ==========================================================
-# 基础信息 / Basic
+# 基础信息
 # ==========================================================
-SCRIPT_VERSION="v2.2"
+SCRIPT_VERSION="v2.3"
 
 MOSDNS_USER="mosdns"
 CONF_DIR="/etc/mosdns-x"
@@ -36,7 +36,7 @@ LOG_FILE="/var/log/doh-manager-pro.log"
 DEFAULT_ALLOWLIST_FILE="/etc/mosdns-x/allowlist.txt"
 
 # ==========================================================
-# 默认参数 / Defaults
+# 默认参数
 # ==========================================================
 DEFAULT_DOMAIN="example.com"
 DEFAULT_DOH_PATH="/dns-query"
@@ -69,7 +69,7 @@ TEMPLATE_404='<!doctype html><html><head><meta charset="utf-8"><meta name="viewp
 TEMPLATE_MINIMAL='<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Welcome</title></head><body>Welcome</body></html>'
 
 # ==========================================================
-# 当前参数 / Runtime state
+# 当前参数
 # ==========================================================
 DOMAIN=""
 DOH_PATH=""
@@ -95,9 +95,10 @@ NGX_RPS=""
 NGX_BURST=""
 
 NGINX_SSL_DIR=""
+FIRST_RUN="no"
 
 # ==========================================================
-# 输出 / UI
+# 输出
 # ==========================================================
 c_ok()   { echo -e "\033[1;32m[OK]\033[0m $*"; }
 c_warn() { echo -e "\033[1;33m[!]\033[0m  $*"; }
@@ -106,7 +107,7 @@ c_info() { echo -e "\033[1;36m[i]\033[0m  $*"; }
 
 need_root() {
   if [[ "${EUID}" -ne 0 ]]; then
-    c_err "请使用 root 运行 / Please run as root"
+    c_err "请使用 root 运行"
     exit 1
   fi
 }
@@ -121,7 +122,7 @@ backup_file() {
   local f="$1"
   if [[ -f "${f}" ]]; then
     cp -a "${f}" "${f}.bak.$(date +%Y%m%d_%H%M%S)"
-    c_ok "已备份 / Backed up: ${f}"
+    c_ok "已备份: ${f}"
     log_action "backup ${f}"
   fi
 }
@@ -130,24 +131,25 @@ remove_if_exists() {
   local path="$1"
   if [[ -e "${path}" || -L "${path}" ]]; then
     rm -rf "${path}"
-    c_ok "已删除 / Removed: ${path}"
+    c_ok "已删除: ${path}"
   else
-    c_warn "不存在，跳过 / Not found, skipped: ${path}"
+    c_warn "不存在，跳过: ${path}"
   fi
 }
 
 pause_enter() {
   echo
-  read -r -p "按回车继续 / Press Enter to continue..." _
+  read -r -p "按回车继续..." _
 }
 
 # ==========================================================
-# 状态文件 / State file
+# 状态文件
 # ==========================================================
 ensure_state_file() {
   mkdir -p "$(dirname "${STATE_FILE}")"
   if [[ ! -f "${STATE_FILE}" ]]; then
-    c_warn "未发现状态文件，初始化 / State file missing, initializing: ${STATE_FILE}"
+    FIRST_RUN="yes"
+    c_warn "未发现状态文件，开始初始化: ${STATE_FILE}"
     log_action "init state file ${STATE_FILE}"
     {
       echo "DOMAIN=\"${DEFAULT_DOMAIN}\""
@@ -178,7 +180,7 @@ ensure_state_file() {
       echo "NGX_RPS=\"${DEFAULT_NGX_RPS}\""
       echo "NGX_BURST=\"${DEFAULT_NGX_BURST}\""
     } > "${STATE_FILE}"
-    c_ok "初始化完成 / Initialized"
+    c_ok "初始化完成"
   fi
 }
 
@@ -243,12 +245,12 @@ save_state() {
     echo "NGX_BURST=\"${NGX_BURST}\""
   } > "${STATE_FILE}"
 
-  c_ok "已保存状态 / State saved: ${STATE_FILE}"
+  c_ok "已保存状态: ${STATE_FILE}"
   log_action "save state"
 }
 
 # ==========================================================
-# 安装状态 / Service summary
+# 安装状态
 # ==========================================================
 is_installed() {
   [[ -x /usr/local/bin/mosdns && -f /etc/systemd/system/mosdns.service && -d "${CONF_DIR}" ]]
@@ -259,21 +261,21 @@ service_is_running() {
 }
 
 show_brief_runtime_status() {
-  echo "================================================================"
+  echo "=============================================================="
   echo " DoH Manager PRO ${SCRIPT_VERSION}"
   if is_installed; then
     if service_is_running; then
-      c_ok "状态 / Status: 已安装，服务正在运行 / Installed, services are running"
+      c_ok "状态: 已安装，服务正在运行"
     else
-      c_warn "状态 / Status: 已安装，但服务未全部运行 / Installed, but services are not fully running"
+      c_warn "状态: 已安装，但服务未全部运行"
     fi
   else
-    c_warn "状态 / Status: 尚未完整安装 / Not fully installed yet"
+    c_warn "状态: 尚未完整安装"
   fi
-  echo " 当前域名 / Current domain: ${DOMAIN}"
-  echo " 当前路径 / Current path  : ${DOH_PATH}"
-  echo " allowlist 条数 / items   : $(allowlist_count)"
-  echo "================================================================"
+  echo " 当前域名: ${DOMAIN}"
+  echo " 当前路径: ${DOH_PATH}"
+  echo " allowlist 条数: $(allowlist_count)"
+  echo "=============================================================="
 }
 
 # ==========================================================
@@ -282,13 +284,12 @@ show_brief_runtime_status() {
 ensure_allowlist_file() {
   mkdir -p "$(dirname "${ALLOWLIST_FILE}")"
   if [[ ! -f "${ALLOWLIST_FILE}" ]]; then
-    c_warn "未发现 allowlist.txt，初始化 / allowlist missing, initializing: ${ALLOWLIST_FILE}"
+    c_warn "未发现 allowlist.txt，开始初始化: ${ALLOWLIST_FILE}"
     cat > "${ALLOWLIST_FILE}" <<EOF
 # allowlist.txt
-# Each line: one domain/suffix
 # 每行一个域名或后缀
 EOF
-    c_ok "allowlist.txt 初始化完成 / allowlist initialized"
+    c_ok "allowlist.txt 初始化完成"
     log_action "init allowlist ${ALLOWLIST_FILE}"
   fi
 }
@@ -306,8 +307,8 @@ allowlist_count() {
 show_allowlist() {
   ensure_allowlist_file
   echo "==================== allowlist.txt ===================="
-  echo "路径 / Path : ${ALLOWLIST_FILE}"
-  echo "条数 / Count: $(allowlist_count)"
+  echo "路径: ${ALLOWLIST_FILE}"
+  echo "条数: $(allowlist_count)"
   echo "--------------------------------------------------------"
   awk '
     /^[[:space:]]*#/ {next}
@@ -318,17 +319,17 @@ show_allowlist() {
   total="$(allowlist_count)"
   if (( total > 200 )); then
     echo "..."
-    echo "(仅显示前200条 / showing first 200, total ${total})"
+    echo "(仅显示前200条，总计 ${total} 条)"
   fi
   echo "========================================================"
 }
 
 edit_allowlist_vim() {
   ensure_allowlist_file
-  c_warn "使用 vim 编辑 / Editing with vim (:wq save, :q quit)"
+  c_warn "使用 vim 编辑（保存 :wq，退出 :q）"
   sleep 1
   vim "${ALLOWLIST_FILE}"
-  c_ok "已保存 allowlist.txt / allowlist saved"
+  c_ok "已保存 allowlist.txt"
   log_action "edit allowlist by vim"
 }
 
@@ -350,36 +351,36 @@ allowlist_dedupe_sort() {
     cat "${tmp}"
   } > "${ALLOWLIST_FILE}"
   rm -f "${tmp}" >/dev/null 2>&1 || true
-  c_ok "allowlist.txt 已去重排序 / deduped and sorted"
+  c_ok "allowlist.txt 已去重排序"
   log_action "dedupe/sort allowlist"
 }
 
 add_allowlist_one() {
   ensure_allowlist_file
-  read -r -p "请输入要新增的域名/后缀 / Domain to add: " s
-  [[ -n "${s}" ]] || { c_warn "未输入，取消 / Empty input, cancelled"; return; }
+  read -r -p "请输入要新增的域名/后缀: " s
+  [[ -n "${s}" ]] || { c_warn "未输入，取消"; return; }
   s="$(echo "${s}" | tr -d '\r' | sed -e 's/^[[:space:]]\+//; s/[[:space:]]\+$//')"
-  [[ -n "${s}" ]] || { c_warn "空输入，取消 / Empty input, cancelled"; return; }
+  [[ -n "${s}" ]] || { c_warn "空输入，取消"; return; }
 
   if grep -qxF "${s}" "${ALLOWLIST_FILE}" 2>/dev/null; then
-    c_warn "已存在 / Already exists: ${s}"
+    c_warn "已存在: ${s}"
     return
   fi
 
   echo "${s}" >> "${ALLOWLIST_FILE}"
   allowlist_dedupe_sort
-  c_ok "已新增 / Added: ${s}"
+  c_ok "已新增: ${s}"
   log_action "allowlist add ${s}"
 }
 
 remove_allowlist_one() {
   ensure_allowlist_file
   show_allowlist
-  read -r -p "请输入要删除的域名/后缀（完整匹配）/ Exact domain to remove: " s
-  [[ -n "${s}" ]] || { c_warn "未输入，取消 / Empty input, cancelled"; return; }
+  read -r -p "请输入要删除的域名/后缀（完整匹配）: " s
+  [[ -n "${s}" ]] || { c_warn "未输入，取消"; return; }
 
   if ! grep -qxF "${s}" "${ALLOWLIST_FILE}" 2>/dev/null; then
-    c_warn "未找到 / Not found: ${s}"
+    c_warn "未找到: ${s}"
     return
   fi
 
@@ -387,7 +388,7 @@ remove_allowlist_one() {
   grep -vxF "${s}" "${ALLOWLIST_FILE}" > "${tmp}" || true
   mv "${tmp}" "${ALLOWLIST_FILE}"
   allowlist_dedupe_sort
-  c_ok "已删除 / Removed: ${s}"
+  c_ok "已删除: ${s}"
   log_action "allowlist remove ${s}"
 }
 
@@ -439,9 +440,9 @@ normalize_domain_line() {
 
 batch_import_allowlist() {
   ensure_allowlist_file
-  c_info "批量导入 allowlist.txt / Bulk import allowlist"
+  c_info "批量导入 allowlist.txt"
   echo
-  echo "请粘贴域名列表，多行均可，输入 END 结束 / Paste domains, input END to finish"
+  echo "请粘贴域名列表，多行均可，输入 END 结束"
   echo "------------------------------------------------------------"
 
   local tmp="/tmp/doh_allow_import.$$.txt"
@@ -473,7 +474,7 @@ batch_import_allowlist() {
   local after
   after="$(allowlist_count)"
 
-  c_ok "导入完成 / Import done: +${added}, ${before} -> ${after}"
+  c_ok "导入完成: 新增 ${added} 条；原有 ${before} -> 现在 ${after}"
   log_action "batch import allowlist added=${added} total=${after}"
 }
 
@@ -481,57 +482,57 @@ batch_import_allowlist() {
 # 参数显示与设置
 # ==========================================================
 show_config() {
-  echo "==================== 当前配置 / Current Config ===================="
-  echo "版本 / Version        : ${SCRIPT_VERSION}"
-  echo "DOMAIN                : ${DOMAIN}"
-  echo "DOH_PATH              : ${DOH_PATH}"
-  echo "ALLOWLIST_FILE        : ${ALLOWLIST_FILE}"
-  echo "ALLOWLIST_COUNT       : $(allowlist_count)"
+  echo "==================== 当前配置 ===================="
+  echo "版本: ${SCRIPT_VERSION}"
+  echo "DOMAIN: ${DOMAIN}"
+  echo "DOH_PATH: ${DOH_PATH}"
+  echo "ALLOWLIST_FILE: ${ALLOWLIST_FILE}"
+  echo "ALLOWLIST_COUNT: $(allowlist_count)"
   echo
   echo "UPSTREAM_DOT:"
   for u in "${UPSTREAM_DOT[@]}"; do echo "  - ${u}"; done
-  echo "=================================================================="
+  echo "=================================================="
 }
 
 set_domain() {
-  echo "当前 DOMAIN / Current: ${DOMAIN}"
-  read -r -p "请输入新的伪装域名 / New DOMAIN: " newd
-  [[ -n "${newd}" ]] || { c_warn "未输入，取消 / Empty input, cancelled"; return; }
+  echo "当前 DOMAIN: ${DOMAIN}"
+  read -r -p "请输入新的伪装域名: " newd
+  [[ -n "${newd}" ]] || { c_warn "未输入，取消"; return; }
   DOMAIN="${newd}"
   NGINX_SSL_DIR="/etc/nginx/ssl/${DOMAIN}"
-  c_ok "DOMAIN 已设置 / DOMAIN set to: ${DOMAIN}"
-  c_warn "更换 DOMAIN 后需要重新签发证书 / Re-issue certificate after changing domain"
+  c_ok "DOMAIN 已设置为: ${DOMAIN}"
+  c_warn "更换 DOMAIN 后需要重新签发证书"
   log_action "set DOMAIN=${DOMAIN}"
   save_state
 }
 
 set_doh_path() {
-  echo "当前 DOH_PATH / Current: ${DOH_PATH}"
-  read -r -p "请输入新的伪装路径 / New DOH_PATH: " p
-  [[ -n "${p}" ]] || { c_warn "未输入，取消 / Empty input, cancelled"; return; }
+  echo "当前 DOH_PATH: ${DOH_PATH}"
+  read -r -p "请输入新的伪装路径: " p
+  [[ -n "${p}" ]] || { c_warn "未输入，取消"; return; }
   if [[ "${p:0:1}" != "/" ]]; then
-    c_err "DOH_PATH 必须以 / 开头 / Must start with /"
+    c_err "DOH_PATH 必须以 / 开头"
     return
   fi
   DOH_PATH="${p}"
-  c_ok "DOH_PATH 已设置 / DOH_PATH set to: ${DOH_PATH}"
+  c_ok "DOH_PATH 已设置为: ${DOH_PATH}"
   log_action "set DOH_PATH=${DOH_PATH}"
   save_state
 }
 
 set_allowlist_file() {
-  echo "当前 allowlist 路径 / Current: ${ALLOWLIST_FILE}"
-  read -r -p "请输入新的 allowlist.txt 路径 / New allowlist path: " p
-  [[ -n "${p}" ]] || { c_warn "未输入，取消 / Empty input, cancelled"; return; }
+  echo "当前 allowlist 路径: ${ALLOWLIST_FILE}"
+  read -r -p "请输入新的 allowlist.txt 路径: " p
+  [[ -n "${p}" ]] || { c_warn "未输入，取消"; return; }
   ALLOWLIST_FILE="${p}"
   ensure_allowlist_file
-  c_ok "ALLOWLIST_FILE 已设置 / Set to: ${ALLOWLIST_FILE}"
+  c_ok "ALLOWLIST_FILE 已设置为: ${ALLOWLIST_FILE}"
   log_action "set ALLOWLIST_FILE=${ALLOWLIST_FILE}"
   save_state
 }
 
 list_upstreams() {
-  echo "UPSTREAM_DOT 列表 / Current DoT upstreams:"
+  echo "UPSTREAM_DOT 列表:"
   local i=1
   for u in "${UPSTREAM_DOT[@]}"; do
     echo "  [$i] ${u}"
@@ -540,60 +541,60 @@ list_upstreams() {
 }
 
 add_upstream() {
-  read -r -p "请输入新的 DoT 上游 / New DoT upstream (e.g. 1.1.1.1@853): " u
-  [[ -n "${u}" ]] || { c_warn "未输入，取消 / Empty input, cancelled"; return; }
+  read -r -p "请输入新的 DoT 上游（例如 1.1.1.1@853）: " u
+  [[ -n "${u}" ]] || { c_warn "未输入，取消"; return; }
   for x in "${UPSTREAM_DOT[@]}"; do
     if [[ "${x}" == "${u}" ]]; then
-      c_warn "已存在 / Already exists: ${u}"
+      c_warn "已存在: ${u}"
       return
     fi
   done
   UPSTREAM_DOT+=("${u}")
-  c_ok "已新增 / Added: ${u}"
+  c_ok "已新增: ${u}"
   log_action "add UPSTREAM_DOT+=${u}"
   save_state
 }
 
 remove_upstream() {
   list_upstreams
-  read -r -p "请输入要删除的序号 / Index to remove: " idx
-  [[ "${idx}" =~ ^[0-9]+$ ]] || { c_err "请输入数字 / Please input number"; return; }
+  read -r -p "请输入要删除的序号: " idx
+  [[ "${idx}" =~ ^[0-9]+$ ]] || { c_err "请输入数字"; return; }
   local n="${#UPSTREAM_DOT[@]}"
   if (( idx < 1 || idx > n )); then
-    c_err "超出范围 / Out of range"
+    c_err "超出范围"
     return
   fi
   local target="${UPSTREAM_DOT[$((idx-1))]}"
   UPSTREAM_DOT=( "${UPSTREAM_DOT[@]:0:$((idx-1))}" "${UPSTREAM_DOT[@]:$idx}" )
-  c_ok "已删除 / Removed: ${target}"
+  c_ok "已删除: ${target}"
   log_action "remove UPSTREAM_DOT-=${target}"
   save_state
 }
 
 # ==========================================================
-# 快速初始化向导 / Quick setup wizard
+# 快速初始化向导
 # ==========================================================
 quick_setup_wizard() {
-  c_info "快速初始化向导 / Quick Setup Wizard"
+  c_info "快速初始化向导"
   echo
 
-  read -r -p "请问伪装域名是什么？ / What is the fake domain? " input_domain
-  [[ -n "${input_domain}" ]] || { c_warn "域名为空，取消 / Empty domain, cancelled"; return; }
+  read -r -p "请问伪装域名是什么？ " input_domain
+  [[ -n "${input_domain}" ]] || { c_warn "域名为空，取消"; return; }
 
-  read -r -p "请问伪装路径是什么？ / What is the fake path? " input_path
-  [[ -n "${input_path}" ]] || { c_warn "路径为空，取消 / Empty path, cancelled"; return; }
+  read -r -p "请问伪装路径是什么？ " input_path
+  [[ -n "${input_path}" ]] || { c_warn "路径为空，取消"; return; }
   if [[ "${input_path:0:1}" != "/" ]]; then
     input_path="/${input_path}"
   fi
 
-  read -r -p "请问您想添加进allowlist.txt的域名是什么？以英文逗号,分割 / Domains for allowlist, split by comma: " input_domains
-  [[ -n "${input_domains}" ]] || { c_warn "allowlist 为空，取消 / Empty allowlist input, cancelled"; return; }
+  read -r -p "请问您想添加进 allowlist.txt 的域名是什么？以英文逗号分割: " input_domains
+  [[ -n "${input_domains}" ]] || { c_warn "allowlist 为空，取消"; return; }
 
   DOMAIN="${input_domain}"
   DOH_PATH="${input_path}"
   NGINX_SSL_DIR="/etc/nginx/ssl/${DOMAIN}"
-  ensure_allowlist_file
 
+  ensure_allowlist_file
   : > "${ALLOWLIST_FILE}"
   echo "# allowlist.txt (managed by DoH Manager PRO ${SCRIPT_VERSION})" >> "${ALLOWLIST_FILE}"
   echo "# each line: domain or suffix" >> "${ALLOWLIST_FILE}"
@@ -607,45 +608,76 @@ quick_setup_wizard() {
   allowlist_dedupe_sort
   save_state
 
-  c_ok "快速初始化完成 / Quick setup done"
-  c_info "DOMAIN   = ${DOMAIN}"
+  c_ok "快速初始化完成"
+  c_info "DOMAIN = ${DOMAIN}"
   c_info "DOH_PATH = ${DOH_PATH}"
   c_info "ALLOWLIST_COUNT = $(allowlist_count)"
   log_action "quick setup wizard done"
+
+  echo
+  c_info "开始安装/修复环境..."
+  ensure_environment
+
+  echo
+  c_info "开始自动尝试为当前 DOMAIN 签发证书..."
+  if issue_cert; then
+    c_ok "自动签发证书成功"
+  else
+    c_warn "自动签发证书失败，请稍后在菜单中手动重试"
+  fi
 }
 
 # ==========================================================
-# 路径检测
+# 路径与证书检查
 # ==========================================================
 doh_path_conflict_check() {
-  c_info "DoH 路径冲突检测 / Path conflict check"
+  c_info "DoH 路径冲突检测"
 
   if [[ "${DOH_PATH:0:1}" != "/" ]]; then
-    c_err "DOH_PATH 必须以 / 开头 / Must start with / : ${DOH_PATH}"
+    c_err "DOH_PATH 必须以 / 开头: ${DOH_PATH}"
     return 1
   fi
 
   if [[ "${DOH_PATH}" == "/" ]]; then
-    c_err "DOH_PATH 不能是 / / DOH_PATH cannot be /"
+    c_err "DOH_PATH 不能是 /"
     return 1
   fi
 
   if [[ "${DOH_PATH}" == "/.well-known/acme-challenge/"* ]]; then
-    c_err "DOH_PATH 与 ACME 冲突 / Conflicts with ACME: ${DOH_PATH}"
+    c_err "DOH_PATH 与 ACME 冲突: ${DOH_PATH}"
     return 1
   fi
 
   local static_file="${STATIC_ROOT}${DOH_PATH}"
   if [[ -f "${static_file}" ]]; then
-    c_warn "静态目录有同名文件 / Same file exists in static root: ${static_file}"
+    c_warn "静态目录中存在同名文件: ${static_file}"
   fi
 
   if [[ "${DOH_PATH}" != */*.* ]]; then
-    c_warn "路径不像静态资源 / Path may not look like static asset: ${DOH_PATH}"
+    c_warn "路径看起来不像静态资源: ${DOH_PATH}"
   fi
 
-  c_ok "路径检测通过 / Path check passed"
+  c_ok "路径检测通过"
   return 0
+}
+
+cert_exists_for_domain() {
+  [[ -f "${NGINX_SSL_DIR}/fullchain.pem" && -f "${NGINX_SSL_DIR}/${DOMAIN}.key" ]]
+}
+
+check_domain_cert_before_apply() {
+  if cert_exists_for_domain; then
+    c_ok "检测到当前 DOMAIN 证书存在"
+    return 0
+  fi
+
+  c_err "未检测到当前 DOMAIN 的证书文件"
+  echo "缺少以下文件之一："
+  echo " - ${NGINX_SSL_DIR}/fullchain.pem"
+  echo " - ${NGINX_SSL_DIR}/${DOMAIN}.key"
+  echo
+  c_warn "请先执行证书签发，再进行应用"
+  return 1
 }
 
 # ==========================================================
@@ -660,19 +692,19 @@ apt_install() {
     unbound
   systemctl enable nginx >/dev/null 2>&1 || true
   systemctl enable unbound >/dev/null 2>&1 || true
-  c_ok "依赖安装完成 / Dependencies installed"
+  c_ok "依赖安装完成"
   log_action "apt install deps"
 }
 
 download_and_install_mosdnsx() {
-  c_info "安装/更新 mosdns-x / Install or update mosdns-x"
+  c_info "安装/更新 mosdns-x"
 
   local arch arch_key
   arch="$(dpkg --print-architecture)"
   case "${arch}" in
     amd64) arch_key="amd64" ;;
     arm64) arch_key="arm64" ;;
-    *) c_err "不支持架构 / Unsupported arch: ${arch}"; return 1 ;;
+    *) c_err "不支持架构: ${arch}"; return 1 ;;
   esac
 
   local api="https://api.github.com/repos/pmkol/mosdns-x/releases/latest"
@@ -690,7 +722,7 @@ download_and_install_mosdnsx() {
   ')"
 
   [[ -n "${asset_name}" && -n "${asset_url}" && "${asset_url}" != "null" ]] || {
-    c_err "未找到 mosdns-x 发行包 / Cannot find mosdns-x release asset"
+    c_err "未找到 mosdns-x 发行包"
     return 1
   }
 
@@ -708,19 +740,19 @@ download_and_install_mosdnsx() {
 
   local bin
   bin="$(find "${tmpdir}/out" -maxdepth 3 -type f \( -name "mosdns" -o -name "mosdns-x" \) | head -n 1 || true)"
-  [[ -n "${bin}" ]] || { c_err "解压后未找到 mosdns 二进制 / Binary not found"; rm -rf "${tmpdir}"; return 1; }
+  [[ -n "${bin}" ]] || { c_err "解压后未找到 mosdns 二进制"; rm -rf "${tmpdir}"; return 1; }
 
   install -m 0755 "${bin}" /usr/local/bin/mosdns
   rm -rf "${tmpdir}"
 
-  c_ok "mosdns-x 安装完成 / Installed: /usr/local/bin/mosdns"
+  c_ok "mosdns-x 安装完成: /usr/local/bin/mosdns"
   log_action "install mosdns-x"
 }
 
 create_user_and_dirs() {
   if ! id -u "${MOSDNS_USER}" >/dev/null 2>&1; then
     useradd --system --home "${WORK_DIR}" --shell /usr/sbin/nologin "${MOSDNS_USER}"
-    c_ok "已创建用户 / Created user: ${MOSDNS_USER}"
+    c_ok "已创建用户: ${MOSDNS_USER}"
     log_action "create user ${MOSDNS_USER}"
   fi
 
@@ -729,7 +761,7 @@ create_user_and_dirs() {
 }
 
 install_mosdns_systemd() {
-  c_info "安装/修复 mosdns systemd 服务 / Install or repair mosdns systemd service"
+  c_info "安装/修复 mosdns systemd 服务"
   cat > /etc/systemd/system/mosdns.service <<EOF
 [Unit]
 Description=mosdns-x (DoH backend)
@@ -751,18 +783,18 @@ EOF
 
   systemctl daemon-reload
   systemctl enable mosdns >/dev/null 2>&1 || true
-  c_ok "mosdns systemd 已就绪 / systemd ready"
+  c_ok "mosdns systemd 已就绪"
   log_action "install systemd mosdns"
 }
 
 ensure_environment() {
-  c_info "开始安装/修复环境 / Install or repair environment"
+  c_info "开始安装/修复环境"
   apt_install
   create_user_and_dirs
   ensure_allowlist_file
   download_and_install_mosdnsx
   install_mosdns_systemd
-  c_ok "环境准备完成 / Environment ready"
+  c_ok "环境准备完成"
   log_action "ensure environment done"
 }
 
@@ -770,7 +802,7 @@ ensure_environment() {
 # 写入配置
 # ==========================================================
 write_unbound_forward() {
-  c_info "写入 Unbound 配置 / Writing unbound config: ${UNBOUND_SNIPPET}"
+  c_info "写入 Unbound 配置: ${UNBOUND_SNIPPET}"
   backup_file "${UNBOUND_SNIPPET}"
   mkdir -p "$(dirname "${UNBOUND_SNIPPET}")"
 
@@ -806,7 +838,7 @@ write_unbound_forward() {
   } > "${UNBOUND_SNIPPET}"
 
   unbound-checkconf >/dev/null 2>&1 || {
-    c_err "unbound-checkconf 检查失败 / check failed"
+    c_err "unbound-checkconf 检查失败"
     exit 1
   }
   c_ok "Unbound 配置 OK"
@@ -819,7 +851,7 @@ build_domain_rules_from_allowlist() {
   local cnt
   cnt="$(allowlist_count)"
   if (( cnt <= 0 )); then
-    c_err "allowlist.txt 为空 / allowlist is empty: ${ALLOWLIST_FILE}"
+    c_err "allowlist.txt 为空: ${ALLOWLIST_FILE}"
     return 1
   fi
 
@@ -835,7 +867,7 @@ build_domain_rules_from_allowlist() {
 }
 
 write_mosdns_config() {
-  c_info "写入 mosdns 配置 / Writing mosdns config: ${CONF_DIR}/config.yaml"
+  c_info "写入 mosdns 配置: ${CONF_DIR}/config.yaml"
   mkdir -p "${CONF_DIR}"
   backup_file "${CONF_DIR}/config.yaml"
 
@@ -886,7 +918,7 @@ servers:
         url_path: "${DOH_PATH}"
 EOF
 
-  c_ok "mosdns 配置 OK / mosdns config OK"
+  c_ok "mosdns 配置 OK"
   log_action "write mosdns config"
 }
 
@@ -894,7 +926,7 @@ write_nginx_site() {
   local nginx_site="${NGINX_SITE_DIR}/doh_${DOMAIN}.conf"
   local nginx_link="${NGINX_LINK_DIR}/doh_${DOMAIN}.conf"
 
-  c_info "写入 Nginx 配置 / Writing nginx config: ${nginx_site}"
+  c_info "写入 Nginx 配置: ${nginx_site}"
   mkdir -p "${NGINX_SITE_DIR}" "${NGINX_LINK_DIR}" "${NGINX_SSL_DIR}" "${ACME_WEBROOT}" "${STATIC_ROOT}"
   backup_file "${nginx_site}"
 
@@ -974,45 +1006,15 @@ EOF
 }
 
 # ==========================================================
-# 应用与证书
+# 证书管理
 # ==========================================================
-apply_all() {
-  doh_path_conflict_check || {
-    c_err "检测未通过 / Check failed, apply aborted"
-    return
-  }
-
-  ensure_allowlist_file
-  local cnt
-  cnt="$(allowlist_count)"
-  if (( cnt <= 0 )); then
-    c_err "allowlist.txt 为空，已阻止应用 / Empty allowlist, apply blocked"
-    return
-  fi
-
-  if [[ ! -x /usr/local/bin/mosdns ]]; then
-    c_warn "检测到 mosdns 未安装，建议先执行安装/修复 / mosdns not installed"
-  fi
-  if [[ ! -f /etc/systemd/system/mosdns.service ]]; then
-    c_warn "检测到 mosdns.service 不存在，建议先执行安装/修复 / mosdns.service missing"
-  fi
-
-  c_info "生成配置并应用 / Generating config and applying..."
-  write_unbound_forward
-  write_mosdns_config
-  write_nginx_site
-  reload_services
-  c_ok "本机应用完成 / Applied locally"
-  log_action "apply all done"
-}
-
 acme_sh_path() { echo "/root/.acme.sh/acme.sh"; }
 
 ensure_acme_sh() {
   if [[ ! -d /root/.acme.sh ]]; then
-    c_info "安装 acme.sh / Installing acme.sh..."
+    c_info "安装 acme.sh..."
     curl -fsSL https://get.acme.sh | sh
-    c_ok "acme.sh 安装完成 / acme.sh installed"
+    c_ok "acme.sh 安装完成"
     log_action "install acme.sh"
   fi
 }
@@ -1021,7 +1023,7 @@ write_nginx_http_only_for_acme() {
   local nginx_site="${NGINX_SITE_DIR}/doh_${DOMAIN}.conf"
   local nginx_link="${NGINX_LINK_DIR}/doh_${DOMAIN}.conf"
 
-  c_info "临时写入 Nginx(80) 用于 ACME / Temporary nginx config for ACME"
+  c_info "临时写入 Nginx(80) 用于 ACME"
   mkdir -p "${NGINX_SITE_DIR}" "${NGINX_LINK_DIR}" "${ACME_WEBROOT}"
 
   cat > "${nginx_site}" <<EOF
@@ -1044,7 +1046,7 @@ EOF
   ln -sf "${nginx_site}" "${nginx_link}"
   nginx -t >/dev/null
   systemctl restart nginx >/dev/null 2>&1 || true
-  c_ok "ACME 环境准备完成 / ACME environment ready"
+  c_ok "ACME 环境准备完成"
 }
 
 issue_cert() {
@@ -1052,7 +1054,7 @@ issue_cert() {
   local ACME
   ACME="$(acme_sh_path)"
 
-  c_info "签发证书 / Issue certificate"
+  c_info "开始签发证书"
   mkdir -p "${ACME_WEBROOT}" "${NGINX_SSL_DIR}"
 
   write_nginx_http_only_for_acme
@@ -1065,7 +1067,7 @@ issue_cert() {
     --fullchain-file "${NGINX_SSL_DIR}/fullchain.pem" \
     --reloadcmd     "systemctl reload nginx"
 
-  c_ok "证书签发完成 / Certificate issued: ${NGINX_SSL_DIR}"
+  c_ok "证书签发完成: ${NGINX_SSL_DIR}"
   log_action "issue cert for ${DOMAIN}"
 }
 
@@ -1074,9 +1076,9 @@ renew_cert() {
   local ACME
   ACME="$(acme_sh_path)"
 
-  c_info "强制续期证书 / Force renew certificate"
+  c_info "强制续期证书"
   "${ACME}" --renew -d "${DOMAIN}" --force >/dev/null 2>&1 || true
-  c_ok "续期完成 / Renew done"
+  c_ok "续期完成"
   systemctl reload nginx >/dev/null 2>&1 || true
   log_action "renew cert for ${DOMAIN}"
 }
@@ -1084,10 +1086,10 @@ renew_cert() {
 check_cert_days() {
   local pem="${NGINX_SSL_DIR}/fullchain.pem"
   if [[ ! -f "${pem}" ]]; then
-    c_warn "找不到证书 / Certificate not found: ${pem}"
+    c_warn "找不到证书: ${pem}"
     return
   fi
-  c_info "证书有效期 / Certificate validity:"
+  c_info "证书有效期："
   openssl x509 -in "${pem}" -noout -dates || true
 }
 
@@ -1095,73 +1097,73 @@ check_cert_days() {
 # 服务控制
 # ==========================================================
 reload_services() {
-  c_info "重载服务 / Reloading services: unbound / mosdns / nginx"
+  c_info "重载服务: unbound / mosdns / nginx"
   systemctl restart unbound >/dev/null 2>&1 || true
   systemctl restart mosdns  >/dev/null 2>&1 || true
   systemctl reload nginx    >/dev/null 2>&1 || systemctl restart nginx >/dev/null 2>&1 || true
-  c_ok "服务重载完成 / Reload complete"
+  c_ok "服务重载完成"
   log_action "reload services"
 }
 
 start_services() {
-  c_info "启动服务 / Starting services: unbound / mosdns / nginx"
+  c_info "启动服务: unbound / mosdns / nginx"
   systemctl start unbound >/dev/null 2>&1 || true
   systemctl start mosdns  >/dev/null 2>&1 || true
   systemctl start nginx   >/dev/null 2>&1 || true
-  c_ok "启动完成 / Start complete"
+  c_ok "启动完成"
   log_action "start services"
 }
 
 stop_services() {
-  c_info "停止服务 / Stopping services: mosdns / unbound / nginx"
+  c_info "停止服务: mosdns / unbound / nginx"
   systemctl stop mosdns  >/dev/null 2>&1 || true
   systemctl stop unbound >/dev/null 2>&1 || true
   systemctl stop nginx   >/dev/null 2>&1 || true
-  c_ok "停止完成 / Stop complete"
+  c_ok "停止完成"
   log_action "stop services"
 }
 
 restart_services() {
-  c_info "重启服务 / Restarting services: unbound / mosdns / nginx"
+  c_info "重启服务: unbound / mosdns / nginx"
   systemctl restart unbound >/dev/null 2>&1 || true
   systemctl restart mosdns  >/dev/null 2>&1 || true
   systemctl restart nginx   >/dev/null 2>&1 || true
-  c_ok "重启完成 / Restart complete"
+  c_ok "重启完成"
   log_action "restart services"
 }
 
 show_status() {
-  echo "==================== 服务状态 / Service Status ===================="
+  echo "==================== 服务状态 ===================="
   systemctl --no-pager --full status mosdns 2>/dev/null | sed -n '1,12p' || true
-  echo "------------------------------------------------------------------"
+  echo "--------------------------------------------------"
   systemctl --no-pager --full status unbound 2>/dev/null | sed -n '1,12p' || true
-  echo "------------------------------------------------------------------"
+  echo "--------------------------------------------------"
   systemctl --no-pager --full status nginx 2>/dev/null | sed -n '1,12p' || true
-  echo "=================================================================="
+  echo "=================================================="
 }
 
 show_ports() {
-  c_info "端口监听检查 / Listening ports check: 80/443/8053/5335"
+  c_info "端口监听检查: 80/443/8053/5335"
   ss -lntp | egrep ":80|:443|:8053|:${UNBOUND_PORT}" || true
 }
 
 show_logs_tail() {
-  c_info "查看变更日志 / Tail log: ${LOG_FILE}"
+  c_info "查看日志尾部: ${LOG_FILE}"
   tail -n 40 "${LOG_FILE}" 2>/dev/null || true
 }
 
 health_check() {
-  c_info "健康检查 / Health check"
+  c_info "健康检查"
   echo
   if command -v curl >/dev/null 2>&1; then
-    echo "1) 伪装页 / Fake homepage:"
+    echo "1) 伪装页："
     curl -k -sS "https://${DOMAIN}/" | head -n 2 || true
     echo
-    echo "2) DoH 路径 / DoH path:"
+    echo "2) DoH 路径："
     curl -k -sS -o /dev/null -w "HTTP_CODE=%{http_code}\n" "https://${DOMAIN}${DOH_PATH}" || true
     echo
   else
-    c_warn "curl 未安装，跳过 / curl not installed, skipped"
+    c_warn "curl 未安装，跳过"
   fi
 }
 
@@ -1169,9 +1171,9 @@ health_check() {
 # 卸载
 # ==========================================================
 uninstall_all() {
-  c_warn "你即将执行【彻底卸载】/ You are about to fully uninstall"
-  echo "将删除 / Will remove:"
-  echo " - mosdns service"
+  c_warn "你即将执行【彻底卸载】"
+  echo "将删除以下内容："
+  echo " - mosdns 服务"
   echo " - ${CONF_DIR}"
   echo " - ${WORK_DIR}"
   echo " - ${UNBOUND_SNIPPET}"
@@ -1180,8 +1182,8 @@ uninstall_all() {
   echo " - ${NGINX_SSL_DIR}"
   echo " - /usr/local/bin/mosdns"
   echo
-  read -r -p "请输入 YES 确认彻底卸载 / Type YES to confirm: " confirm
-  [[ "${confirm}" == "YES" ]] || { c_warn "已取消卸载 / Uninstall cancelled"; return; }
+  read -r -p "请输入 YES 确认彻底卸载: " confirm
+  [[ "${confirm}" == "YES" ]] || { c_warn "已取消卸载"; return; }
 
   log_action "begin uninstall all"
 
@@ -1202,7 +1204,7 @@ uninstall_all() {
   nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1 || true
   unbound-checkconf >/dev/null 2>&1 && systemctl restart unbound >/dev/null 2>&1 || true
 
-  c_ok "彻底卸载完成 / Uninstall complete"
+  c_ok "彻底卸载完成"
   log_action "uninstall all done"
 }
 
@@ -1213,54 +1215,54 @@ show_menu() {
   cat <<EOF
 ==================== DoH Manager PRO ${SCRIPT_VERSION} ====================
 
- 0) 安装/修复环境           Install / Repair environment
- 1) 快速初始化向导          Quick setup wizard
+ 0) 安装/修复环境
+ 1) 快速初始化向导
 
- 2) 显示当前配置            Show current config
- 3) 修改 DOMAIN             Set fake domain
- 4) 修改 DOH_PATH           Set fake path
- 5) 修改 allowlist 路径     Set allowlist path
+ 2) 显示当前配置
+ 3) 修改 DOMAIN
+ 4) 修改 DOH_PATH
+ 5) 修改 allowlist 路径
 
 -------------------- allowlist.txt --------------------
- 6) 查看 allowlist          Show allowlist
- 7) 新增 allowlist 项       Add allowlist item
- 8) 删除 allowlist 项       Remove allowlist item
- 9) 批量导入 allowlist      Bulk import allowlist
-10) 编辑 allowlist(vim)     Edit allowlist with vim
-11) allowlist 去重排序      Dedupe and sort allowlist
+ 6) 查看 allowlist
+ 7) 新增 allowlist 项
+ 8) 删除 allowlist 项
+ 9) 批量导入 allowlist
+10) 编辑 allowlist(vim)
+11) allowlist 去重排序
 
 -------------------- Upstream DoT ---------------------
-12) 查看上游 DoT            Show upstream DoT
-13) 新增上游 DoT            Add upstream DoT
-14) 删除上游 DoT            Remove upstream DoT
+12) 查看上游 DoT
+13) 新增上游 DoT
+14) 删除上游 DoT
 
 -------------------- Advanced -------------------------
-15) 编辑 Unbound 参数       Edit Unbound params
-16) 编辑 mosdns 参数        Edit mosdns params
-17) 编辑 Nginx 参数         Edit Nginx params
+15) 编辑 Unbound 参数
+16) 编辑 mosdns 参数
+17) 编辑 Nginx 参数
 
 -------------------- Apply / Check --------------------
-18) 路径冲突检测            Path conflict check
-19) 生成配置并应用          Generate config and apply
+18) 路径冲突检测
+19) 生成配置并应用
 
 -------------------- Certificate ----------------------
-20) 签发证书                Issue certificate
-21) 强制续期证书            Force renew certificate
-22) 查看证书有效期          Show certificate validity
+20) 签发证书
+21) 强制续期证书
+22) 查看证书有效期
 
 -------------------- Service --------------------------
-23) 查看服务状态            Show service status
-24) 查看端口监听            Show listening ports
-25) 健康检查                Health check
-26) 查看日志尾部            Tail log
-27) 启动服务                Start services
-28) 停止服务                Stop services
-29) 重启服务                Restart services
+23) 查看服务状态
+24) 查看端口监听
+25) 健康检查
+26) 查看日志尾部
+27) 启动服务
+28) 停止服务
+29) 重启服务
 
 -------------------- Uninstall ------------------------
-30) 彻底卸载                Full uninstall
+30) 彻底卸载
 
- 99) 退出                   Exit
+ 99) 退出
 =========================================================================
 EOF
 }
@@ -1277,12 +1279,22 @@ main() {
   log_action "run doh-manager-pro-allinone.sh"
   show_brief_runtime_status
 
+  if [[ "${FIRST_RUN}" == "yes" ]]; then
+    echo
+    read -r -p "检测到首次运行，是否进入快速初始化向导？(y/n): " first_run_wizard
+    case "${first_run_wizard}" in
+      y|Y) quick_setup_wizard ;;
+      *) c_info "已跳过快速初始化向导" ;;
+    esac
+  fi
+
   while true; do
     show_menu
-    read -r -p "请选择操作 / Select option: " opt
+    read -r -p "请选择操作: " opt
     echo
     case "${opt}" in
       0) ensure_environment ;;
+
       1) quick_setup_wizard ;;
 
       2) show_config ;;
@@ -1306,7 +1318,11 @@ main() {
       17) edit_nginx_params ;;
 
       18) doh_path_conflict_check ;;
-      19) apply_all ;;
+      19)
+        if check_domain_cert_before_apply; then
+          apply_all
+        fi
+        ;;
 
       20) issue_cert ;;
       21) renew_cert ;;
@@ -1322,8 +1338,8 @@ main() {
 
       30) uninstall_all ;;
 
-      99) c_ok "退出 / Exit"; log_action "exit"; exit 0 ;;
-      *) c_warn "无效选项 / Invalid option" ;;
+      99) c_ok "退出"; log_action "exit"; exit 0 ;;
+      *) c_warn "无效选项" ;;
     esac
     pause_enter
   done

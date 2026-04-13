@@ -3,18 +3,31 @@ set -euo pipefail
 
 ############################################
 # DoH Manager PRO (All-in-One + allowlist.txt)
-# Version: v2.4
+# Version: v2.5
 #
-# v2.4 更新：
-# 1) 服务状态检查改为自动判断正常/异常，并显示异常原因摘要
-# 2) 端口监听检查改为自动判断正常/异常
-# 3) 健康检查改为自动判断正常/异常
-# 4) 证书有效期检查改为显示是否有效、剩余天数
-# 5) 菜单改为并列形式
-# 6) 菜单序号重新按顺序排列
+# v2.5 更新：
+# 1) 修复 issue_cert: command not found
+# 2) 自动检测 Linux 系统并安装依赖
+# 3) 首次初始化后自动询问是否立即应用配置
+# 4) 快速初始化向导改为直接询问“域名是什么 / 路径是什么”
+# 5) 证书检查直接显示证书主题域名
+# 6) 增强平台兼容性（Debian/Ubuntu/CentOS/Rocky/AlmaLinux）
 ############################################
 
-SCRIPT_VERSION="v2.4"
+SCRIPT_VERSION="v2.5"
+
+# ==========================================================
+# 运行时全局变量
+# ==========================================================
+OS_ID=""
+OS_NAME=""
+PKG_MGR=""
+ARCH_RAW=""
+ARCH_KEY=""
+NGINX_SITE_DIR=""
+NGINX_LINK_DIR=""
+UNBOUND_CONF_DIR=""
+USE_NGINX_LINK="yes"
 
 MOSDNS_USER="mosdns"
 CONF_DIR="/etc/mosdns-x"
@@ -25,10 +38,7 @@ ACME_WEBROOT="/var/www/acme"
 STATIC_ROOT="/var/www/html"
 
 UNBOUND_PORT="5335"
-UNBOUND_SNIPPET="/etc/unbound/unbound.conf.d/doh-forward.conf"
-
-NGINX_SITE_DIR="/etc/nginx/sites-available"
-NGINX_LINK_DIR="/etc/nginx/sites-enabled"
+UNBOUND_SNIPPET=""
 
 STATE_FILE="/etc/mosdns-x/doh-manager-pro.state"
 LOG_FILE="/var/log/doh-manager-pro.log"
@@ -90,6 +100,9 @@ NGX_BURST=""
 NGINX_SSL_DIR=""
 FIRST_RUN="no"
 
+# ==========================================================
+# UI
+# ==========================================================
 c_ok()   { echo -e "\033[1;32m[OK]\033[0m $*"; }
 c_warn() { echo -e "\033[1;33m[!]\033[0m  $*"; }
 c_err()  { echo -e "\033[1;31m[-]\033[0m $*"; }
@@ -100,6 +113,11 @@ need_root() {
     c_err "请使用 root 运行"
     exit 1
   fi
+}
+
+pause_enter() {
+  echo
+  read -r -p "按回车继续..." _
 }
 
 log_action() {
@@ -127,11 +145,63 @@ remove_if_exists() {
   fi
 }
 
-pause_enter() {
-  echo
-  read -r -p "按回车继续..." _
+# ==========================================================
+# 平台检测
+# ==========================================================
+detect_platform() {
+  if [[ -f /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    source /etc/os-release
+    OS_ID="${ID:-unknown}"
+    OS_NAME="${PRETTY_NAME:-unknown}"
+  else
+    OS_ID="unknown"
+    OS_NAME="unknown"
+  fi
+
+  if command -v apt-get >/dev/null 2>&1; then
+    PKG_MGR="apt"
+  elif command -v dnf >/dev/null 2>&1; then
+    PKG_MGR="dnf"
+  elif command -v yum >/dev/null 2>&1; then
+    PKG_MGR="yum"
+  else
+    c_err "未检测到支持的包管理器（apt/dnf/yum）"
+    exit 1
+  fi
+
+  ARCH_RAW="$(uname -m)"
+  case "${ARCH_RAW}" in
+    x86_64|amd64) ARCH_KEY="amd64" ;;
+    aarch64|arm64) ARCH_KEY="arm64" ;;
+    *)
+      c_err "不支持的架构: ${ARCH_RAW}"
+      exit 1
+      ;;
+  esac
+
+  if [[ "${PKG_MGR}" == "apt" ]]; then
+    NGINX_SITE_DIR="/etc/nginx/sites-available"
+    NGINX_LINK_DIR="/etc/nginx/sites-enabled"
+    USE_NGINX_LINK="yes"
+    UNBOUND_CONF_DIR="/etc/unbound/unbound.conf.d"
+  else
+    NGINX_SITE_DIR="/etc/nginx/conf.d"
+    NGINX_LINK_DIR="/etc/nginx/conf.d"
+    USE_NGINX_LINK="no"
+    if [[ -d /etc/unbound/conf.d ]]; then
+      UNBOUND_CONF_DIR="/etc/unbound/conf.d"
+    else
+      UNBOUND_CONF_DIR="/etc/unbound/unbound.conf.d"
+    fi
+  fi
+
+  UNBOUND_SNIPPET="${UNBOUND_CONF_DIR}/doh-forward.conf"
 }
 
+# ==========================================================
+# 状态文件
+# ==========================================================
 ensure_state_file() {
   mkdir -p "$(dirname "${STATE_FILE}")"
   if [[ ! -f "${STATE_FILE}" ]]; then
@@ -236,6 +306,9 @@ save_state() {
   log_action "save state"
 }
 
+# ==========================================================
+# 基础状态
+# ==========================================================
 is_installed() {
   [[ -x /usr/local/bin/mosdns && -f /etc/systemd/system/mosdns.service && -d "${CONF_DIR}" ]]
 }
@@ -270,6 +343,8 @@ allowlist_count() {
 show_brief_runtime_status() {
   echo "=============================================================="
   echo " DoH Manager PRO ${SCRIPT_VERSION}"
+  echo " 系统: ${OS_NAME}"
+  echo " 包管理器: ${PKG_MGR}"
   if is_installed; then
     if service_is_running; then
       c_ok "状态: 已安装，服务正在运行"
@@ -285,6 +360,9 @@ show_brief_runtime_status() {
   echo "=============================================================="
 }
 
+# ==========================================================
+# allowlist 管理
+# ==========================================================
 show_allowlist() {
   ensure_allowlist_file
   echo "==================== allowlist.txt ===================="
@@ -459,13 +537,21 @@ batch_import_allowlist() {
   log_action "batch import allowlist added=${added} total=${after}"
 }
 
+# ==========================================================
+# 参数显示与设置
+# ==========================================================
 show_config() {
   echo "==================== 当前配置 ===================="
   echo "版本: ${SCRIPT_VERSION}"
+  echo "系统: ${OS_NAME}"
+  echo "包管理器: ${PKG_MGR}"
+  echo "架构: ${ARCH_RAW}"
   echo "DOMAIN: ${DOMAIN}"
   echo "DOH_PATH: ${DOH_PATH}"
   echo "ALLOWLIST_FILE: ${ALLOWLIST_FILE}"
   echo "ALLOWLIST_COUNT: $(allowlist_count)"
+  echo "NGINX_SITE_DIR: ${NGINX_SITE_DIR}"
+  echo "UNBOUND_CONF_DIR: ${UNBOUND_CONF_DIR}"
   echo
   echo "UPSTREAM_DOT:"
   for u in "${UPSTREAM_DOT[@]}"; do echo "  - ${u}"; done
@@ -549,20 +635,23 @@ remove_upstream() {
   save_state
 }
 
+# ==========================================================
+# 快速初始化向导
+# ==========================================================
 quick_setup_wizard() {
   c_info "快速初始化向导"
   echo
 
-  read -r -p "请问伪装域名是什么？ " input_domain
+  read -r -p "域名是什么？ " input_domain
   [[ -n "${input_domain}" ]] || { c_warn "域名为空，取消"; return; }
 
-  read -r -p "请问伪装路径是什么？ " input_path
+  read -r -p "路径是什么？ " input_path
   [[ -n "${input_path}" ]] || { c_warn "路径为空，取消"; return; }
   if [[ "${input_path:0:1}" != "/" ]]; then
     input_path="/${input_path}"
   fi
 
-  read -r -p "请问您想添加进 allowlist.txt 的域名是什么？以英文逗号分割: " input_domains
+  read -r -p "要添加进 allowlist.txt 的域名是什么？以英文逗号分割: " input_domains
   [[ -n "${input_domains}" ]] || { c_warn "allowlist 为空，取消"; return; }
 
   DOMAIN="${input_domain}"
@@ -600,8 +689,24 @@ quick_setup_wizard() {
   else
     c_warn "自动签发证书失败，请稍后在菜单中手动重试"
   fi
+
+  echo
+  read -r -p "是否立即应用配置？(y/n): " apply_now
+  case "${apply_now}" in
+    y|Y)
+      if check_domain_cert_before_apply; then
+        apply_all
+      fi
+      ;;
+    *)
+      c_info "已跳过立即应用配置"
+      ;;
+  esac
 }
 
+# ==========================================================
+# 路径与证书检查
+# ==========================================================
 doh_path_conflict_check() {
   c_info "DoH 路径冲突检测"
 
@@ -652,35 +757,48 @@ check_domain_cert_before_apply() {
   return 1
 }
 
-apt_install() {
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update -y
-  apt-get install -y --no-install-recommends \
-    ca-certificates curl wget jq unzip tar \
-    nginx openssl socat \
-    unbound
+# ==========================================================
+# 安装/修复环境
+# ==========================================================
+install_packages() {
+  case "${PKG_MGR}" in
+    apt)
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update -y
+      apt-get install -y --no-install-recommends \
+        ca-certificates curl wget jq unzip tar \
+        nginx openssl socat unbound
+      ;;
+    dnf)
+      dnf install -y \
+        ca-certificates curl wget jq unzip tar \
+        nginx openssl socat unbound
+      ;;
+    yum)
+      yum install -y \
+        ca-certificates curl wget jq unzip tar \
+        nginx openssl socat unbound
+      ;;
+    *)
+      c_err "不支持的包管理器: ${PKG_MGR}"
+      return 1
+      ;;
+  esac
+
   systemctl enable nginx >/dev/null 2>&1 || true
   systemctl enable unbound >/dev/null 2>&1 || true
   c_ok "依赖安装完成"
-  log_action "apt install deps"
+  log_action "install deps by ${PKG_MGR}"
 }
 
 download_and_install_mosdnsx() {
   c_info "安装/更新 mosdns-x"
 
-  local arch arch_key
-  arch="$(dpkg --print-architecture)"
-  case "${arch}" in
-    amd64) arch_key="amd64" ;;
-    arm64) arch_key="arm64" ;;
-    *) c_err "不支持架构: ${arch}"; return 1 ;;
-  esac
-
   local api="https://api.github.com/repos/pmkol/mosdns-x/releases/latest"
   local json asset_name asset_url
   json="$(curl -fsSL "${api}")"
 
-  asset_name="$(echo "${json}" | jq -r --arg a "${arch_key}" '
+  asset_name="$(echo "${json}" | jq -r --arg a "${ARCH_KEY}" '
     .assets[]
     | select((.name|ascii_downcase|test("linux")) and (.name|ascii_downcase|test($a)) and ((.name|ascii_downcase|endswith(".zip")) or (.name|ascii_downcase|endswith(".tar.gz"))))
     | .name
@@ -720,13 +838,13 @@ download_and_install_mosdnsx() {
 
 create_user_and_dirs() {
   if ! id -u "${MOSDNS_USER}" >/dev/null 2>&1; then
-    useradd --system --home "${WORK_DIR}" --shell /usr/sbin/nologin "${MOSDNS_USER}"
+    useradd --system --home "${WORK_DIR}" --shell /usr/sbin/nologin "${MOSDNS_USER}" || true
     c_ok "已创建用户: ${MOSDNS_USER}"
     log_action "create user ${MOSDNS_USER}"
   fi
 
-  mkdir -p "${CONF_DIR}" "${WORK_DIR}" "${NGINX_SSL_DIR}" "${ACME_WEBROOT}" "${STATIC_ROOT}"
-  chown -R "${MOSDNS_USER}:${MOSDNS_USER}" "${WORK_DIR}"
+  mkdir -p "${CONF_DIR}" "${WORK_DIR}" "${NGINX_SSL_DIR}" "${ACME_WEBROOT}" "${STATIC_ROOT}" "${UNBOUND_CONF_DIR}" "${NGINX_SITE_DIR}"
+  chown -R "${MOSDNS_USER}:${MOSDNS_USER}" "${WORK_DIR}" >/dev/null 2>&1 || true
 }
 
 install_mosdns_systemd() {
@@ -758,7 +876,7 @@ EOF
 
 ensure_environment() {
   c_info "开始安装/修复环境"
-  apt_install
+  install_packages
   create_user_and_dirs
   ensure_allowlist_file
   download_and_install_mosdnsx
@@ -767,6 +885,9 @@ ensure_environment() {
   log_action "ensure environment done"
 }
 
+# ==========================================================
+# 写入配置
+# ==========================================================
 write_unbound_forward() {
   c_info "写入 Unbound 配置: ${UNBOUND_SNIPPET}"
   backup_file "${UNBOUND_SNIPPET}"
@@ -893,7 +1014,7 @@ write_nginx_site() {
   local nginx_link="${NGINX_LINK_DIR}/doh_${DOMAIN}.conf"
 
   c_info "写入 Nginx 配置: ${nginx_site}"
-  mkdir -p "${NGINX_SITE_DIR}" "${NGINX_LINK_DIR}" "${NGINX_SSL_DIR}" "${ACME_WEBROOT}" "${STATIC_ROOT}"
+  mkdir -p "${NGINX_SITE_DIR}" "${NGINX_SSL_DIR}" "${ACME_WEBROOT}" "${STATIC_ROOT}"
   backup_file "${nginx_site}"
 
   if [[ ! -f "${STATIC_ROOT}/index.html" ]]; then
@@ -910,7 +1031,7 @@ write_nginx_site() {
   local limit_req_block=""
   if [[ "${NGX_LIMIT_REQ}" == "yes" ]]; then
     limit_req_block=$(cat <<EOF
-  limit_req_zone \$binary_remote_addr zone=doh_zone:10m rate=${NGX_RPS}r/s;
+limit_req_zone \$binary_remote_addr zone=doh_zone:10m rate=${NGX_RPS}r/s;
 EOF
 )
   fi
@@ -965,12 +1086,142 @@ ${limit_req_apply}
 }
 EOF
 
-  ln -sf "${nginx_site}" "${nginx_link}"
+  if [[ "${USE_NGINX_LINK}" == "yes" ]]; then
+    mkdir -p "${NGINX_LINK_DIR}"
+    ln -sf "${nginx_site}" "${nginx_link}"
+  fi
+
   nginx -t >/dev/null
   c_ok "Nginx 配置 OK"
   log_action "write nginx site"
 }
 
+# ==========================================================
+# 证书管理
+# ==========================================================
+acme_sh_path() { echo "/root/.acme.sh/acme.sh"; }
+
+ensure_acme_sh() {
+  if [[ ! -d /root/.acme.sh ]]; then
+    c_info "安装 acme.sh..."
+    curl -fsSL https://get.acme.sh | sh
+    c_ok "acme.sh 安装完成"
+    log_action "install acme.sh"
+  fi
+}
+
+write_nginx_http_only_for_acme() {
+  local nginx_site="${NGINX_SITE_DIR}/doh_${DOMAIN}.conf"
+  local nginx_link="${NGINX_LINK_DIR}/doh_${DOMAIN}.conf"
+
+  c_info "临时写入 Nginx(80) 用于 ACME"
+  mkdir -p "${NGINX_SITE_DIR}" "${ACME_WEBROOT}"
+
+  cat > "${nginx_site}" <<EOF
+server {
+  listen 80;
+  server_name ${DOMAIN};
+
+  location ^~ /.well-known/acme-challenge/ {
+    root ${ACME_WEBROOT};
+    default_type "text/plain";
+    try_files \$uri =404;
+  }
+
+  location / {
+    return 200 "OK";
+  }
+}
+EOF
+
+  if [[ "${USE_NGINX_LINK}" == "yes" ]]; then
+    mkdir -p "${NGINX_LINK_DIR}"
+    ln -sf "${nginx_site}" "${nginx_link}"
+  fi
+
+  nginx -t >/dev/null
+  systemctl restart nginx >/dev/null 2>&1 || true
+  c_ok "ACME 环境准备完成"
+}
+
+issue_cert() {
+  ensure_acme_sh
+  local ACME
+  ACME="$(acme_sh_path)"
+
+  c_info "开始签发证书"
+  mkdir -p "${ACME_WEBROOT}" "${NGINX_SSL_DIR}"
+
+  write_nginx_http_only_for_acme
+
+  "${ACME}" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
+
+  "${ACME}" --issue --server letsencrypt -d "${DOMAIN}" --webroot "${ACME_WEBROOT}" --keylength 2048
+  "${ACME}" --install-cert --server letsencrypt -d "${DOMAIN}" \
+    --key-file       "${NGINX_SSL_DIR}/${DOMAIN}.key" \
+    --fullchain-file "${NGINX_SSL_DIR}/fullchain.pem" \
+    --reloadcmd     "systemctl reload nginx"
+
+  c_ok "证书签发完成: ${NGINX_SSL_DIR}"
+  log_action "issue cert for ${DOMAIN}"
+}
+
+renew_cert() {
+  ensure_acme_sh
+  local ACME
+  ACME="$(acme_sh_path)"
+
+  c_info "强制续期证书"
+  "${ACME}" --renew -d "${DOMAIN}" --force >/dev/null 2>&1 || true
+  c_ok "续期完成"
+  systemctl reload nginx >/dev/null 2>&1 || true
+  log_action "renew cert for ${DOMAIN}"
+}
+
+check_cert_days() {
+  local pem="${NGINX_SSL_DIR}/fullchain.pem"
+  if [[ ! -f "${pem}" ]]; then
+    c_err "找不到证书: ${pem}"
+    return
+  fi
+
+  local end_date end_ts now_ts diff_days subject
+  end_date="$(openssl x509 -in "${pem}" -noout -enddate 2>/dev/null | cut -d= -f2-)"
+  subject="$(openssl x509 -in "${pem}" -noout -subject 2>/dev/null | sed 's/^subject=//')"
+
+  if [[ -z "${end_date}" ]]; then
+    c_err "无法读取证书到期时间"
+    return
+  fi
+
+  end_ts="$(date -d "${end_date}" +%s 2>/dev/null || true)"
+  now_ts="$(date +%s)"
+
+  if [[ -z "${end_ts}" ]]; then
+    c_err "无法解析证书时间格式"
+    echo "原始到期时间: ${end_date}"
+    return
+  fi
+
+  diff_days=$(( (end_ts - now_ts) / 86400 ))
+
+  echo "==================== 证书有效期检查 ===================="
+  echo "证书路径: ${pem}"
+  echo "证书主题: ${subject}"
+  echo "到期时间: ${end_date}"
+
+  if (( end_ts > now_ts )); then
+    c_ok "证书仍在有效期内"
+    c_info "距离过期还有 ${diff_days} 天"
+  else
+    c_err "证书已经过期"
+    c_warn "距离过期已超过 $(( -diff_days )) 天"
+  fi
+}
+
+# ==========================================================
+# 服务控制
+# ==========================================================
 reload_services() {
   c_info "重载服务: unbound / mosdns / nginx"
   systemctl restart unbound >/dev/null 2>&1 || true
@@ -1037,6 +1288,9 @@ apply_all() {
   log_action "apply all done"
 }
 
+# ==========================================================
+# 检查类输出
+# ==========================================================
 service_status_summary() {
   local failed=0
 
@@ -1124,44 +1378,9 @@ health_check_summary() {
   fi
 }
 
-check_cert_days() {
-  local pem="${NGINX_SSL_DIR}/fullchain.pem"
-  if [[ ! -f "${pem}" ]]; then
-    c_err "找不到证书: ${pem}"
-    return
-  fi
-
-  local end_date end_ts now_ts diff_days
-  end_date="$(openssl x509 -in "${pem}" -noout -enddate 2>/dev/null | cut -d= -f2-)"
-  if [[ -z "${end_date}" ]]; then
-    c_err "无法读取证书到期时间"
-    return
-  fi
-
-  end_ts="$(date -d "${end_date}" +%s 2>/dev/null || true)"
-  now_ts="$(date +%s)"
-
-  if [[ -z "${end_ts}" ]]; then
-    c_err "无法解析证书时间格式"
-    echo "原始到期时间: ${end_date}"
-    return
-  fi
-
-  diff_days=$(( (end_ts - now_ts) / 86400 ))
-
-  echo "==================== 证书有效期检查 ===================="
-  echo "证书路径: ${pem}"
-  echo "到期时间: ${end_date}"
-
-  if (( end_ts > now_ts )); then
-    c_ok "证书仍在有效期内"
-    c_info "距离过期还有 ${diff_days} 天"
-  else
-    c_err "证书已经过期"
-    c_warn "距离过期已超过 $(( -diff_days )) 天"
-  fi
-}
-
+# ==========================================================
+# 卸载
+# ==========================================================
 uninstall_all() {
   c_warn "你即将执行【彻底卸载】"
   echo "将删除以下内容："
@@ -1170,7 +1389,9 @@ uninstall_all() {
   echo " - ${WORK_DIR}"
   echo " - ${UNBOUND_SNIPPET}"
   echo " - ${NGINX_SITE_DIR}/doh_${DOMAIN}.conf"
-  echo " - ${NGINX_LINK_DIR}/doh_${DOMAIN}.conf"
+  if [[ "${USE_NGINX_LINK}" == "yes" ]]; then
+    echo " - ${NGINX_LINK_DIR}/doh_${DOMAIN}.conf"
+  fi
   echo " - ${NGINX_SSL_DIR}"
   echo " - /usr/local/bin/mosdns"
   echo
@@ -1188,7 +1409,9 @@ uninstall_all() {
   remove_if_exists "${CONF_DIR}"
   remove_if_exists "${WORK_DIR}"
   remove_if_exists "${UNBOUND_SNIPPET}"
-  remove_if_exists "${NGINX_LINK_DIR}/doh_${DOMAIN}.conf"
+  if [[ "${USE_NGINX_LINK}" == "yes" ]]; then
+    remove_if_exists "${NGINX_LINK_DIR}/doh_${DOMAIN}.conf"
+  fi
   remove_if_exists "${NGINX_SITE_DIR}/doh_${DOMAIN}.conf"
   remove_if_exists "${NGINX_SSL_DIR}"
   remove_if_exists "/usr/local/bin/mosdns"
@@ -1200,6 +1423,9 @@ uninstall_all() {
   log_action "uninstall all done"
 }
 
+# ==========================================================
+# 菜单
+# ==========================================================
 show_menu() {
   cat <<EOF
 ==================== DoH Manager PRO ${SCRIPT_VERSION} ====================
@@ -1213,25 +1439,28 @@ show_menu() {
 11. 编辑 allowlist(vim)     12. allowlist 去重排序
 
 13. 查看上游 DoT            14. 新增上游 DoT
-15. 删除上游 DoT            16. 编辑 Unbound 参数
-17. 编辑 mosdns 参数        18. 编辑 Nginx 参数
+15. 删除上游 DoT            16. 路径冲突检测
 
-19. 路径冲突检测            20. 生成配置并应用
-21. 签发证书                22. 强制续期证书
-23. 查看证书有效期          24. 查看服务状态
+17. 生成配置并应用          18. 签发证书
+19. 强制续期证书            20. 查看证书有效期
 
-25. 查看端口监听            26. 健康检查
-27. 查看日志尾部            28. 启动服务
-29. 停止服务                30. 重启服务
+21. 查看服务状态            22. 查看端口监听
+23. 健康检查                24. 查看日志尾部
+25. 启动服务                26. 停止服务
+27. 重启服务                28. 彻底卸载
 
-31. 彻底卸载                99. 退出
+99. 退出
 
 =========================================================================
 EOF
 }
 
+# ==========================================================
+# 主程序
+# ==========================================================
 main() {
   need_root
+  detect_platform
   ensure_state_file
   load_state
   ensure_allowlist_file
@@ -1271,30 +1500,25 @@ main() {
       13) list_upstreams ;;
       14) add_upstream ;;
       15) remove_upstream ;;
-      16) edit_unbound_params ;;
-      17) edit_mosdns_params ;;
-      18) edit_nginx_params ;;
+      16) doh_path_conflict_check ;;
 
-      19) doh_path_conflict_check ;;
-      20)
+      17)
         if check_domain_cert_before_apply; then
           apply_all
         fi
         ;;
+      18) issue_cert ;;
+      19) renew_cert ;;
+      20) check_cert_days ;;
 
-      21) issue_cert ;;
-      22) renew_cert ;;
-      23) check_cert_days ;;
-      24) service_status_summary ;;
-
-      25) show_ports_summary ;;
-      26) health_check_summary ;;
-      27) show_logs_tail ;;
-      28) start_services ;;
-      29) stop_services ;;
-      30) restart_services ;;
-
-      31) uninstall_all ;;
+      21) service_status_summary ;;
+      22) show_ports_summary ;;
+      23) health_check_summary ;;
+      24) show_logs_tail ;;
+      25) start_services ;;
+      26) stop_services ;;
+      27) restart_services ;;
+      28) uninstall_all ;;
 
       99) c_ok "退出"; log_action "exit"; exit 0 ;;
       *) c_warn "无效选项" ;;

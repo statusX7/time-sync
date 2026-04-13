@@ -1,4 +1,4 @@
-cat > /root/install_cfdns_v1_5.sh <<'EOF'
+cat > /root/install_cfdns_v1_7.sh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -17,6 +17,7 @@ GROUPS_FILE="${BASE_DIR}/groups.tsv"
 LOG_FILE="${LOG_DIR}/${APP_NAME}.log"
 HISTORY_FILE="${LOG_DIR}/${APP_NAME}-history.tsv"
 STATE_FILE="${VAR_DIR}/state.tsv"
+RUNSTATE_FILE="${VAR_DIR}/runstate.tsv"
 
 mkdir -p "${BASE_DIR}" "${VAR_DIR}"
 
@@ -69,7 +70,6 @@ install_missing_deps() {
 write_settings() {
   if [[ ! -f "${SETTINGS_FILE}" ]]; then
     cat > "${SETTINGS_FILE}" <<'CFG'
-# NONE / ERROR / INFO / DEBUG
 LOG_LEVEL="INFO"
 CFG
     chmod 600 "${SETTINGS_FILE}"
@@ -79,9 +79,9 @@ CFG
 write_groups() {
   if [[ ! -f "${GROUPS_FILE}" ]]; then
     cat > "${GROUPS_FILE}" <<'TSV'
-# group_name<TAB>api_token<TAB>zone_id<TAB>target_fqdn<TAB>ttl<TAB>proxied<TAB>mode<TAB>source_domains_csv
+# group_name<TAB>enabled<TAB>interval_sec<TAB>api_token<TAB>zone_id<TAB>target_fqdn<TAB>ttl<TAB>proxied<TAB>mode<TAB>source_domains_csv
 # 示例：
-# group-a	please_fill_api_token	please_fill_zone_id	tiktokeu.example.com	60	false	ALL_IPS	src1.example.com,src2.example.com
+# group-a	true	60	please_fill_api_token	please_fill_zone_id	tiktokeu.example.com	60	false	ALL_IPS	src1.example.com,src2.example.com
 TSV
     chmod 600 "${GROUPS_FILE}"
   fi
@@ -99,11 +99,12 @@ GROUPS_FILE="${BASE_DIR}/groups.tsv"
 LOG_FILE="/var/log/cf-dns-sync.log"
 HISTORY_FILE="/var/log/cf-dns-sync-history.tsv"
 STATE_FILE="${VAR_DIR}/state.tsv"
+RUNSTATE_FILE="${VAR_DIR}/runstate.tsv"
 LOCK_FILE="/run/cf-dns-sync.lock"
 
 mkdir -p "${VAR_DIR}"
-touch "${HISTORY_FILE}"
-chmod 600 "${HISTORY_FILE}"
+touch "${HISTORY_FILE}" "${RUNSTATE_FILE}"
+chmod 600 "${HISTORY_FILE}" "${RUNSTATE_FILE}"
 
 [[ -f "${SETTINGS_FILE}" ]] || { echo "配置文件不存在: ${SETTINGS_FILE}"; exit 1; }
 [[ -f "${GROUPS_FILE}" ]] || { echo "组配置不存在: ${GROUPS_FILE}"; exit 1; }
@@ -117,6 +118,7 @@ flock -n 9 || exit 0
 TARGET_GROUP="${1:-ALL}"
 
 timestamp() { date '+%F %T'; }
+now_ts() { date +%s; }
 
 level_num() {
   case "$1" in
@@ -152,7 +154,7 @@ need_cmd() {
   }
 }
 
-for cmd in curl jq dig awk sed grep sort comm mktemp flock paste cut tr; do
+for cmd in curl jq dig awk sed grep sort comm mktemp flock paste cut tr date; do
   need_cmd "$cmd"
 done
 
@@ -193,12 +195,6 @@ write_history() {
     "${target_fqdn}|${note}" >> "${HISTORY_FILE}"
 }
 
-state_key() {
-  local group_name="$1"
-  local ip="$2"
-  printf '%s\t%s' "${group_name}" "${ip}"
-}
-
 domains_by_ip_from_state() {
   local state_file="$1"
   local group_name="$2"
@@ -212,7 +208,6 @@ save_group_state() {
   local map_file="$3"
   local tmp_new
   tmp_new="$(mktemp)"
-  trap 'rm -f "$tmp_new"' RETURN
 
   if [[ -f "${full_state_file}" ]]; then
     awk -F '\t' -v g="${group_name}" '$1!=g' "${full_state_file}" > "${tmp_new}"
@@ -223,6 +218,44 @@ save_group_state() {
   awk -F '\t' -v g="${group_name}" '{print g "\t" $1 "\t" $2}' "${map_file}" >> "${tmp_new}"
   mv "${tmp_new}" "${full_state_file}"
   chmod 600 "${full_state_file}"
+}
+
+get_group_last_run() {
+  local group_name="$1"
+  awk -F '\t' -v g="${group_name}" '$1==g{print $2}' "${RUNSTATE_FILE}" | tail -n1
+}
+
+set_group_last_run() {
+  local group_name="$1"
+  local ts="$2"
+  local tmp
+  tmp="$(mktemp)"
+  if [[ -f "${RUNSTATE_FILE}" ]]; then
+    awk -F '\t' -v g="${group_name}" '$1!=g' "${RUNSTATE_FILE}" > "${tmp}"
+  else
+    : > "${tmp}"
+  fi
+  printf '%s\t%s\n' "${group_name}" "${ts}" >> "${tmp}"
+  mv "${tmp}" "${RUNSTATE_FILE}"
+  chmod 600 "${RUNSTATE_FILE}"
+}
+
+should_run_group() {
+  local group_name="$1"
+  local interval_sec="$2"
+  local last_run now
+  now="$(now_ts)"
+  last_run="$(get_group_last_run "${group_name}")"
+
+  if [[ -z "${last_run}" ]]; then
+    return 0
+  fi
+
+  if ! [[ "${interval_sec}" =~ ^[0-9]+$ ]]; then
+    return 1
+  fi
+
+  (( now - last_run >= interval_sec ))
 }
 
 get_group_map() {
@@ -281,13 +314,27 @@ delete_cf_record() {
 
 sync_one_group() {
   local group_name="$1"
-  local api_token="$2"
-  local zone_id="$3"
-  local target_fqdn="$4"
-  local ttl="$5"
-  local proxied="$6"
-  local mode="$7"
-  local sources_csv="$8"
+  local enabled="$2"
+  local interval_sec="$3"
+  local api_token="$4"
+  local zone_id="$5"
+  local target_fqdn="$6"
+  local ttl="$7"
+  local proxied="$8"
+  local mode="$9"
+  local sources_csv="${10}"
+
+  if [[ "${enabled}" != "true" ]]; then
+    log DEBUG "组 ${group_name}: 已禁用，跳过"
+    return
+  fi
+
+  if [[ "${TARGET_GROUP}" == "ALL" ]]; then
+    if ! should_run_group "${group_name}" "${interval_sec}"; then
+      log DEBUG "组 ${group_name}: 未到执行周期 ${interval_sec}s，跳过"
+      return
+    fi
+  fi
 
   local IFS=','
   read -r -a source_domains <<< "${sources_csv}"
@@ -308,6 +355,11 @@ sync_one_group() {
     return
   fi
 
+  if ! [[ "${interval_sec}" =~ ^[0-9]+$ ]] || [[ "${interval_sec}" -lt 60 ]]; then
+    log ERROR "组 ${group_name}: interval_sec 必须是 >=60 的数字"
+    return
+  fi
+
   local map_file tmp_desired tmp_current tmp_to_add tmp_to_del tmp_old_state current_json old_domains new_domains old_ip new_ip rid
   map_file="$(mktemp)"
   tmp_desired="$(mktemp)"
@@ -316,20 +368,19 @@ sync_one_group() {
   tmp_to_del="$(mktemp)"
   tmp_old_state="$(mktemp)"
 
-  trap 'rm -f "$map_file" "$tmp_desired" "$tmp_current" "$tmp_to_add" "$tmp_to_del" "$tmp_old_state"' RETURN
-
   if [[ -f "${STATE_FILE}" ]]; then
     cp -f "${STATE_FILE}" "${tmp_old_state}"
   else
     : > "${tmp_old_state}"
   fi
 
-  log DEBUG "开始同步组: ${group_name} -> ${target_fqdn}"
+  log DEBUG "组 ${group_name}: 开始同步 -> ${target_fqdn}"
 
   get_group_map "${mode}" "${source_domains[@]}" | sort -u > "${map_file}"
 
   if [[ ! -s "${map_file}" ]]; then
     log ERROR "组 ${group_name}: 未查询到任何源 IPv4，跳过同步"
+    rm -f "${map_file}" "${tmp_desired}" "${tmp_current}" "${tmp_to_add}" "${tmp_to_del}" "${tmp_old_state}"
     return
   fi
 
@@ -338,6 +389,7 @@ sync_one_group() {
   current_json="$(cf_api GET "${api_token}" "/zones/${zone_id}/dns_records?type=A&name=${target_fqdn}&per_page=100")"
   if [[ "$(echo "${current_json}" | jq -r '.success')" != "true" ]]; then
     log ERROR "组 ${group_name}: Cloudflare API 请求失败: $(echo "${current_json}" | jq -c '.')"
+    rm -f "${map_file}" "${tmp_desired}" "${tmp_current}" "${tmp_to_add}" "${tmp_to_del}" "${tmp_old_state}"
     return
   fi
 
@@ -348,7 +400,9 @@ sync_one_group() {
 
   if [[ ! -s "${tmp_to_add}" && ! -s "${tmp_to_del}" ]]; then
     save_group_state "${STATE_FILE}" "${group_name}" "${map_file}"
+    set_group_last_run "${group_name}" "$(now_ts)"
     log INFO "组 ${group_name}: IP 无变化"
+    rm -f "${map_file}" "${tmp_desired}" "${tmp_current}" "${tmp_to_add}" "${tmp_to_del}" "${tmp_old_state}"
     return
   fi
 
@@ -379,13 +433,16 @@ sync_one_group() {
   fi
 
   save_group_state "${STATE_FILE}" "${group_name}" "${map_file}"
+  set_group_last_run "${group_name}" "$(now_ts)"
   log INFO "组 ${group_name}: 增量同步完成"
+
+  rm -f "${map_file}" "${tmp_desired}" "${tmp_current}" "${tmp_to_add}" "${tmp_to_del}" "${tmp_old_state}"
 }
 
 main() {
   local matched=0
 
-  while IFS=$'\t' read -r group_name api_token zone_id target_fqdn ttl proxied mode sources_csv; do
+  while IFS=$'\t' read -r group_name enabled interval_sec api_token zone_id target_fqdn ttl proxied mode sources_csv; do
     [[ -z "${group_name}" ]] && continue
     [[ "${group_name}" =~ ^# ]] && continue
 
@@ -394,7 +451,7 @@ main() {
     fi
 
     matched=1
-    sync_one_group "${group_name}" "${api_token}" "${zone_id}" "${target_fqdn}" "${ttl}" "${proxied}" "${mode}" "${sources_csv}"
+    sync_one_group "${group_name}" "${enabled}" "${interval_sec}" "${api_token}" "${zone_id}" "${target_fqdn}" "${ttl}" "${proxied}" "${mode}" "${sources_csv}"
   done < "${GROUPS_FILE}"
 
   if [[ "${matched}" -eq 0 ]]; then
@@ -421,7 +478,9 @@ GROUPS_FILE="${BASE_DIR}/groups.tsv"
 SERVICE_NAME="${APP_NAME}.service"
 TIMER_NAME="${APP_NAME}.timer"
 LOGROTATE_FILE="/etc/logrotate.d/${APP_NAME}"
+LOG_FILE="/var/log/${APP_NAME}.log"
 HISTORY_FILE="/var/log/${APP_NAME}-history.tsv"
+RUNSTATE_FILE="${VAR_DIR}/runstate.tsv"
 
 mkdir -p "${BASE_DIR}" "${VAR_DIR}"
 
@@ -430,7 +489,7 @@ LOG_LEVEL="INFO"
 CFG
 
 [[ -f "${GROUPS_FILE}" ]] || cat > "${GROUPS_FILE}" <<'TSV'
-# group_name<TAB>api_token<TAB>zone_id<TAB>target_fqdn<TAB>ttl<TAB>proxied<TAB>mode<TAB>source_domains_csv
+# group_name<TAB>enabled<TAB>interval_sec<TAB>api_token<TAB>zone_id<TAB>target_fqdn<TAB>ttl<TAB>proxied<TAB>mode<TAB>source_domains_csv
 TSV
 
 # shellcheck disable=SC1090
@@ -442,15 +501,15 @@ color() {
 }
 
 line() {
-  printf "%s\n" "============================================================"
+  printf "%s\n" "=========================================================================="
 }
 
 title() {
   clear
   line
-  color "1;36" "                    cfdns 管理菜单 v1.5"
+  color "1;36" "                          cfdns 管理菜单 v1.7"
   echo
-  color "0;37" "            多组目标域名 / 多组源域名 / 多账号支持"
+  color "0;37" "     多组目标域名 / 组启用禁用 / 独立周期 / 组排序 / 解析测试 / 单组日志"
   line
 }
 
@@ -467,16 +526,16 @@ CFG
 }
 
 list_groups_table() {
-  printf '%-4s %-16s %-30s %-10s %-8s %-10s %-6s\n' "序号" "组名" "目标域名" "模式" "TTL" "Proxy" "源数"
-  printf '%-4s %-16s %-30s %-10s %-8s %-10s %-6s\n' "----" "----------------" "------------------------------" "----------" "--------" "----------" "------"
+  printf '%-4s %-14s %-8s %-10s %-28s %-10s %-8s %-10s %-6s\n' "序号" "组名" "启用" "周期(s)" "目标域名" "模式" "TTL" "Proxy" "源数"
+  printf '%-4s %-14s %-8s %-10s %-28s %-10s %-8s %-10s %-6s\n' "----" "--------------" "--------" "----------" "----------------------------" "----------" "--------" "----------" "------"
 
-  local i=0 line group_name api_token zone_id target_fqdn ttl proxied mode sources_csv count
-  while IFS=$'\t' read -r group_name api_token zone_id target_fqdn ttl proxied mode sources_csv; do
+  local i=0 group_name enabled interval_sec api_token zone_id target_fqdn ttl proxied mode sources_csv count
+  while IFS=$'\t' read -r group_name enabled interval_sec api_token zone_id target_fqdn ttl proxied mode sources_csv; do
     [[ -z "${group_name}" ]] && continue
     [[ "${group_name}" =~ ^# ]] && continue
     i=$((i+1))
     count="$(awk -F',' '{print NF}' <<< "${sources_csv}")"
-    printf '%-4s %-16s %-30s %-10s %-8s %-10s %-6s\n' "${i}" "${group_name}" "${target_fqdn}" "${mode}" "${ttl}" "${proxied}" "${count}"
+    printf '%-4s %-14s %-8s %-10s %-28s %-10s %-8s %-10s %-6s\n' "${i}" "${group_name}" "${enabled}" "${interval_sec}" "${target_fqdn}" "${mode}" "${ttl}" "${proxied}" "${count}"
   done < "${GROUPS_FILE}"
 
   [[ "${i}" -eq 0 ]] && echo "当前还没有任何组。"
@@ -484,14 +543,14 @@ list_groups_table() {
 
 group_line_by_index() {
   local wanted="$1"
-  local i=0 group_name api_token zone_id target_fqdn ttl proxied mode sources_csv
-  while IFS=$'\t' read -r group_name api_token zone_id target_fqdn ttl proxied mode sources_csv; do
+  local i=0 group_name enabled interval_sec api_token zone_id target_fqdn ttl proxied mode sources_csv
+  while IFS=$'\t' read -r group_name enabled interval_sec api_token zone_id target_fqdn ttl proxied mode sources_csv; do
     [[ -z "${group_name}" ]] && continue
     [[ "${group_name}" =~ ^# ]] && continue
     i=$((i+1))
     if [[ "${i}" -eq "${wanted}" ]]; then
-      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "${group_name}" "${api_token}" "${zone_id}" "${target_fqdn}" "${ttl}" "${proxied}" "${mode}" "${sources_csv}"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "${group_name}" "${enabled}" "${interval_sec}" "${api_token}" "${zone_id}" "${target_fqdn}" "${ttl}" "${proxied}" "${mode}" "${sources_csv}"
       return 0
     fi
   done < "${GROUPS_FILE}"
@@ -506,19 +565,73 @@ choose_group_index() {
   group_line_by_index "${idx}" >/dev/null
 }
 
-rewrite_groups_excluding() {
-  local exclude_group="$1"
-  awk -F '\t' -v g="${exclude_group}" '
-    BEGIN{OFS="\t"}
-    /^#/ {print; next}
-    NF==0 {next}
-    $1!=g {print}
-  ' "${GROUPS_FILE}"
+save_group_line_replace() {
+  local old_group_name="$1"
+  local new_line="$2"
+  {
+    grep '^#' "${GROUPS_FILE}" 2>/dev/null || true
+    awk -F '\t' -v g="${old_group_name}" '!/^#/ && $1!=g {print}' "${GROUPS_FILE}"
+    printf '%s\n' "${new_line}"
+  } > "${GROUPS_FILE}.tmp"
+  mv "${GROUPS_FILE}.tmp" "${GROUPS_FILE}"
+  chmod 600 "${GROUPS_FILE}"
 }
 
-write_groups_content() {
-  cat > "${GROUPS_FILE}"
+move_group_up() {
+  echo
+  if ! idx="$(choose_group_index)"; then
+    echo "序号无效"
+    return
+  fi
+  [[ "${idx}" -gt 1 ]] || { echo "该组已经在最上方"; return; }
+
+  awk -v target="${idx}" '
+    BEGIN{n=0}
+    /^#/ {comments[++c]=$0; next}
+    NF==0 {next}
+    {rows[++n]=$0}
+    END{
+      for(i=1;i<=c;i++) print comments[i]
+      tmp=rows[target-1]
+      rows[target-1]=rows[target]
+      rows[target]=tmp
+      for(i=1;i<=n;i++) print rows[i]
+    }
+  ' "${GROUPS_FILE}" > "${GROUPS_FILE}.tmp"
+
+  mv "${GROUPS_FILE}.tmp" "${GROUPS_FILE}"
   chmod 600 "${GROUPS_FILE}"
+  echo "已上移"
+}
+
+move_group_down() {
+  echo
+  if ! idx="$(choose_group_index)"; then
+    echo "序号无效"
+    return
+  fi
+
+  local total
+  total="$(awk 'BEGIN{n=0} !/^#/ && NF>0 {n++} END{print n}' "${GROUPS_FILE}")"
+  [[ "${idx}" -lt "${total}" ]] || { echo "该组已经在最下方"; return; }
+
+  awk -v target="${idx}" '
+    BEGIN{n=0}
+    /^#/ {comments[++c]=$0; next}
+    NF==0 {next}
+    {rows[++n]=$0}
+    END{
+      for(i=1;i<=c;i++) print comments[i]
+      tmp=rows[target+1]
+      rows[target+1]=rows[target]
+      rows[target]=tmp
+      for(i=1;i<=n;i++) print rows[i]
+    }
+  ' "${GROUPS_FILE}" > "${GROUPS_FILE}.tmp"
+
+  mv "${GROUPS_FILE}.tmp" "${GROUPS_FILE}"
+  chmod 600 "${GROUPS_FILE}"
+  echo "已下移"
 }
 
 add_group() {
@@ -532,6 +645,20 @@ add_group() {
     echo "组名已存在"
     return
   fi
+
+  echo "是否启用该组："
+  echo "1. true（启用）"
+  echo "2. false（禁用）"
+  read -rp "请选择 [1-2]: " enabled_choice
+  case "${enabled_choice}" in
+    1|"") enabled="true" ;;
+    2) enabled="false" ;;
+    *) echo "无效选择"; return ;;
+  esac
+
+  read -rp "请输入同步周期秒数（最小 60，推荐 60 / 300 / 600）: " interval_sec
+  [[ "${interval_sec}" =~ ^[0-9]+$ ]] || { echo "必须为数字"; return; }
+  [[ "${interval_sec}" -ge 60 ]] || { echo "不能小于 60"; return; }
 
   read -rp "请输入 Cloudflare API Token: " api_token
   read -rp "请输入 Zone ID: " zone_id
@@ -580,8 +707,8 @@ add_group() {
   {
     grep '^#' "${GROUPS_FILE}" 2>/dev/null || true
     awk 'BEGIN{skip=1} !/^#/{skip=0} skip==0{print}' "${GROUPS_FILE}" 2>/dev/null || true
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "${group_name}" "${api_token}" "${zone_id}" "${target_fqdn}" "${ttl}" "${proxied}" "${mode}" "${sources_csv}"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "${group_name}" "${enabled}" "${interval_sec}" "${api_token}" "${zone_id}" "${target_fqdn}" "${ttl}" "${proxied}" "${mode}" "${sources_csv}"
   } > "${GROUPS_FILE}.tmp"
 
   mv "${GROUPS_FILE}.tmp" "${GROUPS_FILE}"
@@ -613,6 +740,51 @@ delete_group() {
   echo "已删除组：${group_name}"
 }
 
+toggle_group_enabled() {
+  echo
+  if ! idx="$(choose_group_index)"; then
+    echo "序号无效"
+    return
+  fi
+
+  local line group_name enabled interval_sec api_token zone_id target_fqdn ttl proxied mode sources_csv
+  line="$(group_line_by_index "${idx}")"
+  IFS=$'\t' read -r group_name enabled interval_sec api_token zone_id target_fqdn ttl proxied mode sources_csv <<< "${line}"
+
+  if [[ "${enabled}" == "true" ]]; then
+    enabled="false"
+  else
+    enabled="true"
+  fi
+
+  save_group_line_replace "$(cut -f1 <<< "${line}")" \
+    "$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' "${group_name}" "${enabled}" "${interval_sec}" "${api_token}" "${zone_id}" "${target_fqdn}" "${ttl}" "${proxied}" "${mode}" "${sources_csv}")"
+
+  echo "组 ${group_name} 已切换为 ${enabled}"
+}
+
+set_group_interval() {
+  echo
+  if ! idx="$(choose_group_index)"; then
+    echo "序号无效"
+    return
+  fi
+
+  local line group_name enabled interval_sec api_token zone_id target_fqdn ttl proxied mode sources_csv new_interval
+  line="$(group_line_by_index "${idx}")"
+  IFS=$'\t' read -r group_name enabled interval_sec api_token zone_id target_fqdn ttl proxied mode sources_csv <<< "${line}"
+
+  echo "当前组 ${group_name} 的同步周期为 ${interval_sec} 秒"
+  read -rp "请输入新的同步周期秒数（最小 60）: " new_interval
+  [[ "${new_interval}" =~ ^[0-9]+$ ]] || { echo "必须为数字"; return; }
+  [[ "${new_interval}" -ge 60 ]] || { echo "不能小于 60"; return; }
+
+  save_group_line_replace "$(cut -f1 <<< "${line}")" \
+    "$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' "${group_name}" "${enabled}" "${new_interval}" "${api_token}" "${zone_id}" "${target_fqdn}" "${ttl}" "${proxied}" "${mode}" "${sources_csv}")"
+
+  echo "组 ${group_name} 的同步周期已更新为 ${new_interval} 秒"
+}
+
 manage_group_sources() {
   echo
   if ! idx="$(choose_group_index)"; then
@@ -620,9 +792,9 @@ manage_group_sources() {
     return
   fi
 
-  local line group_name api_token zone_id target_fqdn ttl proxied mode sources_csv
+  local line group_name enabled interval_sec api_token zone_id target_fqdn ttl proxied mode sources_csv
   line="$(group_line_by_index "${idx}")"
-  IFS=$'\t' read -r group_name api_token zone_id target_fqdn ttl proxied mode sources_csv <<< "${line}"
+  IFS=$'\t' read -r group_name enabled interval_sec api_token zone_id target_fqdn ttl proxied mode sources_csv <<< "${line}"
 
   local sources=()
   IFS=',' read -r -a sources <<< "${sources_csv}"
@@ -672,30 +844,15 @@ manage_group_sources() {
         unset 'sources[del_idx-1]'
         sources=("${sources[@]}")
         ;;
-      0)
-        break
-        ;;
-      *)
-        echo "无效选择"
-        pause_wait
-        continue
-        ;;
+      0) break ;;
+      *) echo "无效选择"; pause_wait; continue ;;
     esac
 
     local new_sources_csv
     new_sources_csv="$(IFS=,; echo "${sources[*]}")"
 
-    {
-      grep '^#' "${GROUPS_FILE}" 2>/dev/null || true
-      awk -F '\t' -v g="${group_name}" -v OFS='\t' '
-        !/^#/ && $1!=g {print}
-      ' "${GROUPS_FILE}"
-      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "${group_name}" "${api_token}" "${zone_id}" "${target_fqdn}" "${ttl}" "${proxied}" "${mode}" "${new_sources_csv}"
-    } > "${GROUPS_FILE}.tmp"
-
-    mv "${GROUPS_FILE}.tmp" "${GROUPS_FILE}"
-    chmod 600 "${GROUPS_FILE}"
+    save_group_line_replace "${group_name}" \
+      "$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' "${group_name}" "${enabled}" "${interval_sec}" "${api_token}" "${zone_id}" "${target_fqdn}" "${ttl}" "${proxied}" "${mode}" "${new_sources_csv}")"
   done
 }
 
@@ -706,9 +863,10 @@ edit_group_basic() {
     return
   fi
 
-  local line group_name api_token zone_id target_fqdn ttl proxied mode sources_csv
+  local line old_group_name group_name enabled interval_sec api_token zone_id target_fqdn ttl proxied mode sources_csv
   line="$(group_line_by_index "${idx}")"
-  IFS=$'\t' read -r group_name api_token zone_id target_fqdn ttl proxied mode sources_csv <<< "${line}"
+  old_group_name="$(cut -f1 <<< "${line}")"
+  IFS=$'\t' read -r group_name enabled interval_sec api_token zone_id target_fqdn ttl proxied mode sources_csv <<< "${line}"
 
   echo "当前组名: ${group_name}"
   read -rp "新组名（直接回车保持不变）: " new_group_name
@@ -742,15 +900,9 @@ edit_group_basic() {
     *) echo "无效选择"; return ;;
   esac
 
-  {
-    grep '^#' "${GROUPS_FILE}" 2>/dev/null || true
-    awk -F '\t' -v g_old="$(cut -f1 <<< "${line}")" '!/^#/ && $1!=g_old {print}' "${GROUPS_FILE}"
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "${group_name}" "${api_token}" "${zone_id}" "${target_fqdn}" "${ttl}" "${proxied}" "${mode}" "${sources_csv}"
-  } > "${GROUPS_FILE}.tmp"
+  save_group_line_replace "${old_group_name}" \
+    "$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' "${group_name}" "${enabled}" "${interval_sec}" "${api_token}" "${zone_id}" "${target_fqdn}" "${ttl}" "${proxied}" "${mode}" "${sources_csv}")"
 
-  mv "${GROUPS_FILE}.tmp" "${GROUPS_FILE}"
-  chmod 600 "${GROUPS_FILE}"
   echo "组配置已更新"
 }
 
@@ -773,6 +925,65 @@ set_log_level() {
 
   save_settings
   echo "日志等级已设置为 ${LOG_LEVEL}"
+}
+
+test_group_token() {
+  echo
+  if ! idx="$(choose_group_index)"; then
+    echo "序号无效"
+    return
+  fi
+
+  local line group_name enabled interval_sec api_token zone_id target_fqdn ttl proxied mode sources_csv resp
+  line="$(group_line_by_index "${idx}")"
+  IFS=$'\t' read -r group_name enabled interval_sec api_token zone_id target_fqdn ttl proxied mode sources_csv <<< "${line}"
+
+  echo "正在测试组 ${group_name} 的 API Token 与 Zone ID..."
+  resp="$(curl -sS -X GET "https://api.cloudflare.com/client/v4/zones/${zone_id}" \
+    -H "Authorization: Bearer ${api_token}" \
+    -H "Content-Type: application/json")"
+
+  if [[ "$(echo "${resp}" | jq -r '.success')" == "true" ]]; then
+    echo "测试成功"
+    echo "组名: ${group_name}"
+    echo "Zone: $(echo "${resp}" | jq -r '.result.name // "unknown"')"
+    echo "Zone Status: $(echo "${resp}" | jq -r '.result.status // "unknown"')"
+  else
+    echo "测试失败"
+    echo "${resp}" | jq .
+  fi
+}
+
+test_group_sources_dns() {
+  echo
+  if ! idx="$(choose_group_index)"; then
+    echo "序号无效"
+    return
+  fi
+
+  local line group_name enabled interval_sec api_token zone_id target_fqdn ttl proxied mode sources_csv
+  line="$(group_line_by_index "${idx}")"
+  IFS=$'\t' read -r group_name enabled interval_sec api_token zone_id target_fqdn ttl proxied mode sources_csv <<< "${line}"
+
+  local sources=()
+  IFS=',' read -r -a sources <<< "${sources_csv}"
+
+  echo "测试组 ${group_name} 的源域名解析情况"
+  printf '%-4s %-45s %-8s %-6s %-40s\n' "序号" "源域名" "状态" "数量" "IPv4结果"
+  printf '%-4s %-45s %-8s %-6s %-40s\n' "----" "---------------------------------------------" "--------" "------" "----------------------------------------"
+
+  local i=0 domain ips count joined
+  for domain in "${sources[@]}"; do
+    i=$((i+1))
+    ips="$(dig +short A "${domain}" | sed '/^$/d' | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' || true)"
+    count="$(echo "${ips}" | sed '/^$/d' | wc -l | awk '{print $1}')"
+    joined="$(echo "${ips}" | paste -sd ',' -)"
+    if [[ "${count}" -gt 0 ]]; then
+      printf '%-4s %-45s %-8s %-6s %-40s\n' "${i}" "${domain}" "正常" "${count}" "${joined:0:40}"
+    else
+      printf '%-4s %-45s %-8s %-6s %-40s\n' "${i}" "${domain}" "失败" "0" "-"
+    fi
+  done
 }
 
 start_sync() {
@@ -829,6 +1040,29 @@ follow_logs() {
   journalctl -u "${SERVICE_NAME}" -f
 }
 
+show_group_runtime_logs() {
+  if [[ "${LOG_LEVEL}" == "NONE" ]]; then
+    echo "当前日志等级为 NONE，普通运行日志不输出"
+    return
+  fi
+
+  echo
+  if ! idx="$(choose_group_index)"; then
+    echo "序号无效"
+    return
+  fi
+
+  local line group_name
+  line="$(group_line_by_index "${idx}")"
+  group_name="$(cut -f1 <<< "${line}")"
+
+  if [[ -f "${LOG_FILE}" ]]; then
+    grep "组 ${group_name}:" "${LOG_FILE}" | tail -n 200 || echo "暂无该组运行日志"
+  else
+    echo "日志文件不存在"
+  fi
+}
+
 show_status() {
   systemctl status "${SERVICE_NAME}" --no-pager -l || true
   echo
@@ -836,18 +1070,29 @@ show_status() {
   echo
   echo "LOG_LEVEL=${LOG_LEVEL}"
   echo "GROUPS_FILE=${GROUPS_FILE}"
+  echo "RUNSTATE_FILE=${RUNSTATE_FILE}"
 }
 
 show_dep_status() {
   printf '%-18s %-10s\n' "Command" "Status"
   printf '%-18s %-10s\n' "------------------" "----------"
-  for cmd in curl jq dig flock logrotate zcat awk sed grep comm mktemp paste cut tr; do
+  for cmd in curl jq dig flock logrotate zcat awk sed grep comm mktemp paste cut tr date; do
     if command -v "${cmd}" >/dev/null 2>&1; then
       printf '%-18s %-10s\n' "${cmd}" "OK"
     else
       printf '%-18s %-10s\n' "${cmd}" "MISSING"
     fi
   done
+}
+
+show_runstate() {
+  if [[ ! -f "${RUNSTATE_FILE}" ]]; then
+    echo "暂无运行状态记录"
+    return
+  fi
+  printf '%-16s %-20s\n' "组名" "上次执行时间"
+  printf '%-16s %-20s\n' "----------------" "--------------------"
+  awk -F '\t' '{ cmd="date -d @" $2 " \"+%F %T\""; cmd | getline t; close(cmd); printf "%-16s %-20s\n", $1, t }' "${RUNSTATE_FILE}" | sort
 }
 
 render_history_table() {
@@ -966,22 +1211,30 @@ menu() {
     echo "  3.  删除组（Delete Group / 删除组）"
     echo "  4.  编辑组基础信息（Edit Group / 编辑组）"
     echo "  5.  管理组内源域名（Manage Sources / 源域名管理）"
-    echo "  6.  设置日志等级（Log Level / 日志等级）"
-    echo "  7.  启动（Start / 启动）"
-    echo "  8.  停止（Stop / 停止）"
-    echo "  9.  重启（Restart / 重启）"
-    echo " 10.  手动同步全部组（Sync All / 全部同步）"
-    echo " 11.  手动同步单个组（Sync One / 单组同步）"
-    echo " 12.  查看最近日志（Logs / 最近日志）"
-    echo " 13.  实时查看日志（Follow Logs / 实时日志）"
-    echo " 14.  查看 service/timer 状态（Status / 状态）"
-    echo " 15.  查看依赖状态（Dependencies / 依赖）"
-    echo " 16.  查看半年内全部历史（History All / 全部历史）"
-    echo " 17.  查看半年内全部删除记录（Deleted All / 全部删除）"
-    echo " 18.  查看某一组历史（History One Group / 单组历史）"
-    echo " 19.  查看某一组删除记录（Deleted One Group / 单组删除）"
-    echo " 20.  编辑原始配置文件（Edit Raw Files / 原始配置）"
-    echo " 21.  彻底卸载（Uninstall / 卸载）"
+    echo "  6.  切换组启用状态（Enable/Disable / 启用禁用）"
+    echo "  7.  设置组同步周期（Set Interval / 同步周期）"
+    echo "  8.  测试组 API Token（Test Token / 测试令牌）"
+    echo "  9.  测试组源域名解析（Test Sources DNS / 解析测试）"
+    echo " 10.  组上移（Move Up / 上移）"
+    echo " 11.  组下移（Move Down / 下移）"
+    echo " 12.  设置日志等级（Log Level / 日志等级）"
+    echo " 13.  启动（Start / 启动）"
+    echo " 14.  停止（Stop / 停止）"
+    echo " 15.  重启（Restart / 重启）"
+    echo " 16.  手动同步全部组（Sync All / 全部同步）"
+    echo " 17.  手动同步单个组（Sync One / 单组同步）"
+    echo " 18.  查看最近日志（Logs / 最近日志）"
+    echo " 19.  实时查看日志（Follow Logs / 实时日志）"
+    echo " 20.  查看单组运行日志（One Group Logs / 单组日志）"
+    echo " 21.  查看 service/timer 状态（Status / 状态）"
+    echo " 22.  查看依赖状态（Dependencies / 依赖）"
+    echo " 23.  查看各组上次执行时间（Run State / 执行状态）"
+    echo " 24.  查看半年内全部历史（History All / 全部历史）"
+    echo " 25.  查看半年内全部删除记录（Deleted All / 全部删除）"
+    echo " 26.  查看某一组历史（History One Group / 单组历史）"
+    echo " 27.  查看某一组删除记录（Deleted One Group / 单组删除）"
+    echo " 28.  编辑原始配置文件（Edit Raw Files / 原始配置）"
+    echo " 29.  彻底卸载（Uninstall / 卸载）"
     echo "  0.  退出（Exit / 退出）"
     line
     read -rp "请选择: " choice
@@ -992,22 +1245,30 @@ menu() {
       3) delete_group; pause_wait ;;
       4) edit_group_basic; pause_wait ;;
       5) manage_group_sources ;;
-      6) set_log_level; pause_wait ;;
-      7) start_sync; pause_wait ;;
-      8) stop_sync; pause_wait ;;
-      9) restart_sync; pause_wait ;;
-      10) manual_run_all; pause_wait ;;
-      11) manual_run_one; pause_wait ;;
-      12) show_logs; pause_wait ;;
-      13) follow_logs ;;
-      14) show_status; pause_wait ;;
-      15) show_dep_status; pause_wait ;;
-      16) show_history_all; pause_wait ;;
-      17) show_deleted_all; pause_wait ;;
-      18) show_history_one_group; pause_wait ;;
-      19) show_deleted_one_group; pause_wait ;;
-      20) edit_raw_files ;;
-      21) uninstall_all ;;
+      6) toggle_group_enabled; pause_wait ;;
+      7) set_group_interval; pause_wait ;;
+      8) test_group_token; pause_wait ;;
+      9) test_group_sources_dns; pause_wait ;;
+      10) move_group_up; pause_wait ;;
+      11) move_group_down; pause_wait ;;
+      12) set_log_level; pause_wait ;;
+      13) start_sync; pause_wait ;;
+      14) stop_sync; pause_wait ;;
+      15) restart_sync; pause_wait ;;
+      16) manual_run_all; pause_wait ;;
+      17) manual_run_one; pause_wait ;;
+      18) show_logs; pause_wait ;;
+      19) follow_logs ;;
+      20) show_group_runtime_logs; pause_wait ;;
+      21) show_status; pause_wait ;;
+      22) show_dep_status; pause_wait ;;
+      23) show_runstate; pause_wait ;;
+      24) show_history_all; pause_wait ;;
+      25) show_deleted_all; pause_wait ;;
+      26) show_history_one_group; pause_wait ;;
+      27) show_deleted_one_group; pause_wait ;;
+      28) edit_raw_files ;;
+      29) uninstall_all ;;
       0) exit 0 ;;
       *) echo "无效选择"; sleep 1 ;;
     esac
@@ -1076,19 +1337,21 @@ main() {
   write_timer
   write_logrotate
 
-  touch "${HISTORY_FILE}"
-  chmod 600 "${HISTORY_FILE}"
+  touch "${HISTORY_FILE}" "${RUNSTATE_FILE}"
+  chmod 600 "${HISTORY_FILE}" "${RUNSTATE_FILE}"
 
   systemctl daemon-reload
   systemctl enable --now "${APP_NAME}.timer"
   systemctl start "${APP_NAME}.service" || true
 
   echo
-  echo "安装/升级完成: v1.5"
+  echo "安装/升级完成: v1.7"
   echo "管理命令: cfdns"
   echo "组配置文件: ${GROUPS_FILE}"
   echo "全局设置文件: ${SETTINGS_FILE}"
   echo "同步脚本: ${BIN_SYNC}"
+  echo "日志文件: ${LOG_FILE}"
+  echo "历史文件: ${HISTORY_FILE}"
   echo "日志轮转: ${LOGROTATE_FILE}"
   echo
   systemctl status "${APP_NAME}.timer" --no-pager -l || true
@@ -1097,5 +1360,5 @@ main() {
 main "$@"
 EOF
 
-chmod +x /root/install_cfdns_v1_5.sh
-bash /root/install_cfdns_v1_5.sh
+chmod +x /root/install_cfdns_v1_7.sh
+bash /root/install_cfdns_v1_7.sh

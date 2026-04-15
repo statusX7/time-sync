@@ -3,17 +3,16 @@ set -euo pipefail
 
 ############################################
 # DoH Manager PRO (All-in-One + allowlist.txt)
-# Version: v2.6
+# Version: v2.6.1
 #
-# v2.6 更新：
-# 1) 修复 24 选项 show_logs_tail: command not found
-# 2) 24 改为“日志设置”二级菜单
-# 3) 新增日志等级设置 / 最近50条日志 / 实时查看日志
-# 4) 日志等级修改后自动重写 mosdns 配置并重启 mosdns
-# 5) 保持 v2.5 的 Linux 自动识别、首次初始化立即应用、证书主题显示等能力
+# v2.6.1 更新：
+# 1) 增加启动自检：自动检查菜单引用函数是否存在
+# 2) 增加版本完整性检查：检查核心函数依赖链是否完整
+# 3) 补全完整功能模块，避免再次出现“菜单有、函数没定义”
+# 4) 保留 v2.6 的日志设置二级菜单
 ############################################
 
-SCRIPT_VERSION="v2.6"
+SCRIPT_VERSION="v2.6.1"
 
 # ==========================================================
 # 运行时全局变量
@@ -142,6 +141,10 @@ remove_if_exists() {
   else
     c_warn "不存在，跳过: ${path}"
   fi
+}
+
+function_exists() {
+  declare -F "$1" >/dev/null 2>&1
 }
 
 # ==========================================================
@@ -758,6 +761,345 @@ check_domain_cert_before_apply() {
 }
 
 # ==========================================================
+# 安装/修复环境
+# ==========================================================
+install_packages() {
+  case "${PKG_MGR}" in
+    apt)
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update -y
+      apt-get install -y --no-install-recommends \
+        ca-certificates curl wget jq unzip tar \
+        nginx openssl socat unbound
+      ;;
+    dnf)
+      dnf install -y \
+        ca-certificates curl wget jq unzip tar \
+        nginx openssl socat unbound
+      ;;
+    yum)
+      yum install -y \
+        ca-certificates curl wget jq unzip tar \
+        nginx openssl socat unbound
+      ;;
+    *)
+      c_err "不支持的包管理器: ${PKG_MGR}"
+      return 1
+      ;;
+  esac
+
+  systemctl enable nginx >/dev/null 2>&1 || true
+  systemctl enable unbound >/dev/null 2>&1 || true
+  c_ok "依赖安装完成"
+  log_action "install deps by ${PKG_MGR}"
+}
+
+download_and_install_mosdnsx() {
+  c_info "安装/更新 mosdns-x"
+
+  local api="https://api.github.com/repos/pmkol/mosdns-x/releases/latest"
+  local json asset_name asset_url
+  json="$(curl -fsSL "${api}")"
+
+  asset_name="$(echo "${json}" | jq -r --arg a "${ARCH_KEY}" '
+    .assets[]
+    | select((.name|ascii_downcase|test("linux")) and (.name|ascii_downcase|test($a)) and ((.name|ascii_downcase|endswith(".zip")) or (.name|ascii_downcase|endswith(".tar.gz"))))
+    | .name
+  ' | head -n 1)"
+
+  asset_url="$(echo "${json}" | jq -r --arg n "${asset_name}" '
+    .assets[] | select(.name==$n) | .browser_download_url
+  ')"
+
+  [[ -n "${asset_name}" && -n "${asset_url}" && "${asset_url}" != "null" ]] || {
+    c_err "未找到 mosdns-x 发行包"
+    return 1
+  }
+
+  c_info "-> ${asset_name}"
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  curl -fL --retry 3 --retry-delay 1 -o "${tmpdir}/${asset_name}" "${asset_url}"
+  mkdir -p "${tmpdir}/out"
+
+  if [[ "${asset_name,,}" == *.zip ]]; then
+    unzip -q "${tmpdir}/${asset_name}" -d "${tmpdir}/out"
+  else
+    tar -xzf "${tmpdir}/${asset_name}" -C "${tmpdir}/out"
+  fi
+
+  local bin
+  bin="$(find "${tmpdir}/out" -maxdepth 3 -type f \( -name "mosdns" -o -name "mosdns-x" \) | head -n 1 || true)"
+  [[ -n "${bin}" ]] || { c_err "解压后未找到 mosdns 二进制"; rm -rf "${tmpdir}"; return 1; }
+
+  install -m 0755 "${bin}" /usr/local/bin/mosdns
+  rm -rf "${tmpdir}"
+
+  c_ok "mosdns-x 安装完成: /usr/local/bin/mosdns"
+  log_action "install mosdns-x"
+}
+
+create_user_and_dirs() {
+  if ! id -u "${MOSDNS_USER}" >/dev/null 2>&1; then
+    useradd --system --home "${WORK_DIR}" --shell /usr/sbin/nologin "${MOSDNS_USER}" || true
+    c_ok "已创建用户: ${MOSDNS_USER}"
+    log_action "create user ${MOSDNS_USER}"
+  fi
+
+  mkdir -p "${CONF_DIR}" "${WORK_DIR}" "${NGINX_SSL_DIR}" "${ACME_WEBROOT}" "${STATIC_ROOT}" "${UNBOUND_CONF_DIR}" "${NGINX_SITE_DIR}"
+  chown -R "${MOSDNS_USER}:${MOSDNS_USER}" "${WORK_DIR}" >/dev/null 2>&1 || true
+}
+
+install_mosdns_systemd() {
+  c_info "安装/修复 mosdns systemd 服务"
+  cat > /etc/systemd/system/mosdns.service <<EOF
+[Unit]
+Description=mosdns-x (DoH backend)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=${MOSDNS_USER}
+Group=${MOSDNS_USER}
+WorkingDirectory=${WORK_DIR}
+ExecStart=/usr/local/bin/mosdns start -c ${CONF_DIR}/config.yaml -d ${WORK_DIR}
+Restart=on-failure
+RestartSec=1s
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable mosdns >/dev/null 2>&1 || true
+  c_ok "mosdns systemd 已就绪"
+  log_action "install systemd mosdns"
+}
+
+ensure_environment() {
+  c_info "开始安装/修复环境"
+  install_packages
+  create_user_and_dirs
+  ensure_allowlist_file
+  download_and_install_mosdnsx
+  install_mosdns_systemd
+  c_ok "环境准备完成"
+  log_action "ensure environment done"
+}
+
+# ==========================================================
+# 写入配置
+# ==========================================================
+write_unbound_forward() {
+  c_info "写入 Unbound 配置: ${UNBOUND_SNIPPET}"
+  backup_file "${UNBOUND_SNIPPET}"
+  mkdir -p "$(dirname "${UNBOUND_SNIPPET}")"
+
+  {
+    echo "server:"
+    echo "  interface: 127.0.0.1"
+    echo "  port: ${UNBOUND_PORT}"
+    echo "  access-control: 127.0.0.0/8 allow"
+    echo ""
+    echo "  msg-cache-size: ${UB_MSG_CACHE}"
+    echo "  rrset-cache-size: ${UB_RRSET_CACHE}"
+    echo "  cache-min-ttl: ${UB_MIN_TTL}"
+    echo "  cache-max-ttl: ${UB_MAX_TTL}"
+    echo "  prefetch: ${UB_PREFETCH}"
+    echo "  prefetch-key: ${UB_PREFETCH}"
+    echo ""
+    echo "  serve-expired: ${UB_SERVE_EXPIRED}"
+    echo "  serve-expired-ttl: ${UB_SERVE_EXPIRED_TTL}"
+    echo "  serve-expired-reply-ttl: ${UB_SERVE_EXPIRED_REPLY_TTL}"
+    echo ""
+    echo "  do-ip6: ${UB_DO_IP6}"
+    echo ""
+    echo "  hide-identity: yes"
+    echo "  hide-version: yes"
+    echo "  qname-minimisation: yes"
+    echo ""
+    echo "forward-zone:"
+    echo "  name: \".\""
+    echo "  forward-tls-upstream: yes"
+    for u in "${UPSTREAM_DOT[@]}"; do
+      echo "  forward-addr: ${u}"
+    done
+  } > "${UNBOUND_SNIPPET}"
+
+  unbound-checkconf >/dev/null 2>&1 || {
+    c_err "unbound-checkconf 检查失败"
+    exit 1
+  }
+  c_ok "Unbound 配置 OK"
+  log_action "write unbound config"
+}
+
+build_domain_rules_from_allowlist() {
+  ensure_allowlist_file
+
+  local cnt
+  cnt="$(allowlist_count)"
+  if (( cnt <= 0 )); then
+    c_err "allowlist.txt 为空: ${ALLOWLIST_FILE}"
+    return 1
+  fi
+
+  awk '
+    /^[[:space:]]*#/ {next}
+    /^[[:space:]]*$/ {next}
+    {
+      gsub(/\r/,"",$0)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
+      if (length($0)>0) print "        - \"domain:" $0 "\""
+    }
+  ' "${ALLOWLIST_FILE}"
+}
+
+write_mosdns_config() {
+  c_info "写入 mosdns 配置: ${CONF_DIR}/config.yaml"
+  mkdir -p "${CONF_DIR}"
+  backup_file "${CONF_DIR}/config.yaml"
+
+  local domain_rules
+  domain_rules="$(build_domain_rules_from_allowlist)" || return 1
+
+  local deny_action="_new_refused_response"
+  if [[ "${DENY_MODE}" == "nxdomain" ]]; then
+    deny_action="_new_nxdomain_response"
+  fi
+
+  cat > "${CONF_DIR}/config.yaml" <<EOF
+log:
+  level: ${MOS_LOG_LEVEL}
+
+plugins:
+  - tag: allow_list
+    type: query_matcher
+    args:
+      domain:
+${domain_rules}
+
+  - tag: forward_local_unbound
+    type: fast_forward
+    args:
+      upstream:
+        - addr: "udp://127.0.0.1:${UNBOUND_PORT}"
+          trusted: true
+        - addr: "tcp://127.0.0.1:${UNBOUND_PORT}"
+          trusted: true
+
+  - tag: main_sequence
+    type: sequence
+    args:
+      exec:
+        - if: "! allow_list"
+          exec:
+            - ${deny_action}
+            - _return
+        - _default_cache
+        - forward_local_unbound
+
+servers:
+  - exec: main_sequence
+    listeners:
+      - protocol: http
+        addr: "${MOSDNS_HTTP_ADDR}"
+        url_path: "${DOH_PATH}"
+EOF
+
+  c_ok "mosdns 配置 OK"
+  log_action "write mosdns config"
+}
+
+write_nginx_site() {
+  local nginx_site="${NGINX_SITE_DIR}/doh_${DOMAIN}.conf"
+  local nginx_link="${NGINX_LINK_DIR}/doh_${DOMAIN}.conf"
+
+  c_info "写入 Nginx 配置: ${nginx_site}"
+  mkdir -p "${NGINX_SITE_DIR}" "${NGINX_SSL_DIR}" "${ACME_WEBROOT}" "${STATIC_ROOT}"
+  backup_file "${nginx_site}"
+
+  if [[ ! -f "${STATIC_ROOT}/index.html" ]]; then
+    echo "${TEMPLATE_SIMPLE}" > "${STATIC_ROOT}/index.html"
+  fi
+
+  rm -f /etc/nginx/sites-enabled/default >/dev/null 2>&1 || true
+
+  local http2_line=""
+  if [[ "${NGX_HTTP2}" == "yes" ]]; then
+    http2_line="http2"
+  fi
+
+  local limit_req_block=""
+  if [[ "${NGX_LIMIT_REQ}" == "yes" ]]; then
+    limit_req_block=$(cat <<EOF
+limit_req_zone \$binary_remote_addr zone=doh_zone:10m rate=${NGX_RPS}r/s;
+EOF
+)
+  fi
+
+  local limit_req_apply=""
+  if [[ "${NGX_LIMIT_REQ}" == "yes" ]]; then
+    limit_req_apply=$(cat <<EOF
+    limit_req zone=doh_zone burst=${NGX_BURST} nodelay;
+EOF
+)
+  fi
+
+  cat > "${nginx_site}" <<EOF
+${limit_req_block}
+server {
+  listen 80;
+  server_name ${DOMAIN};
+
+  location ^~ /.well-known/acme-challenge/ {
+    root ${ACME_WEBROOT};
+    default_type "text/plain";
+    try_files \$uri =404;
+  }
+
+  location / {
+    return 301 https://\$host\$request_uri;
+  }
+}
+
+server {
+  listen 443 ssl ${http2_line};
+  server_name ${DOMAIN};
+
+  ssl_certificate     ${NGINX_SSL_DIR}/fullchain.pem;
+  ssl_certificate_key ${NGINX_SSL_DIR}/${DOMAIN}.key;
+  ssl_protocols TLSv1.2 TLSv1.3;
+
+  location = ${DOH_PATH} {
+${limit_req_apply}
+    proxy_http_version 1.1;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_buffering off;
+    proxy_pass http://${MOSDNS_HTTP_ADDR};
+  }
+
+  location / {
+    root ${STATIC_ROOT};
+    try_files \$uri \$uri/ =404;
+  }
+}
+EOF
+
+  if [[ "${USE_NGINX_LINK}" == "yes" ]]; then
+    mkdir -p "${NGINX_LINK_DIR}"
+    ln -sf "${nginx_site}" "${nginx_link}"
+  fi
+
+  nginx -t >/dev/null
+  c_ok "Nginx 配置 OK"
+  log_action "write nginx site"
+}
+
+# ==========================================================
 # 日志设置
 # ==========================================================
 validate_mos_log_level() {
@@ -1137,6 +1479,93 @@ health_check_summary() {
 }
 
 # ==========================================================
+# 自检与版本完整性检查
+# ==========================================================
+self_check_menu_functions() {
+  local missing=0
+  local funcs=(
+    ensure_environment
+    quick_setup_wizard
+    show_config
+    set_domain
+    set_doh_path
+    set_allowlist_file
+    show_allowlist
+    add_allowlist_one
+    remove_allowlist_one
+    batch_import_allowlist
+    edit_allowlist_vim
+    allowlist_dedupe_sort
+    list_upstreams
+    add_upstream
+    remove_upstream
+    doh_path_conflict_check
+    check_domain_cert_before_apply
+    apply_all
+    issue_cert
+    renew_cert
+    check_cert_days
+    service_status_summary
+    show_ports_summary
+    health_check_summary
+    log_settings_menu
+    start_services
+    stop_services
+    restart_services
+    uninstall_all
+  )
+
+  for fn in "${funcs[@]}"; do
+    if ! function_exists "${fn}"; then
+      c_err "菜单自检失败：缺少函数 ${fn}"
+      missing=1
+    fi
+  done
+
+  if (( missing != 0 )); then
+    c_err "启动已终止：菜单函数不完整"
+    exit 1
+  fi
+}
+
+version_integrity_check() {
+  local missing=0
+  local checks=(
+    "quick_setup_wizard:ensure_environment issue_cert check_domain_cert_before_apply apply_all"
+    "apply_all:write_unbound_forward write_mosdns_config write_nginx_site reload_services"
+    "apply_mosdns_log_level:save_state write_mosdns_config"
+    "issue_cert:ensure_acme_sh acme_sh_path write_nginx_http_only_for_acme"
+    "renew_cert:ensure_acme_sh acme_sh_path"
+    "check_domain_cert_before_apply:cert_exists_for_domain"
+    "write_mosdns_config:build_domain_rules_from_allowlist"
+  )
+
+  local item caller deps dep
+  for item in "${checks[@]}"; do
+    caller="${item%%:*}"
+    deps="${item#*:}"
+
+    if ! function_exists "${caller}"; then
+      c_err "完整性检查失败：缺少核心函数 ${caller}"
+      missing=1
+      continue
+    fi
+
+    for dep in ${deps}; do
+      if ! function_exists "${dep}"; then
+        c_err "完整性检查失败：${caller} 依赖函数 ${dep} 缺失"
+        missing=1
+      fi
+    done
+  done
+
+  if (( missing != 0 )); then
+    c_err "启动已终止：版本完整性检查未通过"
+    exit 1
+  fi
+}
+
+# ==========================================================
 # 卸载
 # ==========================================================
 uninstall_all() {
@@ -1222,6 +1651,9 @@ main() {
   ensure_state_file
   load_state
   ensure_allowlist_file
+
+  self_check_menu_functions
+  version_integrity_check
 
   log_action "run doh-manager-pro-allinone.sh"
   show_brief_runtime_status

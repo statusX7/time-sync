@@ -1,4 +1,4 @@
-cat > /root/install_cfdns_v1_8.sh <<'EOF'
+cat > /root/install_cfdns_v1_9.sh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -6,8 +6,10 @@ APP_NAME="cf-dns-sync"
 BASE_DIR="/etc/${APP_NAME}"
 VAR_DIR="/var/lib/${APP_NAME}"
 LOG_DIR="/var/log"
+
 BIN_SYNC="/usr/local/bin/${APP_NAME}.sh"
 BIN_CTL="/usr/local/bin/cfdns"
+
 SERVICE_FILE="/etc/systemd/system/${APP_NAME}.service"
 TIMER_FILE="/etc/systemd/system/${APP_NAME}.timer"
 LOGROTATE_FILE="/etc/logrotate.d/${APP_NAME}"
@@ -177,6 +179,32 @@ cf_api() {
   fi
 }
 
+normalize_sources_csv() {
+  local csv="$1"
+  awk -v RS=',' '
+    {
+      gsub(/^[ \t\r\n]+|[ \t\r\n]+$/, "", $0)
+      if ($0 != "" && !seen[$0]++) {
+        items[++n] = $0
+      }
+    }
+    END {
+      for (i=1; i<=n; i++) {
+        printf "%s%s", items[i], (i<n ? "," : "")
+      }
+    }
+  ' <<< "${csv}"
+}
+
+csv_to_sources_array() {
+  local csv="$1"
+  local normalized
+  normalized="$(normalize_sources_csv "${csv}")"
+  SOURCES_ARRAY=()
+  [[ -z "${normalized}" ]] && return 0
+  IFS=',' read -r -a SOURCES_ARRAY <<< "${normalized}"
+}
+
 write_history() {
   local group_name="$1"
   local action="$2"
@@ -326,7 +354,11 @@ sync_one_group() {
   local sources_csv="${10}"
 
   if [[ "${enabled}" != "true" ]]; then
-    log DEBUG "组 ${group_name}: 已禁用，跳过"
+    if [[ "${TARGET_GROUP}" == "${group_name}" ]]; then
+      log INFO "组 ${group_name}: 已禁用，手动同步未执行"
+    else
+      log DEBUG "组 ${group_name}: 已禁用，跳过"
+    fi
     return
   fi
 
@@ -337,10 +369,9 @@ sync_one_group() {
     fi
   fi
 
-  local IFS=','
-  read -r -a source_domains <<< "${sources_csv}"
+  csv_to_sources_array "${sources_csv}"
+  local source_count="${#SOURCES_ARRAY[@]}"
 
-  local source_count="${#source_domains[@]}"
   if [[ "${source_count}" -lt 1 || "${source_count}" -gt 20 ]]; then
     log ERROR "组 ${group_name}: 源域名数量必须为 1~20，当前 ${source_count}"
     return
@@ -377,7 +408,7 @@ sync_one_group() {
 
   log DEBUG "组 ${group_name}: 开始同步 -> ${target_fqdn}"
 
-  get_group_map "${mode}" "${source_domains[@]}" | sort -u > "${map_file}"
+  get_group_map "${mode}" "${SOURCES_ARRAY[@]}" | sort -u > "${map_file}"
 
   if [[ ! -s "${map_file}" ]]; then
     log ERROR "组 ${group_name}: 未查询到任何源 IPv4，跳过同步"
@@ -441,21 +472,41 @@ sync_one_group() {
 }
 
 main() {
-  local matched=0
+  local configured_count=0
+  local matched_count=0
+  local enabled_count=0
 
   while IFS=$'\t' read -r group_name enabled interval_sec api_token zone_id target_fqdn ttl proxied mode sources_csv; do
     [[ -z "${group_name}" ]] && continue
     [[ "${group_name}" =~ ^# ]] && continue
 
+    configured_count=$((configured_count + 1))
+
+    if [[ "${enabled}" == "true" ]]; then
+      enabled_count=$((enabled_count + 1))
+    fi
+
     if [[ "${TARGET_GROUP}" != "ALL" && "${TARGET_GROUP}" != "${group_name}" ]]; then
       continue
     fi
 
-    matched=1
+    matched_count=$((matched_count + 1))
     sync_one_group "${group_name}" "${enabled}" "${interval_sec}" "${api_token}" "${zone_id}" "${target_fqdn}" "${ttl}" "${proxied}" "${mode}" "${sources_csv}"
   done < "${GROUPS_FILE}"
 
-  if [[ "${matched}" -eq 0 ]]; then
+  if [[ "${TARGET_GROUP}" == "ALL" ]]; then
+    if [[ "${configured_count}" -eq 0 ]]; then
+      log INFO "当前没有任何已配置组，跳过本次同步"
+      exit 0
+    fi
+    if [[ "${enabled_count}" -eq 0 ]]; then
+      log INFO "当前没有启用的组，跳过本次同步"
+      exit 0
+    fi
+    exit 0
+  fi
+
+  if [[ "${matched_count}" -eq 0 ]]; then
     log ERROR "未找到需要同步的组: ${TARGET_GROUP}"
     exit 1
   fi
@@ -513,9 +564,9 @@ line() {
 title() {
   clear
   line
-  color "1;36" "                          cfdns 管理菜单 v1.8"
+  color "1;36" "                          cfdns 管理菜单 v1.9"
   echo
-  color "0;37" " 多组目标域名 / 组启用禁用 / 独立周期 / 组排序 / 解析测试 / 单组日志 / 初始化向导"
+  color "0;37" "  初始化向导已修复 / 空组不报错 / 多组目标域名 / 独立周期 / 解析测试 / 单组日志"
   line
 }
 
@@ -531,6 +582,36 @@ CFG
   chmod 600 "${SETTINGS_FILE}"
 }
 
+normalize_sources_csv() {
+  local csv="$1"
+  awk -v RS=',' '
+    {
+      gsub(/^[ \t\r\n]+|[ \t\r\n]+$/, "", $0)
+      if ($0 != "" && !seen[$0]++) {
+        items[++n] = $0
+      }
+    }
+    END {
+      for (i=1; i<=n; i++) {
+        printf "%s%s", items[i], (i<n ? "," : "")
+      }
+    }
+  ' <<< "${csv}"
+}
+
+count_sources_csv() {
+  local normalized
+  normalized="$(normalize_sources_csv "${1}")"
+  [[ -z "${normalized}" ]] && { echo 0; return; }
+  awk -F',' '{print NF}' <<< "${normalized}"
+}
+
+save_groups_with_tmp() {
+  local tmp="$1"
+  mv "${tmp}" "${GROUPS_FILE}"
+  chmod 600 "${GROUPS_FILE}"
+}
+
 get_group_count() {
   awk 'BEGIN{n=0} !/^#/ && NF>0 {n++} END{print n}' "${GROUPS_FILE}"
 }
@@ -544,7 +625,7 @@ list_groups_table() {
     [[ -z "${group_name}" ]] && continue
     [[ "${group_name}" =~ ^# ]] && continue
     i=$((i+1))
-    count="$(awk -F',' '{print NF}' <<< "${sources_csv}")"
+    count="$(count_sources_csv "${sources_csv}")"
     printf '%-4s %-14s %-8s %-10s %-28s %-10s %-8s %-10s %-6s\n' "${i}" "${group_name}" "${enabled}" "${interval_sec}" "${target_fqdn}" "${mode}" "${ttl}" "${proxied}" "${count}"
   done < "${GROUPS_FILE}"
 
@@ -592,18 +673,28 @@ split_line_to_vars() {
 save_group_line_replace() {
   local old_group_name="$1"
   local new_line="$2"
+  local tmp
+  tmp="$(mktemp)"
   {
     grep '^#' "${GROUPS_FILE}" 2>/dev/null || true
     awk -F '\t' -v g="${old_group_name}" '!/^#/ && $1!=g {print}' "${GROUPS_FILE}"
     printf '%s\n' "${new_line}"
-  } > "${GROUPS_FILE}.tmp"
-  mv "${GROUPS_FILE}.tmp" "${GROUPS_FILE}"
-  chmod 600 "${GROUPS_FILE}"
+  } > "${tmp}"
+  save_groups_with_tmp "${tmp}"
 }
 
 build_group_line() {
+  GROUP_SOURCES_CSV="$(normalize_sources_csv "${GROUP_SOURCES_CSV}")"
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
     "${GROUP_NAME}" "${GROUP_ENABLED}" "${GROUP_INTERVAL}" "${GROUP_API_TOKEN}" "${GROUP_ZONE_ID}" "${GROUP_TARGET_FQDN}" "${GROUP_TTL}" "${GROUP_PROXIED}" "${GROUP_MODE}" "${GROUP_SOURCES_CSV}"
+}
+
+activate_after_init() {
+  systemctl daemon-reload
+  systemctl reset-failed "${SERVICE_NAME}" "${TIMER_NAME}" 2>/dev/null || true
+  systemctl enable --now "${TIMER_NAME}" >/dev/null 2>&1 || true
+  /usr/local/bin/cf-dns-sync.sh ALL >/dev/null 2>&1 || true
+  systemctl start "${SERVICE_NAME}" >/dev/null 2>&1 || true
 }
 
 init_wizard_needed() {
@@ -618,7 +709,7 @@ run_init_wizard() {
   line
   color "1;33" "首次运行快速初始化向导"
   echo
-  color "0;37" "将帮助你快速创建第一个同步组。若暂时不需要，可选择跳过。"
+  color "0;37" "这次向导结束后，会直接把脚本切到可用状态。"
   line
   echo "1. 开始初始化"
   echo "2. 跳过，稍后在菜单中手动配置"
@@ -626,13 +717,9 @@ run_init_wizard() {
   read -rp "请选择 [1-2]: " wizard_choice
 
   case "${wizard_choice}" in
-    1)
-      quick_add_first_group
-      ;;
-    2|"")
-      ;;
-    *)
-      ;;
+    1) quick_add_first_group ;;
+    2|"") ;;
+    *) ;;
   esac
 
   touch "${INIT_FLAG}"
@@ -645,6 +732,11 @@ quick_add_first_group() {
   echo
   read -rp "组名（例如 group-a）: " group_name
   [[ -n "${group_name}" ]] || { echo "组名不能为空"; return; }
+
+  if awk -F '\t' -v g="${group_name}" '!/^#/ && $1==g{found=1} END{exit !found}' "${GROUPS_FILE}"; then
+    echo "组名已存在"
+    return
+  fi
 
   read -rp "同步周期秒数（最小60，推荐60）: " interval_sec
   [[ "${interval_sec}" =~ ^[0-9]+$ ]] || { echo "必须为数字"; return; }
@@ -667,12 +759,18 @@ quick_add_first_group() {
 
   echo "请输入源域名，使用英文逗号分隔，最多20个："
   read -rp "源域名列表: " sources_csv
-  [[ -n "${sources_csv}" ]] || { echo "源域名不能为空"; return; }
+  sources_csv="$(normalize_sources_csv "${sources_csv}")"
+  local src_count
+  src_count="$(count_sources_csv "${sources_csv}")"
+  [[ "${src_count}" -ge 1 && "${src_count}" -le 20 ]] || { echo "源域名数量必须为1~20"; return; }
 
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "${group_name}" "true" "${interval_sec}" "${api_token}" "${zone_id}" "${target_fqdn}" "${ttl}" "false" "${mode}" "${sources_csv}" >> "${GROUPS_FILE}"
   chmod 600 "${GROUPS_FILE}"
+
+  activate_after_init
   echo "初始化完成，已创建组：${group_name}"
+  echo "初始化向导收尾已执行，当前应为可用状态。"
 }
 
 move_group_up() {
@@ -680,6 +778,8 @@ move_group_up() {
   select_group || { echo "序号无效"; return; }
   [[ "${CHOSEN_INDEX}" -gt 1 ]] || { echo "该组已经在最上方"; return; }
 
+  local tmp
+  tmp="$(mktemp)"
   awk -v target="${CHOSEN_INDEX}" '
     BEGIN{n=0}
     /^#/ {comments[++c]=$0; next}
@@ -687,15 +787,14 @@ move_group_up() {
     {rows[++n]=$0}
     END{
       for(i=1;i<=c;i++) print comments[i]
-      tmp=rows[target-1]
+      tmpv=rows[target-1]
       rows[target-1]=rows[target]
-      rows[target]=tmp
+      rows[target]=tmpv
       for(i=1;i<=n;i++) print rows[i]
     }
-  ' "${GROUPS_FILE}" > "${GROUPS_FILE}.tmp"
+  ' "${GROUPS_FILE}" > "${tmp}"
 
-  mv "${GROUPS_FILE}.tmp" "${GROUPS_FILE}"
-  chmod 600 "${GROUPS_FILE}"
+  save_groups_with_tmp "${tmp}"
   echo "已上移"
 }
 
@@ -707,6 +806,8 @@ move_group_down() {
   total="$(get_group_count)"
   [[ "${CHOSEN_INDEX}" -lt "${total}" ]] || { echo "该组已经在最下方"; return; }
 
+  local tmp
+  tmp="$(mktemp)"
   awk -v target="${CHOSEN_INDEX}" '
     BEGIN{n=0}
     /^#/ {comments[++c]=$0; next}
@@ -714,15 +815,14 @@ move_group_down() {
     {rows[++n]=$0}
     END{
       for(i=1;i<=c;i++) print comments[i]
-      tmp=rows[target+1]
+      tmpv=rows[target+1]
       rows[target+1]=rows[target]
-      rows[target]=tmp
+      rows[target]=tmpv
       for(i=1;i<=n;i++) print rows[i]
     }
-  ' "${GROUPS_FILE}" > "${GROUPS_FILE}.tmp"
+  ' "${GROUPS_FILE}" > "${tmp}"
 
-  mv "${GROUPS_FILE}.tmp" "${GROUPS_FILE}"
-  chmod 600 "${GROUPS_FILE}"
+  save_groups_with_tmp "${tmp}"
   echo "已下移"
 }
 
@@ -733,7 +833,7 @@ add_group() {
   read -rp "请输入组名（例如 group-a）: " group_name
   [[ -n "${group_name}" ]] || { echo "组名不能为空"; return; }
 
-  if awk -F '\t' -v g="${group_name}" '$1==g{found=1} END{exit !found}' "${GROUPS_FILE}"; then
+  if awk -F '\t' -v g="${group_name}" '!/^#/ && $1==g{found=1} END{exit !found}' "${GROUPS_FILE}"; then
     echo "组名已存在"
     return
   fi
@@ -778,7 +878,10 @@ add_group() {
   echo
   echo "请输入源域名，使用英文逗号分隔，最多20个："
   read -rp "源域名列表: " sources_csv
-  [[ -n "${sources_csv}" ]] || { echo "至少需要1个源域名"; return; }
+  sources_csv="$(normalize_sources_csv "${sources_csv}")"
+  local src_count
+  src_count="$(count_sources_csv "${sources_csv}")"
+  [[ "${src_count}" -ge 1 && "${src_count}" -le 20 ]] || { echo "源域名数量必须为1~20"; return; }
 
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "${group_name}" "${enabled}" "${interval_sec}" "${api_token}" "${zone_id}" "${target_fqdn}" "${ttl}" "${proxied}" "${mode}" "${sources_csv}" >> "${GROUPS_FILE}"
@@ -794,12 +897,13 @@ delete_group() {
   read -rp "确认删除组 ${group_name}？输入 yes 继续: " ans
   [[ "${ans}" == "yes" ]] || { echo "已取消"; return; }
 
+  local tmp
+  tmp="$(mktemp)"
   {
     grep '^#' "${GROUPS_FILE}" 2>/dev/null || true
     awk -F '\t' -v g="${group_name}" '!/^#/ && $1!=g {print}' "${GROUPS_FILE}"
-  } > "${GROUPS_FILE}.tmp"
-  mv "${GROUPS_FILE}.tmp" "${GROUPS_FILE}"
-  chmod 600 "${GROUPS_FILE}"
+  } > "${tmp}"
+  save_groups_with_tmp "${tmp}"
 
   echo "已删除组：${group_name}"
 }
@@ -836,15 +940,11 @@ set_group_interval() {
 
 parse_sources_to_array() {
   local csv="$1"
+  local normalized
+  normalized="$(normalize_sources_csv "${csv}")"
   SOURCES_ARRAY=()
-  IFS=',' read -r -a SOURCES_ARRAY <<< "${csv}"
-  local cleaned=()
-  local item
-  for item in "${SOURCES_ARRAY[@]}"; do
-    item="$(echo "${item}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-    [[ -n "${item}" ]] && cleaned+=("${item}")
-  done
-  SOURCES_ARRAY=("${cleaned[@]}")
+  [[ -z "${normalized}" ]] && return 0
+  IFS=',' read -r -a SOURCES_ARRAY <<< "${normalized}"
 }
 
 join_sources_array() {
@@ -856,7 +956,6 @@ manage_group_sources() {
   echo
   select_group || { echo "序号无效"; return; }
   split_line_to_vars "${CHOSEN_LINE}"
-
   parse_sources_to_array "${GROUP_SOURCES_CSV}"
 
   while true; do
@@ -888,7 +987,13 @@ manage_group_sources() {
           continue
         fi
         read -rp "请输入新的源域名: " new_domain
+        new_domain="$(normalize_sources_csv "${new_domain}")"
         [[ -n "${new_domain}" ]] || { echo "不能为空"; pause_wait; continue; }
+        if printf '%s\n' "${SOURCES_ARRAY[@]}" | grep -Fxq "${new_domain}"; then
+          echo "该源域名已存在"
+          pause_wait
+          continue
+        fi
         SOURCES_ARRAY+=("${new_domain}")
         ;;
       2)
@@ -908,14 +1013,15 @@ manage_group_sources() {
         ;;
       3)
         read -rp "请输入源域名列表（英文逗号分隔，最多20个）: " import_csv
-        [[ -n "${import_csv}" ]] || { echo "不能为空"; pause_wait; continue; }
-        parse_sources_to_array "${import_csv}"
-        if [[ "${#SOURCES_ARRAY[@]}" -lt 1 || "${#SOURCES_ARRAY[@]}" -gt 20 ]]; then
+        import_csv="$(normalize_sources_csv "${import_csv}")"
+        local import_count
+        import_count="$(count_sources_csv "${import_csv}")"
+        if [[ "${import_count}" -lt 1 || "${import_count}" -gt 20 ]]; then
           echo "导入后的源域名数量必须为 1~20"
           pause_wait
-          parse_sources_to_array "${GROUP_SOURCES_CSV}"
           continue
         fi
+        parse_sources_to_array "${import_csv}"
         ;;
       4)
         echo "当前源域名导出结果："
@@ -1056,6 +1162,7 @@ stop_sync() {
 
 restart_sync() {
   systemctl daemon-reload
+  systemctl reset-failed "${SERVICE_NAME}" "${TIMER_NAME}" 2>/dev/null || true
   systemctl restart "${TIMER_NAME}"
   systemctl restart "${SERVICE_NAME}" || true
   echo "已重启"
@@ -1377,7 +1484,7 @@ main() {
   systemctl start "${APP_NAME}.service" || true
 
   echo
-  echo "安装/升级完成: v1.8"
+  echo "安装/升级完成: v1.9"
   echo "管理命令: cfdns"
   echo "组配置文件: ${GROUPS_FILE}"
   echo "全局设置文件: ${SETTINGS_FILE}"
@@ -1389,8 +1496,8 @@ main() {
   systemctl status "${APP_NAME}.timer" --no-pager -l || true
 }
 
-main "$@"
+main
 EOF
 
-chmod +x /root/install_cfdns_v1_8.sh
-bash /root/install_cfdns_v1_8.sh
+chmod +x /root/install_cfdns_v1_9.sh
+bash /root/install_cfdns_v1_9.sh

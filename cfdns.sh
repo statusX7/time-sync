@@ -1,4 +1,4 @@
-cat > /root/install_cfdns_v1_7.sh <<'EOF'
+cat > /root/install_cfdns_v1_8.sh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -18,6 +18,7 @@ LOG_FILE="${LOG_DIR}/${APP_NAME}.log"
 HISTORY_FILE="${LOG_DIR}/${APP_NAME}-history.tsv"
 STATE_FILE="${VAR_DIR}/state.tsv"
 RUNSTATE_FILE="${VAR_DIR}/runstate.tsv"
+INIT_FLAG="${VAR_DIR}/.initialized"
 
 mkdir -p "${BASE_DIR}" "${VAR_DIR}"
 
@@ -340,8 +341,8 @@ sync_one_group() {
   read -r -a source_domains <<< "${sources_csv}"
 
   local source_count="${#source_domains[@]}"
-  if [[ "${source_count}" -lt 1 || "${source_count}" -gt 10 ]]; then
-    log ERROR "组 ${group_name}: 源域名数量必须为 1~10，当前 ${source_count}"
+  if [[ "${source_count}" -lt 1 || "${source_count}" -gt 20 ]]; then
+    log ERROR "组 ${group_name}: 源域名数量必须为 1~20，当前 ${source_count}"
     return
   fi
 
@@ -481,6 +482,7 @@ LOGROTATE_FILE="/etc/logrotate.d/${APP_NAME}"
 LOG_FILE="/var/log/${APP_NAME}.log"
 HISTORY_FILE="/var/log/${APP_NAME}-history.tsv"
 RUNSTATE_FILE="${VAR_DIR}/runstate.tsv"
+INIT_FLAG="${VAR_DIR}/.initialized"
 
 mkdir -p "${BASE_DIR}" "${VAR_DIR}"
 
@@ -495,6 +497,10 @@ TSV
 # shellcheck disable=SC1090
 source "${SETTINGS_FILE}"
 
+CHOSEN_INDEX=""
+CHOSEN_LINE=""
+CHOSEN_GROUP_NAME=""
+
 color() {
   local code="$1"; shift
   printf "\033[%sm%s\033[0m" "${code}" "$*"
@@ -507,9 +513,9 @@ line() {
 title() {
   clear
   line
-  color "1;36" "                          cfdns 管理菜单 v1.7"
+  color "1;36" "                          cfdns 管理菜单 v1.8"
   echo
-  color "0;37" "     多组目标域名 / 组启用禁用 / 独立周期 / 组排序 / 解析测试 / 单组日志"
+  color "0;37" " 多组目标域名 / 组启用禁用 / 独立周期 / 组排序 / 解析测试 / 单组日志 / 初始化向导"
   line
 }
 
@@ -523,6 +529,10 @@ save_settings() {
 LOG_LEVEL="${LOG_LEVEL}"
 CFG
   chmod 600 "${SETTINGS_FILE}"
+}
+
+get_group_count() {
+  awk 'BEGIN{n=0} !/^#/ && NF>0 {n++} END{print n}' "${GROUPS_FILE}"
 }
 
 list_groups_table() {
@@ -557,12 +567,26 @@ group_line_by_index() {
   return 1
 }
 
-choose_group_index() {
+select_group() {
+  CHOSEN_INDEX=""
+  CHOSEN_LINE=""
+  CHOSEN_GROUP_NAME=""
   list_groups_table
   echo
   read -rp "请输入组序号: " idx
   [[ "${idx}" =~ ^[0-9]+$ ]] || return 1
-  group_line_by_index "${idx}" >/dev/null
+  local line
+  line="$(group_line_by_index "${idx}" || true)"
+  [[ -n "${line}" ]] || return 1
+  CHOSEN_INDEX="${idx}"
+  CHOSEN_LINE="${line}"
+  CHOSEN_GROUP_NAME="$(cut -f1 <<< "${line}")"
+  return 0
+}
+
+split_line_to_vars() {
+  local line="$1"
+  IFS=$'\t' read -r GROUP_NAME GROUP_ENABLED GROUP_INTERVAL GROUP_API_TOKEN GROUP_ZONE_ID GROUP_TARGET_FQDN GROUP_TTL GROUP_PROXIED GROUP_MODE GROUP_SOURCES_CSV <<< "${line}"
 }
 
 save_group_line_replace() {
@@ -577,15 +601,86 @@ save_group_line_replace() {
   chmod 600 "${GROUPS_FILE}"
 }
 
+build_group_line() {
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+    "${GROUP_NAME}" "${GROUP_ENABLED}" "${GROUP_INTERVAL}" "${GROUP_API_TOKEN}" "${GROUP_ZONE_ID}" "${GROUP_TARGET_FQDN}" "${GROUP_TTL}" "${GROUP_PROXIED}" "${GROUP_MODE}" "${GROUP_SOURCES_CSV}"
+}
+
+init_wizard_needed() {
+  [[ -f "${INIT_FLAG}" ]] && return 1
+  return 0
+}
+
+run_init_wizard() {
+  init_wizard_needed || return 0
+
+  clear
+  line
+  color "1;33" "首次运行快速初始化向导"
+  echo
+  color "0;37" "将帮助你快速创建第一个同步组。若暂时不需要，可选择跳过。"
+  line
+  echo "1. 开始初始化"
+  echo "2. 跳过，稍后在菜单中手动配置"
+  line
+  read -rp "请选择 [1-2]: " wizard_choice
+
+  case "${wizard_choice}" in
+    1)
+      quick_add_first_group
+      ;;
+    2|"")
+      ;;
+    *)
+      ;;
+  esac
+
+  touch "${INIT_FLAG}"
+  chmod 600 "${INIT_FLAG}"
+}
+
+quick_add_first_group() {
+  echo
+  color "1;33" "创建第一个组"
+  echo
+  read -rp "组名（例如 group-a）: " group_name
+  [[ -n "${group_name}" ]] || { echo "组名不能为空"; return; }
+
+  read -rp "同步周期秒数（最小60，推荐60）: " interval_sec
+  [[ "${interval_sec}" =~ ^[0-9]+$ ]] || { echo "必须为数字"; return; }
+  [[ "${interval_sec}" -ge 60 ]] || { echo "不能小于60"; return; }
+
+  read -rp "Cloudflare API Token: " api_token
+  read -rp "Zone ID: " zone_id
+  read -rp "目标域名（例如 tiktokeu.example.com）: " target_fqdn
+  read -rp "TTL（推荐60）: " ttl
+
+  echo "解析模式："
+  echo "1. ALL_IPS（全部IP模式）"
+  echo "2. SINGLE_IP（单IP模式）"
+  read -rp "请选择 [1-2]: " mode_choice
+  case "${mode_choice}" in
+    1|"") mode="ALL_IPS" ;;
+    2) mode="SINGLE_IP" ;;
+    *) echo "无效选择"; return ;;
+  esac
+
+  echo "请输入源域名，使用英文逗号分隔，最多20个："
+  read -rp "源域名列表: " sources_csv
+  [[ -n "${sources_csv}" ]] || { echo "源域名不能为空"; return; }
+
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "${group_name}" "true" "${interval_sec}" "${api_token}" "${zone_id}" "${target_fqdn}" "${ttl}" "false" "${mode}" "${sources_csv}" >> "${GROUPS_FILE}"
+  chmod 600 "${GROUPS_FILE}"
+  echo "初始化完成，已创建组：${group_name}"
+}
+
 move_group_up() {
   echo
-  if ! idx="$(choose_group_index)"; then
-    echo "序号无效"
-    return
-  fi
-  [[ "${idx}" -gt 1 ]] || { echo "该组已经在最上方"; return; }
+  select_group || { echo "序号无效"; return; }
+  [[ "${CHOSEN_INDEX}" -gt 1 ]] || { echo "该组已经在最上方"; return; }
 
-  awk -v target="${idx}" '
+  awk -v target="${CHOSEN_INDEX}" '
     BEGIN{n=0}
     /^#/ {comments[++c]=$0; next}
     NF==0 {next}
@@ -606,16 +701,13 @@ move_group_up() {
 
 move_group_down() {
   echo
-  if ! idx="$(choose_group_index)"; then
-    echo "序号无效"
-    return
-  fi
+  select_group || { echo "序号无效"; return; }
 
   local total
-  total="$(awk 'BEGIN{n=0} !/^#/ && NF>0 {n++} END{print n}' "${GROUPS_FILE}")"
-  [[ "${idx}" -lt "${total}" ]] || { echo "该组已经在最下方"; return; }
+  total="$(get_group_count)"
+  [[ "${CHOSEN_INDEX}" -lt "${total}" ]] || { echo "该组已经在最下方"; return; }
 
-  awk -v target="${idx}" '
+  awk -v target="${CHOSEN_INDEX}" '
     BEGIN{n=0}
     /^#/ {comments[++c]=$0; next}
     NF==0 {next}
@@ -684,48 +776,20 @@ add_group() {
   esac
 
   echo
-  echo "请输入 1~10 个源域名，输入完成后直接回车结束："
-  local sources=() one
-  while true; do
-    read -rp "源域名 ${#sources[@]}+1: " one
-    [[ -z "${one}" ]] && break
-    sources+=("${one}")
-    if [[ "${#sources[@]}" -ge 10 ]]; then
-      echo "已达到 10 个上限"
-      break
-    fi
-  done
+  echo "请输入源域名，使用英文逗号分隔，最多20个："
+  read -rp "源域名列表: " sources_csv
+  [[ -n "${sources_csv}" ]] || { echo "至少需要1个源域名"; return; }
 
-  if [[ "${#sources[@]}" -lt 1 ]]; then
-    echo "至少需要 1 个源域名"
-    return
-  fi
-
-  local sources_csv
-  sources_csv="$(IFS=,; echo "${sources[*]}")"
-
-  {
-    grep '^#' "${GROUPS_FILE}" 2>/dev/null || true
-    awk 'BEGIN{skip=1} !/^#/{skip=0} skip==0{print}' "${GROUPS_FILE}" 2>/dev/null || true
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "${group_name}" "${enabled}" "${interval_sec}" "${api_token}" "${zone_id}" "${target_fqdn}" "${ttl}" "${proxied}" "${mode}" "${sources_csv}"
-  } > "${GROUPS_FILE}.tmp"
-
-  mv "${GROUPS_FILE}.tmp" "${GROUPS_FILE}"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "${group_name}" "${enabled}" "${interval_sec}" "${api_token}" "${zone_id}" "${target_fqdn}" "${ttl}" "${proxied}" "${mode}" "${sources_csv}" >> "${GROUPS_FILE}"
   chmod 600 "${GROUPS_FILE}"
   echo "组已添加：${group_name}"
 }
 
 delete_group() {
   echo
-  if ! idx="$(choose_group_index)"; then
-    echo "序号无效"
-    return
-  fi
-
-  local line group_name
-  line="$(group_line_by_index "${idx}")"
-  group_name="$(cut -f1 <<< "${line}")"
+  select_group || { echo "序号无效"; return; }
+  local group_name="${CHOSEN_GROUP_NAME}"
 
   read -rp "确认删除组 ${group_name}？输入 yes 继续: " ans
   [[ "${ans}" == "yes" ]] || { echo "已取消"; return; }
@@ -742,167 +806,171 @@ delete_group() {
 
 toggle_group_enabled() {
   echo
-  if ! idx="$(choose_group_index)"; then
-    echo "序号无效"
-    return
-  fi
+  select_group || { echo "序号无效"; return; }
+  split_line_to_vars "${CHOSEN_LINE}"
 
-  local line group_name enabled interval_sec api_token zone_id target_fqdn ttl proxied mode sources_csv
-  line="$(group_line_by_index "${idx}")"
-  IFS=$'\t' read -r group_name enabled interval_sec api_token zone_id target_fqdn ttl proxied mode sources_csv <<< "${line}"
-
-  if [[ "${enabled}" == "true" ]]; then
-    enabled="false"
+  if [[ "${GROUP_ENABLED}" == "true" ]]; then
+    GROUP_ENABLED="false"
   else
-    enabled="true"
+    GROUP_ENABLED="true"
   fi
 
-  save_group_line_replace "$(cut -f1 <<< "${line}")" \
-    "$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' "${group_name}" "${enabled}" "${interval_sec}" "${api_token}" "${zone_id}" "${target_fqdn}" "${ttl}" "${proxied}" "${mode}" "${sources_csv}")"
-
-  echo "组 ${group_name} 已切换为 ${enabled}"
+  save_group_line_replace "${CHOSEN_GROUP_NAME}" "$(build_group_line)"
+  echo "组 ${GROUP_NAME} 已切换为 ${GROUP_ENABLED}"
 }
 
 set_group_interval() {
   echo
-  if ! idx="$(choose_group_index)"; then
-    echo "序号无效"
-    return
-  fi
+  select_group || { echo "序号无效"; return; }
+  split_line_to_vars "${CHOSEN_LINE}"
 
-  local line group_name enabled interval_sec api_token zone_id target_fqdn ttl proxied mode sources_csv new_interval
-  line="$(group_line_by_index "${idx}")"
-  IFS=$'\t' read -r group_name enabled interval_sec api_token zone_id target_fqdn ttl proxied mode sources_csv <<< "${line}"
-
-  echo "当前组 ${group_name} 的同步周期为 ${interval_sec} 秒"
+  echo "当前组 ${GROUP_NAME} 的同步周期为 ${GROUP_INTERVAL} 秒"
   read -rp "请输入新的同步周期秒数（最小 60）: " new_interval
   [[ "${new_interval}" =~ ^[0-9]+$ ]] || { echo "必须为数字"; return; }
   [[ "${new_interval}" -ge 60 ]] || { echo "不能小于 60"; return; }
+  GROUP_INTERVAL="${new_interval}"
 
-  save_group_line_replace "$(cut -f1 <<< "${line}")" \
-    "$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' "${group_name}" "${enabled}" "${new_interval}" "${api_token}" "${zone_id}" "${target_fqdn}" "${ttl}" "${proxied}" "${mode}" "${sources_csv}")"
+  save_group_line_replace "${CHOSEN_GROUP_NAME}" "$(build_group_line)"
+  echo "组 ${GROUP_NAME} 的同步周期已更新为 ${GROUP_INTERVAL} 秒"
+}
 
-  echo "组 ${group_name} 的同步周期已更新为 ${new_interval} 秒"
+parse_sources_to_array() {
+  local csv="$1"
+  SOURCES_ARRAY=()
+  IFS=',' read -r -a SOURCES_ARRAY <<< "${csv}"
+  local cleaned=()
+  local item
+  for item in "${SOURCES_ARRAY[@]}"; do
+    item="$(echo "${item}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    [[ -n "${item}" ]] && cleaned+=("${item}")
+  done
+  SOURCES_ARRAY=("${cleaned[@]}")
+}
+
+join_sources_array() {
+  local IFS=,
+  echo "${SOURCES_ARRAY[*]}"
 }
 
 manage_group_sources() {
   echo
-  if ! idx="$(choose_group_index)"; then
-    echo "序号无效"
-    return
-  fi
+  select_group || { echo "序号无效"; return; }
+  split_line_to_vars "${CHOSEN_LINE}"
 
-  local line group_name enabled interval_sec api_token zone_id target_fqdn ttl proxied mode sources_csv
-  line="$(group_line_by_index "${idx}")"
-  IFS=$'\t' read -r group_name enabled interval_sec api_token zone_id target_fqdn ttl proxied mode sources_csv <<< "${line}"
-
-  local sources=()
-  IFS=',' read -r -a sources <<< "${sources_csv}"
+  parse_sources_to_array "${GROUP_SOURCES_CSV}"
 
   while true; do
     clear
     line
-    color "1;36" "源域名管理 - ${group_name}"
+    color "1;36" "源域名管理 - ${GROUP_NAME}"
     echo
     line
     local i=0
-    for s in "${sources[@]}"; do
+    for s in "${SOURCES_ARRAY[@]}"; do
       i=$((i+1))
       printf "%2d. %s\n" "${i}" "${s}"
     done
-    [[ "${#sources[@]}" -eq 0 ]] && echo "当前无源域名"
+    [[ "${#SOURCES_ARRAY[@]}" -eq 0 ]] && echo "当前无源域名"
     line
-    echo "1. 添加源域名"
-    echo "2. 删除源域名"
+    echo "1. 添加单个源域名"
+    echo "2. 删除单个源域名"
+    echo "3. 批量导入源域名（英文逗号分隔）"
+    echo "4. 导出当前源域名（英文逗号分隔）"
     echo "0. 返回上级"
     line
     read -rp "请选择: " choice
 
     case "${choice}" in
       1)
-        if [[ "${#sources[@]}" -ge 10 ]]; then
-          echo "最多只能配置 10 个源域名"
+        if [[ "${#SOURCES_ARRAY[@]}" -ge 20 ]]; then
+          echo "最多只能配置 20 个源域名"
           pause_wait
           continue
         fi
         read -rp "请输入新的源域名: " new_domain
         [[ -n "${new_domain}" ]] || { echo "不能为空"; pause_wait; continue; }
-        sources+=("${new_domain}")
+        SOURCES_ARRAY+=("${new_domain}")
         ;;
       2)
-        if [[ "${#sources[@]}" -le 1 ]]; then
+        if [[ "${#SOURCES_ARRAY[@]}" -le 1 ]]; then
           echo "至少保留 1 个源域名"
           pause_wait
           continue
         fi
         read -rp "请输入要删除的序号: " del_idx
-        if ! [[ "${del_idx}" =~ ^[0-9]+$ ]] || [[ "${del_idx}" -lt 1 || "${del_idx}" -gt "${#sources[@]}" ]]; then
+        if ! [[ "${del_idx}" =~ ^[0-9]+$ ]] || [[ "${del_idx}" -lt 1 || "${del_idx}" -gt "${#SOURCES_ARRAY[@]}" ]]; then
           echo "序号无效"
           pause_wait
           continue
         fi
-        unset 'sources[del_idx-1]'
-        sources=("${sources[@]}")
+        unset 'SOURCES_ARRAY[del_idx-1]'
+        SOURCES_ARRAY=("${SOURCES_ARRAY[@]}")
+        ;;
+      3)
+        read -rp "请输入源域名列表（英文逗号分隔，最多20个）: " import_csv
+        [[ -n "${import_csv}" ]] || { echo "不能为空"; pause_wait; continue; }
+        parse_sources_to_array "${import_csv}"
+        if [[ "${#SOURCES_ARRAY[@]}" -lt 1 || "${#SOURCES_ARRAY[@]}" -gt 20 ]]; then
+          echo "导入后的源域名数量必须为 1~20"
+          pause_wait
+          parse_sources_to_array "${GROUP_SOURCES_CSV}"
+          continue
+        fi
+        ;;
+      4)
+        echo "当前源域名导出结果："
+        join_sources_array
+        pause_wait
+        continue
         ;;
       0) break ;;
       *) echo "无效选择"; pause_wait; continue ;;
     esac
 
-    local new_sources_csv
-    new_sources_csv="$(IFS=,; echo "${sources[*]}")"
-
-    save_group_line_replace "${group_name}" \
-      "$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' "${group_name}" "${enabled}" "${interval_sec}" "${api_token}" "${zone_id}" "${target_fqdn}" "${ttl}" "${proxied}" "${mode}" "${new_sources_csv}")"
+    GROUP_SOURCES_CSV="$(join_sources_array)"
+    save_group_line_replace "${CHOSEN_GROUP_NAME}" "$(build_group_line)"
   done
 }
 
 edit_group_basic() {
   echo
-  if ! idx="$(choose_group_index)"; then
-    echo "序号无效"
-    return
-  fi
+  select_group || { echo "序号无效"; return; }
+  local old_group_name="${CHOSEN_GROUP_NAME}"
+  split_line_to_vars "${CHOSEN_LINE}"
 
-  local line old_group_name group_name enabled interval_sec api_token zone_id target_fqdn ttl proxied mode sources_csv
-  line="$(group_line_by_index "${idx}")"
-  old_group_name="$(cut -f1 <<< "${line}")"
-  IFS=$'\t' read -r group_name enabled interval_sec api_token zone_id target_fqdn ttl proxied mode sources_csv <<< "${line}"
-
-  echo "当前组名: ${group_name}"
+  echo "当前组名: ${GROUP_NAME}"
   read -rp "新组名（直接回车保持不变）: " new_group_name
-  [[ -n "${new_group_name}" ]] && group_name="${new_group_name}"
+  [[ -n "${new_group_name}" ]] && GROUP_NAME="${new_group_name}"
 
-  echo "当前目标域名: ${target_fqdn}"
+  echo "当前目标域名: ${GROUP_TARGET_FQDN}"
   read -rp "新目标域名（回车不变）: " new_target
-  [[ -n "${new_target}" ]] && target_fqdn="${new_target}"
+  [[ -n "${new_target}" ]] && GROUP_TARGET_FQDN="${new_target}"
 
-  echo "当前 TTL: ${ttl}"
+  echo "当前 TTL: ${GROUP_TTL}"
   read -rp "新 TTL（回车不变）: " new_ttl
-  [[ -n "${new_ttl}" ]] && ttl="${new_ttl}"
+  [[ -n "${new_ttl}" ]] && GROUP_TTL="${new_ttl}"
 
-  echo "当前 Zone ID: ${zone_id}"
+  echo "当前 Zone ID: ${GROUP_ZONE_ID}"
   read -rp "新 Zone ID（回车不变）: " new_zone
-  [[ -n "${new_zone}" ]] && zone_id="${new_zone}"
+  [[ -n "${new_zone}" ]] && GROUP_ZONE_ID="${new_zone}"
 
   echo "当前 API Token: 已隐藏"
   read -rp "新 API Token（回车不变）: " new_token
-  [[ -n "${new_token}" ]] && api_token="${new_token}"
+  [[ -n "${new_token}" ]] && GROUP_API_TOKEN="${new_token}"
 
-  echo "当前解析模式: ${mode}"
+  echo "当前解析模式: ${GROUP_MODE}"
   echo "1. 保持不变"
   echo "2. ALL_IPS（全部IP模式）"
   echo "3. SINGLE_IP（单IP模式）"
   read -rp "请选择 [1-3]: " mode_choice
   case "${mode_choice}" in
     1|"") ;;
-    2) mode="ALL_IPS" ;;
-    3) mode="SINGLE_IP" ;;
+    2) GROUP_MODE="ALL_IPS" ;;
+    3) GROUP_MODE="SINGLE_IP" ;;
     *) echo "无效选择"; return ;;
   esac
 
-  save_group_line_replace "${old_group_name}" \
-    "$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' "${group_name}" "${enabled}" "${interval_sec}" "${api_token}" "${zone_id}" "${target_fqdn}" "${ttl}" "${proxied}" "${mode}" "${sources_csv}")"
-
+  save_group_line_replace "${old_group_name}" "$(build_group_line)"
   echo "组配置已更新"
 }
 
@@ -929,23 +997,18 @@ set_log_level() {
 
 test_group_token() {
   echo
-  if ! idx="$(choose_group_index)"; then
-    echo "序号无效"
-    return
-  fi
+  select_group || { echo "序号无效"; return; }
+  split_line_to_vars "${CHOSEN_LINE}"
 
-  local line group_name enabled interval_sec api_token zone_id target_fqdn ttl proxied mode sources_csv resp
-  line="$(group_line_by_index "${idx}")"
-  IFS=$'\t' read -r group_name enabled interval_sec api_token zone_id target_fqdn ttl proxied mode sources_csv <<< "${line}"
-
-  echo "正在测试组 ${group_name} 的 API Token 与 Zone ID..."
-  resp="$(curl -sS -X GET "https://api.cloudflare.com/client/v4/zones/${zone_id}" \
-    -H "Authorization: Bearer ${api_token}" \
+  echo "正在测试组 ${GROUP_NAME} 的 API Token 与 Zone ID..."
+  local resp
+  resp="$(curl -sS -X GET "https://api.cloudflare.com/client/v4/zones/${GROUP_ZONE_ID}" \
+    -H "Authorization: Bearer ${GROUP_API_TOKEN}" \
     -H "Content-Type: application/json")"
 
   if [[ "$(echo "${resp}" | jq -r '.success')" == "true" ]]; then
     echo "测试成功"
-    echo "组名: ${group_name}"
+    echo "组名: ${GROUP_NAME}"
     echo "Zone: $(echo "${resp}" | jq -r '.result.name // "unknown"')"
     echo "Zone Status: $(echo "${resp}" | jq -r '.result.status // "unknown"')"
   else
@@ -956,24 +1019,16 @@ test_group_token() {
 
 test_group_sources_dns() {
   echo
-  if ! idx="$(choose_group_index)"; then
-    echo "序号无效"
-    return
-  fi
+  select_group || { echo "序号无效"; return; }
+  split_line_to_vars "${CHOSEN_LINE}"
+  parse_sources_to_array "${GROUP_SOURCES_CSV}"
 
-  local line group_name enabled interval_sec api_token zone_id target_fqdn ttl proxied mode sources_csv
-  line="$(group_line_by_index "${idx}")"
-  IFS=$'\t' read -r group_name enabled interval_sec api_token zone_id target_fqdn ttl proxied mode sources_csv <<< "${line}"
-
-  local sources=()
-  IFS=',' read -r -a sources <<< "${sources_csv}"
-
-  echo "测试组 ${group_name} 的源域名解析情况"
+  echo "测试组 ${GROUP_NAME} 的源域名解析情况"
   printf '%-4s %-45s %-8s %-6s %-40s\n' "序号" "源域名" "状态" "数量" "IPv4结果"
   printf '%-4s %-45s %-8s %-6s %-40s\n' "----" "---------------------------------------------" "--------" "------" "----------------------------------------"
 
   local i=0 domain ips count joined
-  for domain in "${sources[@]}"; do
+  for domain in "${SOURCES_ARRAY[@]}"; do
     i=$((i+1))
     ips="$(dig +short A "${domain}" | sed '/^$/d' | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' || true)"
     count="$(echo "${ips}" | sed '/^$/d' | wc -l | awk '{print $1}')"
@@ -1013,15 +1068,9 @@ manual_run_all() {
 
 manual_run_one() {
   echo
-  if ! idx="$(choose_group_index)"; then
-    echo "序号无效"
-    return
-  fi
-  local line group_name
-  line="$(group_line_by_index "${idx}")"
-  group_name="$(cut -f1 <<< "${line}")"
-  /usr/local/bin/cf-dns-sync.sh "${group_name}"
-  echo "已执行组同步：${group_name}"
+  select_group || { echo "序号无效"; return; }
+  /usr/local/bin/cf-dns-sync.sh "${CHOSEN_GROUP_NAME}"
+  echo "已执行组同步：${CHOSEN_GROUP_NAME}"
 }
 
 show_logs() {
@@ -1047,17 +1096,10 @@ show_group_runtime_logs() {
   fi
 
   echo
-  if ! idx="$(choose_group_index)"; then
-    echo "序号无效"
-    return
-  fi
-
-  local line group_name
-  line="$(group_line_by_index "${idx}")"
-  group_name="$(cut -f1 <<< "${line}")"
+  select_group || { echo "序号无效"; return; }
 
   if [[ -f "${LOG_FILE}" ]]; then
-    grep "组 ${group_name}:" "${LOG_FILE}" | tail -n 200 || echo "暂无该组运行日志"
+    grep "组 ${CHOSEN_GROUP_NAME}:" "${LOG_FILE}" | tail -n 200 || echo "暂无该组运行日志"
   else
     echo "日志文件不存在"
   fi
@@ -1140,26 +1182,14 @@ show_deleted_all() {
 
 show_history_one_group() {
   echo
-  if ! idx="$(choose_group_index)"; then
-    echo "序号无效"
-    return
-  fi
-  local line group_name
-  line="$(group_line_by_index "${idx}")"
-  group_name="$(cut -f1 <<< "${line}")"
-  render_history_table "all" "${group_name}"
+  select_group || { echo "序号无效"; return; }
+  render_history_table "all" "${CHOSEN_GROUP_NAME}"
 }
 
 show_deleted_one_group() {
   echo
-  if ! idx="$(choose_group_index)"; then
-    echo "序号无效"
-    return
-  fi
-  local line group_name
-  line="$(group_line_by_index "${idx}")"
-  group_name="$(cut -f1 <<< "${line}")"
-  render_history_table "deleted" "${group_name}"
+  select_group || { echo "序号无效"; return; }
+  render_history_table "deleted" "${CHOSEN_GROUP_NAME}"
 }
 
 edit_raw_files() {
@@ -1204,6 +1234,8 @@ uninstall_all() {
 }
 
 menu() {
+  run_init_wizard
+
   while true; do
     title
     echo "  1.  查看全部组（List Groups / 查看组）"
@@ -1345,7 +1377,7 @@ main() {
   systemctl start "${APP_NAME}.service" || true
 
   echo
-  echo "安装/升级完成: v1.7"
+  echo "安装/升级完成: v1.8"
   echo "管理命令: cfdns"
   echo "组配置文件: ${GROUPS_FILE}"
   echo "全局设置文件: ${SETTINGS_FILE}"
@@ -1360,5 +1392,5 @@ main() {
 main "$@"
 EOF
 
-chmod +x /root/install_cfdns_v1_7.sh
-bash /root/install_cfdns_v1_7.sh
+chmod +x /root/install_cfdns_v1_8.sh
+bash /root/install_cfdns_v1_8.sh

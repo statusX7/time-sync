@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_VERSION="v2.6.1"
+############################################
+# DoH Manager PRO (All-in-One + allowlist.txt)
+# Version: v2.6.2
+#
 
-# ==========================================================
-# 运行时全局变量
-# ==========================================================
+
+SCRIPT_VERSION="v2.6.2"
+SCRIPT_NAME="DoH Manager PRO"
+MOSDNS_UNIT="mosdns"
+NGINX_UNIT="nginx"
+UNBOUND_UNIT="unbound"
+
 OS_ID=""
 OS_NAME=""
 PKG_MGR=""
@@ -87,9 +94,64 @@ NGX_BURST=""
 NGINX_SSL_DIR=""
 FIRST_RUN="no"
 
-# ==========================================================
-# UI
-# ==========================================================
+MENU_REQUIRED_FUNCTIONS=(
+  ensure_environment
+  quick_setup_wizard
+  show_config
+  set_domain
+  set_doh_path
+  set_allowlist_file
+  show_allowlist
+  add_allowlist_one
+  remove_allowlist_one
+  batch_import_allowlist
+  edit_allowlist_vim
+  allowlist_dedupe_sort
+  list_upstreams
+  add_upstream
+  remove_upstream
+  doh_path_conflict_check
+  apply_all
+  issue_cert
+  renew_cert
+  check_cert_days
+  service_status_summary
+  show_ports_summary
+  health_check_summary
+  log_settings_menu
+  start_services
+  stop_services
+  restart_services
+  uninstall_all
+)
+
+CORE_REQUIRED_FUNCTIONS=(
+  detect_platform
+  ensure_state_file
+  load_state
+  save_state
+  ensure_allowlist_file
+  install_packages
+  download_and_install_mosdnsx
+  create_user_and_dirs
+  install_mosdns_systemd
+  write_unbound_forward
+  build_domain_rules_from_allowlist
+  write_mosdns_config
+  write_nginx_site
+  ensure_acme_sh
+  write_nginx_http_only_for_acme
+  issue_cert
+  renew_cert
+  apply_all
+  validate_mos_log_level
+  apply_mosdns_log_level
+  set_mosdns_log_level_menu
+  show_recent_logs_50
+  follow_mosdns_logs
+  log_settings_menu
+)
+
 c_ok()   { echo -e "\033[1;32m[OK]\033[0m $*"; }
 c_warn() { echo -e "\033[1;33m[!]\033[0m  $*"; }
 c_err()  { echo -e "\033[1;31m[-]\033[0m $*"; }
@@ -132,13 +194,69 @@ remove_if_exists() {
   fi
 }
 
+have_cmd() {
+  command -v "$1" >/dev/null 2>&1
+}
+
 function_exists() {
   declare -F "$1" >/dev/null 2>&1
 }
 
-# ==========================================================
-# 平台检测
-# ==========================================================
+service_load_state() {
+  systemctl show -p LoadState --value "$1" 2>/dev/null || true
+}
+
+service_exists() {
+  [[ "$(service_load_state "$1")" == "loaded" ]]
+}
+
+service_active() {
+  systemctl is-active --quiet "$1" >/dev/null 2>&1
+}
+
+mosdns_process_exists() {
+  pgrep -f '(^|/)(mosdns|mosdns-x)( |$)' >/dev/null 2>&1 || pgrep -x mosdns >/dev/null 2>&1
+}
+
+self_check_menu_functions() {
+  local missing=()
+  local fn
+  for fn in "${MENU_REQUIRED_FUNCTIONS[@]}"; do
+    if ! function_exists "${fn}"; then
+      missing+=("${fn}")
+    fi
+  done
+
+  if (( ${#missing[@]} > 0 )); then
+    c_err "启动自检失败：菜单引用了不存在的函数"
+    printf ' - %s\n' "${missing[@]}"
+    c_err "请修复脚本后再运行"
+    exit 1
+  fi
+}
+
+integrity_check_core_functions() {
+  local missing=()
+  local fn
+  for fn in "${CORE_REQUIRED_FUNCTIONS[@]}"; do
+    if ! function_exists "${fn}"; then
+      missing+=("${fn}")
+    fi
+  done
+
+  if (( ${#missing[@]} > 0 )); then
+    c_err "版本完整性检查失败：核心函数链不完整"
+    printf ' - %s\n' "${missing[@]}"
+    c_err "该脚本存在遗漏，已阻止继续执行"
+    exit 1
+  fi
+}
+
+show_integrity_summary() {
+  c_ok "启动自检通过"
+  c_ok "版本完整性检查通过"
+}
+
 detect_platform() {
   if [[ -f /etc/os-release ]]; then
     # shellcheck disable=SC1091
@@ -150,11 +268,11 @@ detect_platform() {
     OS_NAME="unknown"
   fi
 
-  if command -v apt-get >/dev/null 2>&1; then
+  if have_cmd apt-get; then
     PKG_MGR="apt"
-  elif command -v dnf >/dev/null 2>&1; then
+  elif have_cmd dnf; then
     PKG_MGR="dnf"
-  elif command -v yum >/dev/null 2>&1; then
+  elif have_cmd yum; then
     PKG_MGR="yum"
   else
     c_err "未检测到支持的包管理器（apt/dnf/yum）"
@@ -165,10 +283,7 @@ detect_platform() {
   case "${ARCH_RAW}" in
     x86_64|amd64) ARCH_KEY="amd64" ;;
     aarch64|arm64) ARCH_KEY="arm64" ;;
-    *)
-      c_err "不支持的架构: ${ARCH_RAW}"
-      exit 1
-      ;;
+    *) c_err "不支持的架构: ${ARCH_RAW}"; exit 1 ;;
   esac
 
   if [[ "${PKG_MGR}" == "apt" ]]; then
@@ -190,9 +305,6 @@ detect_platform() {
   UNBOUND_SNIPPET="${UNBOUND_CONF_DIR}/doh-forward.conf"
 }
 
-# ==========================================================
-# 状态文件
-# ==========================================================
 ensure_state_file() {
   mkdir -p "$(dirname "${STATE_FILE}")"
   if [[ ! -f "${STATE_FILE}" ]]; then
@@ -203,13 +315,12 @@ ensure_state_file() {
       echo "DOMAIN=\"${DEFAULT_DOMAIN}\""
       echo "DOH_PATH=\"${DEFAULT_DOH_PATH}\""
       echo "ALLOWLIST_FILE=\"${DEFAULT_ALLOWLIST_FILE}\""
-
       echo "UPSTREAM_DOT=("
+      local u
       for u in "${DEFAULT_UPSTREAM_DOT[@]}"; do
         echo "  \"${u}\""
       done
       echo ")"
-
       echo "UB_MSG_CACHE=\"${DEFAULT_UB_MSG_CACHE}\""
       echo "UB_RRSET_CACHE=\"${DEFAULT_UB_RRSET_CACHE}\""
       echo "UB_MIN_TTL=\"${DEFAULT_UB_MIN_TTL}\""
@@ -219,10 +330,8 @@ ensure_state_file() {
       echo "UB_SERVE_EXPIRED_TTL=\"${DEFAULT_UB_SERVE_EXPIRED_TTL}\""
       echo "UB_SERVE_EXPIRED_REPLY_TTL=\"${DEFAULT_UB_SERVE_EXPIRED_REPLY_TTL}\""
       echo "UB_DO_IP6=\"${DEFAULT_UB_DO_IP6}\""
-
       echo "MOS_LOG_LEVEL=\"${DEFAULT_MOS_LOG_LEVEL}\""
       echo "DENY_MODE=\"${DEFAULT_DENY_MODE}\""
-
       echo "NGX_HTTP2=\"${DEFAULT_NGX_HTTP2}\""
       echo "NGX_LIMIT_REQ=\"${DEFAULT_NGX_LIMIT_REQ}\""
       echo "NGX_RPS=\"${DEFAULT_NGX_RPS}\""
@@ -269,11 +378,12 @@ save_state() {
     echo "DOMAIN=\"${DOMAIN}\""
     echo "DOH_PATH=\"${DOH_PATH}\""
     echo "ALLOWLIST_FILE=\"${ALLOWLIST_FILE}\""
-
     echo "UPSTREAM_DOT=("
-    for u in "${UPSTREAM_DOT[@]}"; do echo "  \"${u}\""; done
+    local u
+    for u in "${UPSTREAM_DOT[@]}"; do
+      echo "  \"${u}\""
+    done
     echo ")"
-
     echo "UB_MSG_CACHE=\"${UB_MSG_CACHE}\""
     echo "UB_RRSET_CACHE=\"${UB_RRSET_CACHE}\""
     echo "UB_MIN_TTL=\"${UB_MIN_TTL}\""
@@ -283,10 +393,8 @@ save_state() {
     echo "UB_SERVE_EXPIRED_TTL=\"${UB_SERVE_EXPIRED_TTL}\""
     echo "UB_SERVE_EXPIRED_REPLY_TTL=\"${UB_SERVE_EXPIRED_REPLY_TTL}\""
     echo "UB_DO_IP6=\"${UB_DO_IP6}\""
-
     echo "MOS_LOG_LEVEL=\"${MOS_LOG_LEVEL}\""
     echo "DENY_MODE=\"${DENY_MODE}\""
-
     echo "NGX_HTTP2=\"${NGX_HTTP2}\""
     echo "NGX_LIMIT_REQ=\"${NGX_LIMIT_REQ}\""
     echo "NGX_RPS=\"${NGX_RPS}\""
@@ -297,25 +405,22 @@ save_state() {
   log_action "save state"
 }
 
-# ==========================================================
-# 基础状态
-# ==========================================================
 is_installed() {
-  [[ -x /usr/local/bin/mosdns && -f /etc/systemd/system/mosdns.service && -d "${CONF_DIR}" ]]
+  [[ -x /usr/local/bin/mosdns && -f /etc/systemd/system/${MOSDNS_UNIT}.service && -d "${CONF_DIR}" ]]
 }
 
 service_is_running() {
-  systemctl is-active --quiet mosdns && systemctl is-active --quiet unbound && systemctl is-active --quiet nginx
+  service_active "${MOSDNS_UNIT}" && service_active "${UNBOUND_UNIT}" && service_active "${NGINX_UNIT}"
 }
 
 ensure_allowlist_file() {
   mkdir -p "$(dirname "${ALLOWLIST_FILE}")"
   if [[ ! -f "${ALLOWLIST_FILE}" ]]; then
     c_warn "未发现 allowlist.txt，开始初始化: ${ALLOWLIST_FILE}"
-    cat > "${ALLOWLIST_FILE}" <<EOF
+    cat > "${ALLOWLIST_FILE}" <<'EOF2'
 # allowlist.txt
 # 每行一个域名或后缀
-EOF
+EOF2
     c_ok "allowlist.txt 初始化完成"
     log_action "init allowlist ${ALLOWLIST_FILE}"
   fi
@@ -333,7 +438,7 @@ allowlist_count() {
 
 show_brief_runtime_status() {
   echo "=============================================================="
-  echo " DoH Manager PRO ${SCRIPT_VERSION}"
+  echo " ${SCRIPT_NAME} ${SCRIPT_VERSION}"
   echo " 系统: ${OS_NAME}"
   echo " 包管理器: ${PKG_MGR}"
   if is_installed; then
@@ -351,9 +456,6 @@ show_brief_runtime_status() {
   echo "=============================================================="
 }
 
-# ==========================================================
-# allowlist 管理
-# ==========================================================
 show_allowlist() {
   ensure_allowlist_file
   echo "==================== allowlist.txt ===================="
@@ -396,7 +498,7 @@ allowlist_dedupe_sort() {
     }
   ' "${ALLOWLIST_FILE}" | sort -u > "${tmp}"
   {
-    echo "# allowlist.txt (managed by DoH Manager PRO)"
+    echo "# allowlist.txt (managed by ${SCRIPT_NAME})"
     echo "# each line: domain or suffix"
     cat "${tmp}"
   } > "${ALLOWLIST_FILE}"
@@ -528,9 +630,6 @@ batch_import_allowlist() {
   log_action "batch import allowlist added=${added} total=${after}"
 }
 
-# ==========================================================
-# 参数显示与设置
-# ==========================================================
 show_config() {
   echo "==================== 当前配置 ===================="
   echo "版本: ${SCRIPT_VERSION}"
@@ -546,7 +645,10 @@ show_config() {
   echo "MOS_LOG_LEVEL: ${MOS_LOG_LEVEL}"
   echo
   echo "UPSTREAM_DOT:"
-  for u in "${UPSTREAM_DOT[@]}"; do echo "  - ${u}"; done
+  local u
+  for u in "${UPSTREAM_DOT[@]}"; do
+    echo "  - ${u}"
+  done
   echo "=================================================="
 }
 
@@ -590,6 +692,7 @@ set_allowlist_file() {
 list_upstreams() {
   echo "UPSTREAM_DOT 列表:"
   local i=1
+  local u
   for u in "${UPSTREAM_DOT[@]}"; do
     echo "  [$i] ${u}"
     i=$((i+1))
@@ -599,6 +702,7 @@ list_upstreams() {
 add_upstream() {
   read -r -p "请输入新的 DoT 上游（例如 1.1.1.1@853）: " u
   [[ -n "${u}" ]] || { c_warn "未输入，取消"; return; }
+  local x
   for x in "${UPSTREAM_DOT[@]}"; do
     if [[ "${x}" == "${u}" ]]; then
       c_warn "已存在: ${u}"
@@ -627,9 +731,6 @@ remove_upstream() {
   save_state
 }
 
-# ==========================================================
-# 快速初始化向导
-# ==========================================================
 quick_setup_wizard() {
   c_info "快速初始化向导"
   echo
@@ -652,10 +753,11 @@ quick_setup_wizard() {
 
   ensure_allowlist_file
   : > "${ALLOWLIST_FILE}"
-  echo "# allowlist.txt (managed by DoH Manager PRO ${SCRIPT_VERSION})" >> "${ALLOWLIST_FILE}"
+  echo "# allowlist.txt (managed by ${SCRIPT_NAME} ${SCRIPT_VERSION})" >> "${ALLOWLIST_FILE}"
   echo "# each line: domain or suffix" >> "${ALLOWLIST_FILE}"
 
   IFS=',' read -r -a domains_arr <<< "${input_domains}"
+  local item
   for item in "${domains_arr[@]}"; do
     item="$(echo "${item}" | sed -e 's/^[[:space:]]\+//; s/[[:space:]]\+$//')"
     [[ -n "${item}" ]] && echo "${item}" >> "${ALLOWLIST_FILE}"
@@ -696,9 +798,6 @@ quick_setup_wizard() {
   esac
 }
 
-# ==========================================================
-# 路径与证书检查
-# ==========================================================
 doh_path_conflict_check() {
   c_info "DoH 路径冲突检测"
 
@@ -749,9 +848,6 @@ check_domain_cert_before_apply() {
   return 1
 }
 
-# ==========================================================
-# 安装/修复环境
-# ==========================================================
 install_packages() {
   case "${PKG_MGR}" in
     apt)
@@ -762,11 +858,13 @@ install_packages() {
         nginx openssl socat unbound
       ;;
     dnf)
+      dnf install -y epel-release >/dev/null 2>&1 || true
       dnf install -y \
         ca-certificates curl wget jq unzip tar \
         nginx openssl socat unbound
       ;;
     yum)
+      yum install -y epel-release >/dev/null 2>&1 || true
       yum install -y \
         ca-certificates curl wget jq unzip tar \
         nginx openssl socat unbound
@@ -777,8 +875,8 @@ install_packages() {
       ;;
   esac
 
-  systemctl enable nginx >/dev/null 2>&1 || true
-  systemctl enable unbound >/dev/null 2>&1 || true
+  systemctl enable "${NGINX_UNIT}" >/dev/null 2>&1 || true
+  systemctl enable "${UNBOUND_UNIT}" >/dev/null 2>&1 || true
   c_ok "依赖安装完成"
   log_action "install deps by ${PKG_MGR}"
 }
@@ -841,7 +939,7 @@ create_user_and_dirs() {
 
 install_mosdns_systemd() {
   c_info "安装/修复 mosdns systemd 服务"
-  cat > /etc/systemd/system/mosdns.service <<EOF
+  cat > "/etc/systemd/system/${MOSDNS_UNIT}.service" <<EOF2
 [Unit]
 Description=mosdns-x (DoH backend)
 After=network-online.target
@@ -858,10 +956,10 @@ LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
-EOF
+EOF2
 
   systemctl daemon-reload
-  systemctl enable mosdns >/dev/null 2>&1 || true
+  systemctl enable "${MOSDNS_UNIT}" >/dev/null 2>&1 || true
   c_ok "mosdns systemd 已就绪"
   log_action "install systemd mosdns"
 }
@@ -877,9 +975,6 @@ ensure_environment() {
   log_action "ensure environment done"
 }
 
-# ==========================================================
-# 写入配置
-# ==========================================================
 write_unbound_forward() {
   c_info "写入 Unbound 配置: ${UNBOUND_SNIPPET}"
   backup_file "${UNBOUND_SNIPPET}"
@@ -911,6 +1006,7 @@ write_unbound_forward() {
     echo "forward-zone:"
     echo "  name: \".\""
     echo "  forward-tls-upstream: yes"
+    local u
     for u in "${UPSTREAM_DOT[@]}"; do
       echo "  forward-addr: ${u}"
     done
@@ -958,7 +1054,7 @@ write_mosdns_config() {
     deny_action="_new_nxdomain_response"
   fi
 
-  cat > "${CONF_DIR}/config.yaml" <<EOF
+  cat > "${CONF_DIR}/config.yaml" <<EOF2
 log:
   level: ${MOS_LOG_LEVEL}
 
@@ -995,7 +1091,7 @@ servers:
       - protocol: http
         addr: "${MOSDNS_HTTP_ADDR}"
         url_path: "${DOH_PATH}"
-EOF
+EOF2
 
   c_ok "mosdns 配置 OK"
   log_action "write mosdns config"
@@ -1022,21 +1118,21 @@ write_nginx_site() {
 
   local limit_req_block=""
   if [[ "${NGX_LIMIT_REQ}" == "yes" ]]; then
-    limit_req_block=$(cat <<EOF
+    limit_req_block=$(cat <<EOF2
 limit_req_zone \$binary_remote_addr zone=doh_zone:10m rate=${NGX_RPS}r/s;
-EOF
+EOF2
 )
   fi
 
   local limit_req_apply=""
   if [[ "${NGX_LIMIT_REQ}" == "yes" ]]; then
-    limit_req_apply=$(cat <<EOF
+    limit_req_apply=$(cat <<EOF2
     limit_req zone=doh_zone burst=${NGX_BURST} nodelay;
-EOF
+EOF2
 )
   fi
 
-  cat > "${nginx_site}" <<EOF
+  cat > "${nginx_site}" <<EOF2
 ${limit_req_block}
 server {
   listen 80;
@@ -1076,7 +1172,7 @@ ${limit_req_apply}
     try_files \$uri \$uri/ =404;
   }
 }
-EOF
+EOF2
 
   if [[ "${USE_NGINX_LINK}" == "yes" ]]; then
     mkdir -p "${NGINX_LINK_DIR}"
@@ -1088,26 +1184,38 @@ EOF
   log_action "write nginx site"
 }
 
-# ==========================================================
-# 日志设置
-# ==========================================================
 validate_mos_log_level() {
-  local level="$1"
-  case "${level}" in
+  case "$1" in
     none|error|warning|info|debug) return 0 ;;
     *) return 1 ;;
   esac
 }
 
 apply_mosdns_log_level() {
+  if ! validate_mos_log_level "${MOS_LOG_LEVEL}"; then
+    c_err "非法日志等级: ${MOS_LOG_LEVEL}"
+    return 1
+  fi
+
+  if ! service_exists "${MOSDNS_UNIT}" && ! mosdns_process_exists; then
+    c_warn "当前未检测到 mosdns 服务或进程，日志等级已保存，但要在 mosdns 启动后才会生效"
+    save_state
+    return 0
+  fi
+
   save_state
   if write_mosdns_config; then
-    if systemctl restart mosdns >/dev/null 2>&1; then
-      c_ok "日志等级已生效，mosdns 已重启"
-      log_action "set MOS_LOG_LEVEL=${MOS_LOG_LEVEL} and restart mosdns"
+    if service_exists "${MOSDNS_UNIT}"; then
+      if systemctl restart "${MOSDNS_UNIT}" >/dev/null 2>&1; then
+        c_ok "日志等级已生效，mosdns 已重启"
+        log_action "set MOS_LOG_LEVEL=${MOS_LOG_LEVEL} and restart mosdns"
+      else
+        c_err "mosdns 重启失败，请检查配置"
+        systemctl --no-pager --full status "${MOSDNS_UNIT}" 2>/dev/null | sed -n '1,12p' || true
+      fi
     else
-      c_err "mosdns 重启失败，请检查配置"
-      systemctl --no-pager --full status mosdns 2>/dev/null | sed -n '1,12p' || true
+      c_warn "检测到 mosdns 进程存在，但没有 systemd unit；日志等级已写入配置，需你手动重启 mosdns 进程后生效"
+      pgrep -af '(^|/)(mosdns|mosdns-x)( |$)' || true
     fi
   else
     c_err "重写 mosdns 配置失败，日志等级未应用"
@@ -1143,21 +1251,49 @@ set_mosdns_log_level_menu() {
 
 show_recent_logs_50() {
   echo "==================== 最近50条日志 ===================="
-  if systemctl list-unit-files | grep -q '^mosdns\.service'; then
-    journalctl -u mosdns -n 50 --no-pager 2>/dev/null || c_warn "读取 mosdns 日志失败"
-  else
-    c_warn "未检测到 mosdns.service"
+
+  if service_exists "${MOSDNS_UNIT}" || service_active "${MOSDNS_UNIT}"; then
+    journalctl -u "${MOSDNS_UNIT}" -n 50 --no-pager 2>/dev/null || {
+      c_warn "按 unit 读取失败，尝试按进程名读取"
+      journalctl _COMM=mosdns -n 50 --no-pager 2>/dev/null || c_warn "读取 mosdns 日志失败"
+    }
+    return
   fi
+
+  if mosdns_process_exists; then
+    c_warn "未检测到 ${MOSDNS_UNIT}.service，但检测到 mosdns 进程，尝试按进程名读取日志"
+    journalctl _COMM=mosdns -n 50 --no-pager 2>/dev/null || {
+      c_warn "按 journald 进程名过滤失败，当前 mosdns 可能不是通过 systemd/journald 方式启动"
+      pgrep -af '(^|/)(mosdns|mosdns-x)( |$)' || true
+    }
+    return
+  fi
+
+  c_warn "未检测到 mosdns 的 systemd unit，也未检测到 mosdns 进程"
 }
 
 follow_mosdns_logs() {
   echo "==================== 实时查看日志 ===================="
   c_info "按 Ctrl+C 退出实时日志查看"
-  if systemctl list-unit-files | grep -q '^mosdns\.service'; then
-    journalctl -u mosdns -f 2>/dev/null || c_warn "实时查看 mosdns 日志失败"
-  else
-    c_warn "未检测到 mosdns.service"
+
+  if service_exists "${MOSDNS_UNIT}" || service_active "${MOSDNS_UNIT}"; then
+    journalctl -u "${MOSDNS_UNIT}" -f 2>/dev/null || {
+      c_warn "按 unit 跟随失败，尝试按进程名跟随"
+      journalctl _COMM=mosdns -f 2>/dev/null || c_warn "实时查看 mosdns 日志失败"
+    }
+    return
   fi
+
+  if mosdns_process_exists; then
+    c_warn "未检测到 ${MOSDNS_UNIT}.service，但检测到 mosdns 进程，尝试按进程名跟随日志"
+    journalctl _COMM=mosdns -f 2>/dev/null || {
+      c_warn "当前 mosdns 可能不是通过 journald 方式启动，无法直接实时跟随日志"
+      pgrep -af '(^|/)(mosdns|mosdns-x)( |$)' || true
+    }
+    return
+  fi
+
+  c_warn "未检测到 mosdns 的 systemd unit，也未检测到 mosdns 进程"
 }
 
 log_settings_menu() {
@@ -1185,9 +1321,6 @@ log_settings_menu() {
   done
 }
 
-# ==========================================================
-# 证书管理
-# ==========================================================
 acme_sh_path() { echo "/root/.acme.sh/acme.sh"; }
 
 ensure_acme_sh() {
@@ -1206,7 +1339,7 @@ write_nginx_http_only_for_acme() {
   c_info "临时写入 Nginx(80) 用于 ACME"
   mkdir -p "${NGINX_SITE_DIR}" "${ACME_WEBROOT}"
 
-  cat > "${nginx_site}" <<EOF
+  cat > "${nginx_site}" <<EOF2
 server {
   listen 80;
   server_name ${DOMAIN};
@@ -1221,7 +1354,7 @@ server {
     return 200 "OK";
   }
 }
-EOF
+EOF2
 
   if [[ "${USE_NGINX_LINK}" == "yes" ]]; then
     mkdir -p "${NGINX_LINK_DIR}"
@@ -1229,11 +1362,16 @@ EOF
   fi
 
   nginx -t >/dev/null
-  systemctl restart nginx >/dev/null 2>&1 || true
+  systemctl restart "${NGINX_UNIT}" >/dev/null 2>&1 || true
   c_ok "ACME 环境准备完成"
 }
 
 issue_cert() {
+  if [[ -z "${DOMAIN}" || "${DOMAIN}" == "example.com" ]]; then
+    c_err "当前 DOMAIN 无效，请先设置真实域名后再签发证书"
+    return 1
+  fi
+
   ensure_acme_sh
   local ACME
   ACME="$(acme_sh_path)"
@@ -1249,7 +1387,7 @@ issue_cert() {
   "${ACME}" --install-cert --server letsencrypt -d "${DOMAIN}" \
     --key-file       "${NGINX_SSL_DIR}/${DOMAIN}.key" \
     --fullchain-file "${NGINX_SSL_DIR}/fullchain.pem" \
-    --reloadcmd     "systemctl reload nginx"
+    --reloadcmd     "systemctl reload ${NGINX_UNIT}"
 
   c_ok "证书签发完成: ${NGINX_SSL_DIR}"
   log_action "issue cert for ${DOMAIN}"
@@ -1263,7 +1401,7 @@ renew_cert() {
   c_info "强制续期证书"
   "${ACME}" --renew -d "${DOMAIN}" --force >/dev/null 2>&1 || true
   c_ok "续期完成"
-  systemctl reload nginx >/dev/null 2>&1 || true
+  systemctl reload "${NGINX_UNIT}" >/dev/null 2>&1 || true
   log_action "renew cert for ${DOMAIN}"
 }
 
@@ -1308,41 +1446,46 @@ check_cert_days() {
   fi
 }
 
-# ==========================================================
-# 服务控制
-# ==========================================================
 reload_services() {
-  c_info "重载服务: unbound / mosdns / nginx"
-  systemctl restart unbound >/dev/null 2>&1 || true
-  systemctl restart mosdns  >/dev/null 2>&1 || true
-  systemctl reload nginx    >/dev/null 2>&1 || systemctl restart nginx >/dev/null 2>&1 || true
+  c_info "重载服务: ${UNBOUND_UNIT} / ${MOSDNS_UNIT} / ${NGINX_UNIT}"
+  systemctl restart "${UNBOUND_UNIT}" >/dev/null 2>&1 || true
+  if service_exists "${MOSDNS_UNIT}"; then
+    systemctl restart "${MOSDNS_UNIT}" >/dev/null 2>&1 || true
+  fi
+  systemctl reload "${NGINX_UNIT}" >/dev/null 2>&1 || systemctl restart "${NGINX_UNIT}" >/dev/null 2>&1 || true
   c_ok "服务重载完成"
   log_action "reload services"
 }
 
 start_services() {
-  c_info "启动服务: unbound / mosdns / nginx"
-  systemctl start unbound >/dev/null 2>&1 || true
-  systemctl start mosdns  >/dev/null 2>&1 || true
-  systemctl start nginx   >/dev/null 2>&1 || true
+  c_info "启动服务: ${UNBOUND_UNIT} / ${MOSDNS_UNIT} / ${NGINX_UNIT}"
+  systemctl start "${UNBOUND_UNIT}" >/dev/null 2>&1 || true
+  if service_exists "${MOSDNS_UNIT}"; then
+    systemctl start "${MOSDNS_UNIT}" >/dev/null 2>&1 || true
+  fi
+  systemctl start "${NGINX_UNIT}" >/dev/null 2>&1 || true
   c_ok "启动完成"
   log_action "start services"
 }
 
 stop_services() {
-  c_info "停止服务: mosdns / unbound / nginx"
-  systemctl stop mosdns  >/dev/null 2>&1 || true
-  systemctl stop unbound >/dev/null 2>&1 || true
-  systemctl stop nginx   >/dev/null 2>&1 || true
+  c_info "停止服务: ${MOSDNS_UNIT} / ${UNBOUND_UNIT} / ${NGINX_UNIT}"
+  if service_exists "${MOSDNS_UNIT}"; then
+    systemctl stop "${MOSDNS_UNIT}" >/dev/null 2>&1 || true
+  fi
+  systemctl stop "${UNBOUND_UNIT}" >/dev/null 2>&1 || true
+  systemctl stop "${NGINX_UNIT}" >/dev/null 2>&1 || true
   c_ok "停止完成"
   log_action "stop services"
 }
 
 restart_services() {
-  c_info "重启服务: unbound / mosdns / nginx"
-  systemctl restart unbound >/dev/null 2>&1 || true
-  systemctl restart mosdns  >/dev/null 2>&1 || true
-  systemctl restart nginx   >/dev/null 2>&1 || true
+  c_info "重启服务: ${UNBOUND_UNIT} / ${MOSDNS_UNIT} / ${NGINX_UNIT}"
+  systemctl restart "${UNBOUND_UNIT}" >/dev/null 2>&1 || true
+  if service_exists "${MOSDNS_UNIT}"; then
+    systemctl restart "${MOSDNS_UNIT}" >/dev/null 2>&1 || true
+  fi
+  systemctl restart "${NGINX_UNIT}" >/dev/null 2>&1 || true
   c_ok "重启完成"
   log_action "restart services"
 }
@@ -1364,8 +1507,8 @@ apply_all() {
   if [[ ! -x /usr/local/bin/mosdns ]]; then
     c_warn "检测到 mosdns 未安装，建议先执行安装/修复"
   fi
-  if [[ ! -f /etc/systemd/system/mosdns.service ]]; then
-    c_warn "检测到 mosdns.service 不存在，建议先执行安装/修复"
+  if [[ ! -f "/etc/systemd/system/${MOSDNS_UNIT}.service" ]]; then
+    c_warn "检测到 ${MOSDNS_UNIT}.service 不存在，建议先执行安装/修复"
   fi
 
   c_info "生成配置并应用..."
@@ -1377,30 +1520,40 @@ apply_all() {
   log_action "apply all done"
 }
 
-# ==========================================================
-# 检查类输出
-# ==========================================================
 service_status_summary() {
   local failed=0
 
   echo "==================== 服务状态检查 ===================="
 
-  for svc in mosdns unbound nginx; do
-    if systemctl is-active --quiet "${svc}"; then
-      c_ok "${svc} 正在正常运行中"
+  local svc
+  for svc in "${MOSDNS_UNIT}" "${UNBOUND_UNIT}" "${NGINX_UNIT}"; do
+    if service_exists "${svc}"; then
+      if service_active "${svc}"; then
+        c_ok "${svc} 正在正常运行中"
+      else
+        c_err "${svc} 未正常运行"
+        failed=1
+        echo "原因摘要："
+        systemctl --no-pager --full status "${svc}" 2>/dev/null | sed -n '1,12p' || true
+        echo "最近日志："
+        journalctl -u "${svc}" -n 8 --no-pager 2>/dev/null || true
+        echo "------------------------------------------------------"
+      fi
     else
-      c_err "${svc} 未正常运行"
-      failed=1
-      echo "原因摘要："
-      systemctl --no-pager --full status "${svc}" 2>/dev/null | sed -n '1,12p' || true
-      echo "最近日志："
-      journalctl -u "${svc}" -n 8 --no-pager 2>/dev/null || true
-      echo "------------------------------------------------------"
+      if [[ "${svc}" == "${MOSDNS_UNIT}" ]] && mosdns_process_exists; then
+        c_warn "${MOSDNS_UNIT} 没有 systemd unit，但检测到 mosdns 进程正在运行"
+        pgrep -af '(^|/)(mosdns|mosdns-x)( |$)' || true
+        echo "------------------------------------------------------"
+      else
+        c_err "${svc} 的 systemd unit 未找到"
+        failed=1
+        echo "------------------------------------------------------"
+      fi
     fi
   done
 
   if (( failed == 0 )); then
-    c_ok "结论：全部服务正在正常运行中"
+    c_ok "结论：全部服务正在正常运行中，或 mosdns 以非 systemd 方式运行"
   else
     c_warn "结论：存在异常服务，请根据上面的原因摘要排查"
   fi
@@ -1411,6 +1564,7 @@ show_ports_summary() {
 
   local failed=0
   local ports=(80 443 8053 "${UNBOUND_PORT}")
+  local p
 
   for p in "${ports[@]}"; do
     if ss -lntp 2>/dev/null | grep -q ":${p} "; then
@@ -1437,9 +1591,13 @@ health_check_summary() {
 
   local failed=0
 
-  if ! command -v curl >/dev/null 2>&1; then
+  if ! have_cmd curl; then
     c_err "未安装 curl，无法执行健康检查"
     return 1
+  fi
+
+  if [[ -z "${DOMAIN}" || "${DOMAIN}" == "example.com" ]]; then
+    c_warn "当前 DOMAIN 仍是默认值，健康检查结果没有实际意义"
   fi
 
   local homepage_code doh_code
@@ -1467,96 +1625,6 @@ health_check_summary() {
   fi
 }
 
-# ==========================================================
-# 自检与版本完整性检查
-# ==========================================================
-self_check_menu_functions() {
-  local missing=0
-  local funcs=(
-    ensure_environment
-    quick_setup_wizard
-    show_config
-    set_domain
-    set_doh_path
-    set_allowlist_file
-    show_allowlist
-    add_allowlist_one
-    remove_allowlist_one
-    batch_import_allowlist
-    edit_allowlist_vim
-    allowlist_dedupe_sort
-    list_upstreams
-    add_upstream
-    remove_upstream
-    doh_path_conflict_check
-    check_domain_cert_before_apply
-    apply_all
-    issue_cert
-    renew_cert
-    check_cert_days
-    service_status_summary
-    show_ports_summary
-    health_check_summary
-    log_settings_menu
-    start_services
-    stop_services
-    restart_services
-    uninstall_all
-  )
-
-  for fn in "${funcs[@]}"; do
-    if ! function_exists "${fn}"; then
-      c_err "菜单自检失败：缺少函数 ${fn}"
-      missing=1
-    fi
-  done
-
-  if (( missing != 0 )); then
-    c_err "启动已终止：菜单函数不完整"
-    exit 1
-  fi
-}
-
-version_integrity_check() {
-  local missing=0
-  local checks=(
-    "quick_setup_wizard:ensure_environment issue_cert check_domain_cert_before_apply apply_all"
-    "apply_all:write_unbound_forward write_mosdns_config write_nginx_site reload_services"
-    "apply_mosdns_log_level:save_state write_mosdns_config"
-    "issue_cert:ensure_acme_sh acme_sh_path write_nginx_http_only_for_acme"
-    "renew_cert:ensure_acme_sh acme_sh_path"
-    "check_domain_cert_before_apply:cert_exists_for_domain"
-    "write_mosdns_config:build_domain_rules_from_allowlist"
-  )
-
-  local item caller deps dep
-  for item in "${checks[@]}"; do
-    caller="${item%%:*}"
-    deps="${item#*:}"
-
-    if ! function_exists "${caller}"; then
-      c_err "完整性检查失败：缺少核心函数 ${caller}"
-      missing=1
-      continue
-    fi
-
-    for dep in ${deps}; do
-      if ! function_exists "${dep}"; then
-        c_err "完整性检查失败：${caller} 依赖函数 ${dep} 缺失"
-        missing=1
-      fi
-    done
-  done
-
-  if (( missing != 0 )); then
-    c_err "启动已终止：版本完整性检查未通过"
-    exit 1
-  fi
-}
-
-# ==========================================================
-# 卸载
-# ==========================================================
 uninstall_all() {
   c_warn "你即将执行【彻底卸载】"
   echo "将删除以下内容："
@@ -1576,10 +1644,12 @@ uninstall_all() {
 
   log_action "begin uninstall all"
 
-  systemctl stop mosdns 2>/dev/null || true
-  systemctl disable mosdns 2>/dev/null || true
+  if service_exists "${MOSDNS_UNIT}"; then
+    systemctl stop "${MOSDNS_UNIT}" 2>/dev/null || true
+    systemctl disable "${MOSDNS_UNIT}" 2>/dev/null || true
+  fi
 
-  remove_if_exists "/etc/systemd/system/mosdns.service"
+  remove_if_exists "/etc/systemd/system/${MOSDNS_UNIT}.service"
   systemctl daemon-reload
 
   remove_if_exists "${CONF_DIR}"
@@ -1592,19 +1662,16 @@ uninstall_all() {
   remove_if_exists "${NGINX_SSL_DIR}"
   remove_if_exists "/usr/local/bin/mosdns"
 
-  nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1 || true
-  unbound-checkconf >/dev/null 2>&1 && systemctl restart unbound >/dev/null 2>&1 || true
+  nginx -t >/dev/null 2>&1 && systemctl reload "${NGINX_UNIT}" >/dev/null 2>&1 || true
+  unbound-checkconf >/dev/null 2>&1 && systemctl restart "${UNBOUND_UNIT}" >/dev/null 2>&1 || true
 
   c_ok "彻底卸载完成"
   log_action "uninstall all done"
 }
 
-# ==========================================================
-# 菜单
-# ==========================================================
 show_menu() {
-  cat <<EOF
-==================== DoH Manager PRO ${SCRIPT_VERSION} ====================
+  cat <<EOF2
+==================== ${SCRIPT_NAME} ${SCRIPT_VERSION} ====================
 
  1. 安装/修复环境            2. 快速初始化向导
  3. 显示当前配置            4. 修改 DOMAIN
@@ -1628,12 +1695,9 @@ show_menu() {
 99. 退出
 
 =========================================================================
-EOF
+EOF2
 }
 
-# ==========================================================
-# 主程序
-# ==========================================================
 main() {
   need_root
   detect_platform
@@ -1642,7 +1706,8 @@ main() {
   ensure_allowlist_file
 
   self_check_menu_functions
-  version_integrity_check
+  integrity_check_core_functions
+  show_integrity_summary
 
   log_action "run doh-manager-pro-allinone.sh"
   show_brief_runtime_status

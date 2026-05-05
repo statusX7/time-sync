@@ -294,7 +294,7 @@ add_profile_interactive() {
   line
   echo "建议使用 API Token，不建议使用全局 Key；Token 至少需要该 Zone 的 DNS Read + DNS Write。"
   local zone_name zone_id token name id exists profile_json
-  zone_name="$(read_required '域名，例如 vkvkvk.vip: ')"
+  zone_name="$(read_required '域名，例如 123.com: ')"
   zone_id="$(read_required 'Cloudflare Zone ID: ')"
   token="$(read_secret_required 'Cloudflare API Token，输入时不回显: ')"
   name="$(read_default '配置名称' "$zone_name")"
@@ -439,7 +439,7 @@ add_task_interactive() {
   cecho "$C_BLUE" "新增 CNAME 定时切换任务"
   line
   echo "当前域名配置：$pname"
-  task_name="$(read_required '任务名称，例如 vkvkvk-night-switch: ')"
+  task_name="$(read_required '任务名称，例如 123-night-switch: ')"
   task_id="$(sanitize_id "$task_name")"
   [[ -z "$task_id" ]] && task_id="task-$(now_id)"
   if [[ -n "$(jq -r --arg id "$task_id" '.tasks[]? | select(.id == $id) | .id' "$CONFIG_FILE")" ]]; then

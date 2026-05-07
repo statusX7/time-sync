@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # cfcname - Cloudflare CNAME Pair-Swap Manager
-# Version: 1.6
+# Version: 1.7
 # License: MIT
 #
 # 功能简要注释：
@@ -13,7 +13,7 @@
 set -Eeuo pipefail
 
 APP_NAME="cfcname"
-APP_VERSION="1.6"
+APP_VERSION="1.7"
 INSTALL_BIN="/usr/local/bin/${APP_NAME}"
 INSTALL_BIN_COMPAT="/usr/bin/${APP_NAME}"
 CONFIG_DIR="/etc/${APP_NAME}"
@@ -64,7 +64,8 @@ cn_num() {
 
 menu_item() {
   local n="$1" text="$2"
-  printf "  %s. %s\n" "$(cn_num "$n")" "$text"
+  # v1.7 UI：统一使用 1. / 2. / 3. 这种编号，避免中文编号在终端里显得混乱。
+  printf "  %s. %s\n" "$n" "$text"
 }
 
 choice_num() {
@@ -511,6 +512,66 @@ scheduler_status() {
   else
     echo "  未检测到 cron 文件。"
   fi
+}
+
+# ---------- 服务控制 ----------
+# 说明：cfcname 的后台执行依靠 systemd timer 或 cron。
+# 启动 = 创建并启用调度器；停止 = 停用调度器但保留配置；重启 = 重建调度器。
+scheduler_start() {
+  need_root
+  ensure_dirs
+  migrate_config
+  setup_scheduler
+  log_msg INFO "服务已启动：定时检查已启用。"
+}
+
+scheduler_stop() {
+  need_root
+  disable_scheduler
+  log_msg INFO "服务已停止：定时检查已停用，配置保留。"
+}
+
+scheduler_restart() {
+  need_root
+  disable_scheduler || true
+  setup_scheduler
+  log_msg INFO "服务已重启：定时检查已重新启用。"
+}
+
+scheduler_reload() {
+  need_root
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
+  log_msg INFO "服务配置已重载。"
+}
+
+service_control_menu() {
+  while true; do
+    print_header
+    section_title "服务控制"
+    echo "这里控制的是 cfcname 的定时执行服务。"
+    echo "启动后，脚本会按分钟检查是否需要在切换时间/恢复时间更新 CNAME。"
+    echo
+    menu_item 1 "▶️  启动定时服务"
+    menu_item 2 "🔄 重启定时服务"
+    menu_item 3 "⏹️  停止定时服务"
+    menu_item 4 "📊 查看服务状态"
+    menu_item 5 "🛠️  修复/重装定时服务"
+    menu_item 0 "返回主菜单"
+    echo
+    read -r -p "请选择: " ans || true
+    ans="$(choice_num "$ans")"
+    case "$ans" in
+      1) scheduler_start; pause_enter ;;
+      2) scheduler_restart; pause_enter ;;
+      3) if confirm_select "确认停止 cfcname 定时服务？配置不会删除。"; then scheduler_stop; fi; pause_enter ;;
+      4) print_header; scheduler_status; pause_enter ;;
+      5) setup_scheduler; pause_enter ;;
+      0) return 0 ;;
+      *) log_msg WARN "无效选项"; pause_enter ;;
+    esac
+  done
 }
 
 # ---------- Cloudflare API ----------
@@ -1553,8 +1614,8 @@ settings_menu() {
     menu_item 2 "设置日志等级"
     menu_item 3 "设置 curl 网络参数"
     menu_item 4 "设置时区 / 默认 TTL / 自动创建"
-    menu_item 5 "重装/修复定时器"
-    menu_item 6 "停用定时器"
+    menu_item 5 "重装/修复定时服务"
+    menu_item 6 "停用定时服务"
     menu_item 7 "查看最近 80 行日志"
     menu_item 8 "实时查看日志"
     menu_item 0 "返回主菜单"
@@ -1649,16 +1710,17 @@ main_menu() {
   migrate_config
   while true; do
     print_header
-    echo "推荐：第一次使用选 1；日常改互换规则选 3；排障选 6。"
+    echo "推荐：第一次使用选 1；日常改互换规则选 3；服务启停选 5；排障选 7。"
     echo
     menu_item 1 "🚀 快速初始化：创建 21点互换 / 2点恢复任务"
     menu_item 2 "🌐 域名 / Token 配置"
     menu_item 3 "🔁 CNAME 成对互换任务"
-    menu_item 4 "💾 备份 / 恢复"
-    menu_item 5 "⚙️  系统设置 / 日志等级"
-    menu_item 6 "🔎 自检"
-    menu_item 7 "▶️  立即执行所有启用任务"
-    menu_item 8 "🧹 卸载 cfcname"
+    menu_item 4 "💾 备份 / 恢复 / 导入导出"
+    menu_item 5 "🧭 服务控制：启动 / 重启 / 停止"
+    menu_item 6 "⚙️  系统设置 / 日志等级"
+    menu_item 7 "🔎 自检"
+    menu_item 8 "▶️  立即执行所有启用任务"
+    menu_item 9 "🧹 卸载 cfcname"
     menu_item 0 "退出"
     echo
     read -r -p "请选择: " ans || true
@@ -1668,10 +1730,11 @@ main_menu() {
       2) zone_menu ;;
       3) task_menu ;;
       4) backup_menu ;;
-      5) settings_menu ;;
-      6) self_check; pause_enter ;;
-      7) run_tasks force; pause_enter ;;
-      8) uninstall_self; pause_enter ;;
+      5) service_control_menu ;;
+      6) settings_menu ;;
+      7) self_check; pause_enter ;;
+      8) run_tasks force; pause_enter ;;
+      9) uninstall_self; pause_enter ;;
       0) exit 0 ;;
       *) log_msg WARN "无效选项"; pause_enter ;;
     esac
@@ -1687,6 +1750,10 @@ cfcname v${APP_VERSION}
   sudo cfcname                                    打开菜单
   sudo cfcname run --quiet                       定时器调用，按当前时间执行
   sudo cfcname run --force                       立即强制执行所有启用任务
+  sudo cfcname start                             启动定时服务
+  sudo cfcname stop                              停止定时服务
+  sudo cfcname restart                           重启定时服务
+  sudo cfcname status                            查看定时服务状态
   sudo cfcname self-check                        自检
   sudo cfcname uninstall                         卸载
 
@@ -1719,6 +1786,10 @@ main() {
       done
       run_tasks "$force"
       ;;
+    start) scheduler_start ;;
+    stop) scheduler_stop ;;
+    restart) scheduler_restart ;;
+    status) need_root; migrate_config; scheduler_status ;;
     self-check|check) need_root; migrate_config; self_check ;;
     help|-h|--help) usage ;;
     *) usage; exit 1 ;;

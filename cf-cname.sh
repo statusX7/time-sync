@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # cfcname - Cloudflare CNAME Pair-Swap Manager
-# Version: 1.7
+# Version: 1.8
 # License: MIT
 #
 # 功能简要注释：
@@ -13,13 +13,16 @@
 set -Eeuo pipefail
 
 APP_NAME="cfcname"
-APP_VERSION="1.7"
+APP_VERSION="1.8"
+INSTALL_DIR="/opt/${APP_NAME}"
+INSTALL_SCRIPT="${INSTALL_DIR}/${APP_NAME}.sh"
 INSTALL_BIN="/usr/local/bin/${APP_NAME}"
 INSTALL_BIN_COMPAT="/usr/bin/${APP_NAME}"
 CONFIG_DIR="/etc/${APP_NAME}"
 CONFIG_FILE="${CONFIG_DIR}/config.json"
 STATE_DIR="/var/lib/${APP_NAME}"
 BACKUP_DIR="${STATE_DIR}/backups"
+DEPS_MARKER="${STATE_DIR}/installed_deps.txt"
 LOG_DIR="/var/log/${APP_NAME}"
 LOG_FILE="${LOG_DIR}/${APP_NAME}.log"
 SYSTEMD_SERVICE="/etc/systemd/system/${APP_NAME}.service"
@@ -358,32 +361,123 @@ detect_pkg_manager() {
 }
 
 install_deps() {
-  local missing=() pm
-  command -v curl >/dev/null 2>&1 || missing+=(curl)
-  command -v jq >/dev/null 2>&1 || missing+=(jq)
-  command -v flock >/dev/null 2>&1 || missing+=(util-linux)
-  [[ ${#missing[@]} -eq 0 ]] && return 0
+  # 只检测并安装缺失依赖：已经存在的 curl/jq/flock 不重复安装。
+  local pkgs=() pm pkg
+
+  command -v curl >/dev/null 2>&1 || pkgs+=(curl ca-certificates)
+  command -v jq >/dev/null 2>&1 || pkgs+=(jq)
+  command -v flock >/dev/null 2>&1 || pkgs+=(util-linux)
+
+  # 非 systemd 环境需要 cron 兜底；systemd 环境不强行安装 cron。
+  if ! command -v systemctl >/dev/null 2>&1; then
+    if ! command -v crond >/dev/null 2>&1 && ! command -v cron >/dev/null 2>&1; then
+      case "$(detect_pkg_manager)" in
+        apt) pkgs+=(cron) ;;
+        dnf|yum) pkgs+=(cronie) ;;
+        apk) pkgs+=(dcron) ;;
+      esac
+    fi
+  fi
+
+  # 去重。
+  if [[ ${#pkgs[@]} -gt 0 ]]; then
+    mapfile -t pkgs < <(printf '%s\n' "${pkgs[@]}" | awk 'NF && !seen[$0]++')
+  fi
+
+  if [[ ${#pkgs[@]} -eq 0 ]]; then
+    echo "依赖检测完成：curl / jq / flock 已存在，无需安装。"
+    return 0
+  fi
 
   pm="$(detect_pkg_manager)"
-  echo "准备安装依赖：${missing[*]}"
+  echo "检测到缺失依赖，准备安装：${pkgs[*]}"
   case "$pm" in
     apt)
       apt-get update -y
-      DEBIAN_FRONTEND=noninteractive apt-get install -y curl jq util-linux cron ca-certificates
+      DEBIAN_FRONTEND=noninteractive apt-get install -y "${pkgs[@]}"
       ;;
     dnf)
-      dnf install -y curl jq util-linux cronie ca-certificates
+      dnf install -y "${pkgs[@]}"
       ;;
     yum)
-      yum install -y curl jq util-linux cronie ca-certificates
+      yum install -y "${pkgs[@]}"
       ;;
     apk)
-      apk add --no-cache curl jq util-linux ca-certificates dcron
+      apk add --no-cache "${pkgs[@]}"
       ;;
     *)
       echo "无法识别包管理器，请手动安装 curl jq flock 后重试。" >&2
       exit 1
       ;;
+  esac
+
+  # 记录本脚本本次补装过的包，供“全部卸载”时二次确认使用。
+  mkdir -p "$STATE_DIR"
+  touch "$DEPS_MARKER"
+  for pkg in "${pkgs[@]}"; do
+    grep -qxF "$pkg" "$DEPS_MARKER" 2>/dev/null || echo "$pkg" >> "$DEPS_MARKER"
+  done
+  chmod 600 "$DEPS_MARKER" 2>/dev/null || true
+}
+
+write_launcher() {
+  # 入口命令只做一件事：找到真正主程序并执行。这样可避免软链接断裂、sudo secure_path 导致命令不可用。
+  local target="$1"
+  cat > "$target" <<EOF
+#!/usr/bin/env bash
+set -Eeuo pipefail
+REAL="${INSTALL_SCRIPT}"
+if [[ ! -s "\$REAL" ]]; then
+  echo "cfcname 主程序不存在或为空：\$REAL" >&2
+  echo "请重新安装：sudo bash cfcname_v${APP_VERSION}.sh install" >&2
+  exit 127
+fi
+if [[ "\$(id -u)" -ne 0 ]]; then
+  if command -v sudo >/dev/null 2>&1 && [[ -t 0 ]]; then
+    exec sudo "\$REAL" "\$@"
+  fi
+  echo "请使用 root 运行：sudo cfcname" >&2
+  exit 1
+fi
+exec "\$REAL" "\$@"
+EOF
+  chmod 755 "$target"
+}
+
+verify_launcher() {
+  local ok=1
+  for f in "$INSTALL_SCRIPT" "$INSTALL_BIN" "$INSTALL_BIN_COMPAT"; do
+    if [[ -s "$f" ]]; then
+      echo "✅ 入口正常：$f"
+    else
+      echo "❌ 入口异常或为空：$f"
+      ok=0
+    fi
+  done
+  return $(( ok == 1 ? 0 : 1 ))
+}
+
+remove_marked_deps() {
+  # 只有“全部卸载”才会走到这里，并且还会二次确认。
+  [[ -s "$DEPS_MARKER" ]] || { echo "没有找到依赖安装记录，跳过依赖卸载。"; return 0; }
+  local pm pkgs=()
+  mapfile -t pkgs < <(awk 'NF && !seen[$0]++' "$DEPS_MARKER")
+  [[ ${#pkgs[@]} -gt 0 ]] || { echo "依赖安装记录为空，跳过依赖卸载。"; return 0; }
+  echo
+  echo "以下依赖曾由 cfcname 补装，但也可能被其他软件使用："
+  printf '  - %s\n' "${pkgs[@]}"
+  echo
+  if ! confirm_select "是否尝试卸载这些记录中的依赖？不确定请选择取消。"; then
+    echo "已跳过依赖卸载。"
+    return 0
+  fi
+  pm="$(detect_pkg_manager)"
+  case "$pm" in
+    apt) apt-get purge -y "${pkgs[@]}" || true; apt-get autoremove -y || true ;;
+    dnf) dnf remove -y "${pkgs[@]}" || true ;;
+    yum) yum remove -y "${pkgs[@]}" || true ;;
+    apk) apk del "${pkgs[@]}" || true ;;
+    *) echo "无法识别包管理器，已跳过依赖卸载。" ;;
   esac
 }
 
@@ -392,41 +486,69 @@ install_self() {
   install_deps
   ensure_dirs
   migrate_config
-  if [[ "$(readlink -f "$0" 2>/dev/null || echo "$0")" != "$INSTALL_BIN" ]]; then
-    install -m 755 "$0" "$INSTALL_BIN"
+
+  mkdir -p "$INSTALL_DIR"
+  local self_path
+  self_path="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+  if [[ "$self_path" != "$INSTALL_SCRIPT" ]]; then
+    install -m 755 "$self_path" "$INSTALL_SCRIPT"
   else
-    chmod 755 "$INSTALL_BIN"
+    chmod 755 "$INSTALL_SCRIPT"
   fi
 
-  # 兼容 sudo secure_path：部分系统 sudo 找不到 /usr/local/bin，所以同时提供 /usr/bin/cfcname。
-  if [[ "$INSTALL_BIN" != "$INSTALL_BIN_COMPAT" ]]; then
-    ln -sf "$INSTALL_BIN" "$INSTALL_BIN_COMPAT" 2>/dev/null || install -m 755 "$INSTALL_BIN" "$INSTALL_BIN_COMPAT"
-  fi
+  # 同时写入 /usr/local/bin 和 /usr/bin，解决 sudo secure_path 或 PATH 不一致导致的 command not found/空入口问题。
+  write_launcher "$INSTALL_BIN"
+  write_launcher "$INSTALL_BIN_COMPAT"
   hash -r 2>/dev/null || true
 
   setup_scheduler
-  log_msg INFO "已安装 ${APP_NAME} v${APP_VERSION} 到 ${INSTALL_BIN}，兼容命令：${INSTALL_BIN_COMPAT}"
-  echo "安装完成。可输入以下任一命令进入菜单："
+  log_msg INFO "已安装 ${APP_NAME} v${APP_VERSION}，主程序：${INSTALL_SCRIPT}，命令：${INSTALL_BIN} ${INSTALL_BIN_COMPAT}"
+  echo
+  echo "安装完成。入口自检如下："
+  verify_launcher || true
+  echo
+  echo "可输入以下任一命令进入菜单："
+  echo "  cfcname"
   echo "  sudo cfcname"
   echo "  sudo /usr/bin/cfcname"
-  echo "  sudo /usr/local/bin/cfcname"
 }
 
 uninstall_self() {
   need_root
   print_header
-  echo "卸载会删除命令和定时器。配置文件默认保留。"
-  if ! confirm_select "确认卸载 cfcname？"; then return 0; fi
-  disable_scheduler || true
-  rm -f "$INSTALL_BIN" "$INSTALL_BIN_COMPAT"
-  log_msg INFO "已卸载命令：${INSTALL_BIN} ${INSTALL_BIN_COMPAT}"
-  if confirm_select "是否同时删除配置、状态、日志？"; then
-    rm -rf "$CONFIG_DIR" "$STATE_DIR" "$LOG_DIR"
-    echo "已删除配置、状态、日志。"
-  else
-    echo "已保留配置：${CONFIG_DIR}，状态：${STATE_DIR}，日志：${LOG_DIR}"
-  fi
+  section_title "卸载 cfcname"
+  echo "请选择卸载方式："
+  echo
+  menu_item 1 "保守卸载：仅删除 cfcname 命令、主程序、定时器；保留配置/日志/系统依赖"
+  menu_item 2 "全部卸载：删除 cfcname 命令、主程序、定时器、配置、状态、日志；可选移除本脚本记录的补装依赖"
+  menu_item 0 "取消"
+  echo
+  local ans
+  read -r -p "请选择: " ans || return 1
+  ans="$(choice_num "$ans")"
+  case "$ans" in
+    1)
+      confirm_select "确认执行保守卸载？" || return 0
+      disable_scheduler || true
+      rm -f "$INSTALL_BIN" "$INSTALL_BIN_COMPAT"
+      rm -rf "$INSTALL_DIR"
+      log_msg INFO "已执行保守卸载：删除命令、主程序和定时器，保留配置/日志/依赖。"
+      echo "保守卸载完成。已保留：${CONFIG_DIR} ${STATE_DIR} ${LOG_DIR}"
+      ;;
+    2)
+      confirm_select "确认执行全部卸载？这会删除配置、状态和日志。" || return 0
+      disable_scheduler || true
+      rm -f "$INSTALL_BIN" "$INSTALL_BIN_COMPAT"
+      rm -rf "$INSTALL_DIR"
+      remove_marked_deps || true
+      rm -rf "$CONFIG_DIR" "$STATE_DIR" "$LOG_DIR"
+      echo "已删除 cfcname 命令、主程序、配置、状态和日志。"
+      ;;
+    0) return 0 ;;
+    *) echo "无效选项。" ;;
+  esac
 }
+
 
 # ---------- 调度器 ----------
 setup_systemd_timer() {
@@ -1651,6 +1773,10 @@ quick_init_wizard() {
   echo "  21:00：记录A -> 目标B，记录B -> 目标A"
   echo "  02:00：记录A -> 目标A，记录B -> 目标B"
   echo
+  section_title "快速初始化前置检查"
+  install_deps
+  migrate_config
+  echo
   confirm_select "是否开始快速初始化？" || return 0
 
   if [[ "$(jq '.zones | length' "$CONFIG_FILE")" -eq 0 ]]; then
@@ -1689,6 +1815,9 @@ self_check() {
   if [[ -x "$INSTALL_BIN" ]]; then echo "✅ 管理命令存在：${INSTALL_BIN}"; else echo "⚠️  管理命令不存在：${INSTALL_BIN}"; fi
   if [[ -x "$INSTALL_BIN_COMPAT" || -L "$INSTALL_BIN_COMPAT" ]]; then echo "✅ sudo 兼容命令存在：${INSTALL_BIN_COMPAT}"; else echo "⚠️  sudo 兼容命令不存在：${INSTALL_BIN_COMPAT}"; fi
   if command -v cfcname >/dev/null 2>&1; then echo "✅ 当前 PATH 可找到：$(command -v cfcname)"; else echo "⚠️  当前 PATH 找不到 cfcname，可执行 sudo bash $0 install 修复。"; fi
+  for f in "$INSTALL_SCRIPT" "$INSTALL_BIN" "$INSTALL_BIN_COMPAT"; do
+    if [[ -s "$f" ]]; then echo "✅ 入口文件正常：$f"; else echo "⚠️  入口文件不存在或为空：$f"; ok=0; fi
+  done
   local empty_tokens bad_zone pair_count legacy_count
   empty_tokens="$(jq '[.zones[]? | select((.token // "") == "")] | length' "$CONFIG_FILE" 2>/dev/null || echo 0)"
   bad_zone="$(jq -r '.zones[]? | select((.zone_id|test("^[a-fA-F0-9]{32}$")|not)) | .name + " => " + .zone_id' "$CONFIG_FILE" 2>/dev/null || true)"
@@ -1747,6 +1876,7 @@ cfcname v${APP_VERSION}
 
 用法：
   sudo bash cfcname_v${APP_VERSION}.sh install     安装/更新管理命令 cfcname
+  cfcname                                         打开菜单（非 root 会自动尝试 sudo）
   sudo cfcname                                    打开菜单
   sudo cfcname run --quiet                       定时器调用，按当前时间执行
   sudo cfcname run --force                       立即强制执行所有启用任务
@@ -1768,6 +1898,7 @@ USAGE
 
 main() {
   local cmd="${1:-menu}"
+  [[ -z "$cmd" ]] && cmd="menu"
   case "$cmd" in
     install) install_self ;;
     uninstall) uninstall_self ;;

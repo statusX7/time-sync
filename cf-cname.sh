@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # cfcname - Cloudflare CNAME Pair-Swap Manager
-# Version: 1.5
+# Version: 1.6
 # License: MIT
 #
 # 功能简要注释：
@@ -13,8 +13,9 @@
 set -Eeuo pipefail
 
 APP_NAME="cfcname"
-APP_VERSION="1.5"
+APP_VERSION="1.6"
 INSTALL_BIN="/usr/local/bin/${APP_NAME}"
+INSTALL_BIN_COMPAT="/usr/bin/${APP_NAME}"
 CONFIG_DIR="/etc/${APP_NAME}"
 CONFIG_FILE="${CONFIG_DIR}/config.json"
 STATE_DIR="/var/lib/${APP_NAME}"
@@ -53,6 +54,41 @@ hint() {
   printf "%b\n" "${C_DIM}$*${C_RESET}"
 }
 
+cn_num() {
+  case "${1:-}" in
+    0) echo "零" ;; 1) echo "一" ;; 2) echo "二" ;; 3) echo "三" ;; 4) echo "四" ;;
+    5) echo "五" ;; 6) echo "六" ;; 7) echo "七" ;; 8) echo "八" ;; 9) echo "九" ;; 10) echo "十" ;;
+    *) echo "$1" ;;
+  esac
+}
+
+menu_item() {
+  local n="$1" text="$2"
+  printf "  %s. %s\n" "$(cn_num "$n")" "$text"
+}
+
+choice_num() {
+  local x="${1:-}"
+  x="${x//$'\r'/}"
+  x="${x//$'\n'/}"
+  x="${x//[[:space:]]/}"
+  x="${x//./}"; x="${x//)/}"; x="${x//、/}"
+  case "$x" in
+    0|零|〇) echo 0 ;;
+    1|一|壹) echo 1 ;;
+    2|二|两|貳|贰) echo 2 ;;
+    3|三|叁) echo 3 ;;
+    4|四|肆) echo 4 ;;
+    5|五|伍) echo 5 ;;
+    6|六|陆) echo 6 ;;
+    7|七|柒) echo 7 ;;
+    8|八|捌) echo 8 ;;
+    9|九|玖) echo 9 ;;
+    10|十|拾) echo 10 ;;
+    *) echo "$x" ;;
+  esac
+}
+
 pause_enter() {
   echo
   read -r -p "按 Enter 返回..." _ || true
@@ -62,10 +98,11 @@ confirm_select() {
   local msg="$1" ans
   echo
   printf "%b\n" "${C_YELLOW}${msg}${C_RESET}"
-  echo "  1) 确认"
-  echo "  2) 取消"
+  menu_item 1 "确认"
+  menu_item 2 "取消"
   while true; do
     read -r -p "请选择 [1-2]: " ans || return 1
+    ans="$(choice_num "$ans")"
     case "$ans" in
       1) return 0 ;;
       2) return 1 ;;
@@ -359,9 +396,19 @@ install_self() {
   else
     chmod 755 "$INSTALL_BIN"
   fi
+
+  # 兼容 sudo secure_path：部分系统 sudo 找不到 /usr/local/bin，所以同时提供 /usr/bin/cfcname。
+  if [[ "$INSTALL_BIN" != "$INSTALL_BIN_COMPAT" ]]; then
+    ln -sf "$INSTALL_BIN" "$INSTALL_BIN_COMPAT" 2>/dev/null || install -m 755 "$INSTALL_BIN" "$INSTALL_BIN_COMPAT"
+  fi
+  hash -r 2>/dev/null || true
+
   setup_scheduler
-  log_msg INFO "已安装 ${APP_NAME} v${APP_VERSION} 到 ${INSTALL_BIN}"
-  echo "安装完成。输入 sudo cfcname 进入菜单。"
+  log_msg INFO "已安装 ${APP_NAME} v${APP_VERSION} 到 ${INSTALL_BIN}，兼容命令：${INSTALL_BIN_COMPAT}"
+  echo "安装完成。可输入以下任一命令进入菜单："
+  echo "  sudo cfcname"
+  echo "  sudo /usr/bin/cfcname"
+  echo "  sudo /usr/local/bin/cfcname"
 }
 
 uninstall_self() {
@@ -370,8 +417,8 @@ uninstall_self() {
   echo "卸载会删除命令和定时器。配置文件默认保留。"
   if ! confirm_select "确认卸载 cfcname？"; then return 0; fi
   disable_scheduler || true
-  rm -f "$INSTALL_BIN"
-  log_msg INFO "已卸载命令：${INSTALL_BIN}"
+  rm -f "$INSTALL_BIN" "$INSTALL_BIN_COMPAT"
+  log_msg INFO "已卸载命令：${INSTALL_BIN} ${INSTALL_BIN_COMPAT}"
   if confirm_select "是否同时删除配置、状态、日志？"; then
     rm -rf "$CONFIG_DIR" "$STATE_DIR" "$LOG_DIR"
     echo "已删除配置、状态、日志。"
@@ -390,7 +437,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=${INSTALL_BIN} run --quiet
+ExecStart=${INSTALL_BIN_COMPAT} run --quiet
 Nice=5
 UNIT
 
@@ -418,7 +465,7 @@ setup_cron_timer() {
 # cfcname v${APP_VERSION} - run every minute
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-* * * * * root flock -n /run/${APP_NAME}.lock ${INSTALL_BIN} run --quiet >/dev/null 2>&1
+* * * * * root flock -n /run/${APP_NAME}.lock ${INSTALL_BIN_COMPAT} run --quiet >/dev/null 2>&1
 CRON
   chmod 644 "$CRON_FILE"
   if command -v systemctl >/dev/null 2>&1; then
@@ -688,9 +735,10 @@ select_zone() {
     return 1
   fi
   echo "可选域名配置：" >&2
-  jq -r '.zones | to_entries[] | "  \(.key+1)) \(.value.name)  ZoneID=\(.value.zone_id)  Token=" + ((.value.token // "")[0:5]) + "..."' "$CONFIG_FILE" >&2
+  jq -r '.zones | to_entries[] | "  \(.key+1). \(.value.name)  ZoneID=\(.value.zone_id)  Token=" + ((.value.token // "")[0:5]) + "..."' "$CONFIG_FILE" >&2
   while true; do
     read -r -p "请选择 [1-${count}]: " idx || return 1
+    idx="$(choice_num "$idx")"
     [[ "$idx" =~ ^[0-9]+$ ]] || { echo "请输入数字" >&2; continue; }
     (( idx >= 1 && idx <= count )) || { echo "超出范围" >&2; continue; }
     zid="$(jq -r --argjson i "$((idx-1))" '.zones[$i].id' "$CONFIG_FILE")"
@@ -809,14 +857,15 @@ zone_menu() {
   while true; do
     print_header
     section_title "域名 / Token 配置"
-    echo "  1) 查看域名配置"
-    echo "  2) 添加域名配置"
-    echo "  3) 编辑域名配置"
-    echo "  4) 测试 API 权限"
-    echo "  5) 删除域名配置"
-    echo "  0) 返回主菜单"
+    menu_item 1 "查看域名配置"
+    menu_item 2 "添加域名配置"
+    menu_item 3 "编辑域名配置"
+    menu_item 4 "测试 API 权限"
+    menu_item 5 "删除域名配置"
+    menu_item 0 "返回主菜单"
     echo
     read -r -p "请选择: " ans || true
+    ans="$(choice_num "$ans")"
     case "$ans" in
       1) list_zones; pause_enter ;;
       2) add_zone_wizard; pause_enter ;;
@@ -838,9 +887,10 @@ select_task() {
     return 1
   fi
   echo "可选任务：" >&2
-  jq -r '[.tasks[] | select(.task_type=="pair_swap")] | to_entries[] | "  \(.key+1)) " + (if .value.enabled then "✅" else "⏸️" end) + " " + .value.name + "  切换=" + .value.swap_time + " 恢复=" + .value.restore_time' "$CONFIG_FILE" >&2
+  jq -r '[.tasks[] | select(.task_type=="pair_swap")] | to_entries[] | "  \(.key+1). " + (if .value.enabled then "✅" else "⏸️" end) + " " + .value.name + "  切换=" + .value.swap_time + " 恢复=" + .value.restore_time' "$CONFIG_FILE" >&2
   while true; do
     read -r -p "请选择 [1-${count}]: " idx || return 1
+    idx="$(choice_num "$idx")"
     [[ "$idx" =~ ^[0-9]+$ ]] || { echo "请输入数字" >&2; continue; }
     (( idx >= 1 && idx <= count )) || { echo "超出范围" >&2; continue; }
     tid="$(jq -r --argjson i "$((idx-1))" '[.tasks[] | select(.task_type=="pair_swap")][$i].id' "$CONFIG_FILE")"
@@ -926,7 +976,7 @@ list_tasks() {
   local legacy_count
   legacy_count="$(jq '[.tasks[] | select(.task_type=="legacy")] | length' "$CONFIG_FILE")"
   if [[ "$legacy_count" -gt 0 ]]; then
-    echo "⚠️ 检测到 ${legacy_count} 个旧版通用任务。1.5 主逻辑已改为成对互换，建议重新创建任务。"
+    echo "⚠️ 检测到 ${legacy_count} 个旧版通用任务。1.6 主逻辑已改为成对互换，建议重新创建任务。"
   fi
 }
 
@@ -1031,14 +1081,15 @@ edit_pair_task_menu() {
     task="$(jq -c --arg id "$tid" '.tasks[] | select(.id==$id)' "$CONFIG_FILE")"
     print_pair_task_human "$task"
     echo
-    echo "  1) 修改任务名称"
-    echo "  2) 修改记录A / 记录B"
-    echo "  3) 修改目标A / 目标B"
-    echo "  4) 修改切换时间 / 恢复时间"
-    echo "  5) 启用 / 停用"
-    echo "  0) 返回"
+    menu_item 1 "修改任务名称"
+    menu_item 2 "修改记录A / 记录B"
+    menu_item 3 "修改目标A / 目标B"
+    menu_item 4 "修改切换时间 / 恢复时间"
+    menu_item 5 "启用 / 停用"
+    menu_item 0 "返回"
     echo
     read -r -p "请选择: " ans || true
+    ans="$(choice_num "$ans")"
     case "$ans" in
       1)
         value="$(prompt_input "新的任务名称" "$(jq -r '.name' <<<"$task")")"
@@ -1161,12 +1212,13 @@ apply_task_mode_menu() {
   local tid ans mode
   tid="$(select_task)" || return 0
   echo
-  echo "  1) 按当前时间自动判断"
-  echo "  2) 强制执行正常/恢复模式"
-  echo "  3) 强制执行互换模式"
-  echo "  0) 返回"
+  menu_item 1 "按当前时间自动判断"
+  menu_item 2 "强制执行正常/恢复模式"
+  menu_item 3 "强制执行互换模式"
+  menu_item 0 "返回"
   echo
   read -r -p "请选择: " ans || true
+  ans="$(choice_num "$ans")"
   case "$ans" in
     1) mode=current ;;
     2) mode=normal ;;
@@ -1181,16 +1233,17 @@ task_menu() {
   while true; do
     print_header
     section_title "CNAME 成对互换任务"
-    echo "  1) 查看任务"
-    echo "  2) 新增成对互换任务"
-    echo "  3) 编辑任务"
-    echo "  4) 删除任务"
-    echo "  5) 查看任务对应 DNS 当前状态"
-    echo "  6) 立即执行指定任务"
-    echo "  7) 手动立即修改任意 CNAME"
-    echo "  0) 返回主菜单"
+    menu_item 1 "查看任务"
+    menu_item 2 "新增成对互换任务"
+    menu_item 3 "编辑任务"
+    menu_item 4 "删除任务"
+    menu_item 5 "查看任务对应 DNS 当前状态"
+    menu_item 6 "立即执行指定任务"
+    menu_item 7 "手动立即修改任意 CNAME"
+    menu_item 0 "返回主菜单"
     echo
     read -r -p "请选择: " ans || true
+    ans="$(choice_num "$ans")"
     case "$ans" in
       1) list_tasks; pause_enter ;;
       2) add_pair_task_wizard; pause_enter ;;
@@ -1322,8 +1375,9 @@ restore_backup_menu() {
   if [[ ${#files[@]} -eq 0 ]]; then echo "暂无备份。"; return 0; fi
   echo "选择要恢复的备份："
   local i=1
-  for file in "${files[@]}"; do echo "  $i) $file"; i=$((i+1)); done
+  for file in "${files[@]}"; do echo "  $i. $file"; i=$((i+1)); done
   read -r -p "请选择 [1-${#files[@]}]: " idx || return 0
+  idx="$(choice_num "$idx")"
   [[ "$idx" =~ ^[0-9]+$ ]] && (( idx>=1 && idx<=${#files[@]} )) || { echo "无效选择"; return 1; }
   file="${files[$((idx-1))]}"
 
@@ -1345,18 +1399,73 @@ restore_backup_menu() {
   log_msg INFO "备份恢复完成：${file}"
 }
 
+export_config_full_menu() {
+  print_header
+  section_title "导出完整配置"
+  echo "完整配置会包含 Cloudflare API Token，只适合自己迁移备份，不要上传 GitHub。"
+  local out
+  out="$(prompt_input "导出文件路径" "/root/cfcname_config_full_$(date +%Y%m%d_%H%M%S).json")"
+  confirm_select "确认导出完整配置到 ${out}？" || return 0
+  install -m 600 "$CONFIG_FILE" "$out"
+  log_msg INFO "已导出完整配置：${out}"
+  echo "已导出：${out}"
+}
+
+export_config_safe_menu() {
+  print_header
+  section_title "导出去敏配置"
+  echo "去敏配置会移除 Token，适合发给别人排查或放 GitHub 示例。"
+  local out
+  out="$(prompt_input "导出文件路径" "/root/cfcname_config_safe_$(date +%Y%m%d_%H%M%S).json")"
+  confirm_select "确认导出去敏配置到 ${out}？" || return 0
+  jq '(.zones[]?.token) = "__SET_YOUR_CLOUDFLARE_API_TOKEN__"' "$CONFIG_FILE" > "$out"
+  chmod 644 "$out" 2>/dev/null || true
+  log_msg INFO "已导出去敏配置：${out}"
+  echo "已导出：${out}"
+}
+
+import_config_menu() {
+  print_header
+  section_title "导入配置"
+  echo "导入会替换当前 ${CONFIG_FILE}。脚本会先自动备份当前配置。"
+  local in backup empty_tokens
+  in="$(prompt_input "请输入要导入的 JSON 配置路径" "")"
+  [[ -f "$in" ]] || { echo "文件不存在：${in}"; return 1; }
+  jq -e '.settings and (.zones|type=="array") and (.tasks|type=="array")' "$in" >/dev/null 2>&1 || { echo "配置格式不正确，未导入。"; return 1; }
+  echo
+  echo "将导入：${in}"
+  empty_tokens="$(jq '[.zones[]? | select((.token // "") == "" or (.token // "") == "__SET_YOUR_CLOUDFLARE_API_TOKEN__")] | length' "$in")"
+  if [[ "$empty_tokens" -gt 0 ]]; then
+    echo "⚠️  检测到 ${empty_tokens} 个空 Token/占位 Token，导入后需要重新编辑域名配置。"
+  fi
+  confirm_select "确认替换当前配置？" || return 0
+  backup="${CONFIG_FILE}.before_import.$(date +%Y%m%d%H%M%S)"
+  [[ -f "$CONFIG_FILE" ]] && install -m 600 "$CONFIG_FILE" "$backup"
+  install -m 600 "$in" "$CONFIG_FILE"
+  migrate_config
+  log_msg INFO "已导入配置：${in}；旧配置备份：${backup}"
+  echo "导入完成。旧配置备份：${backup}"
+}
+
 backup_menu() {
   while true; do
     print_header
-    section_title "备份 / 恢复"
-    echo "  1) 查看最近备份"
-    echo "  2) 从备份恢复 CNAME 目标"
-    echo "  0) 返回主菜单"
+    section_title "备份 / 恢复 / 导入导出"
+    menu_item 1 "查看最近 DNS 备份"
+    menu_item 2 "从 DNS 备份恢复 CNAME 目标"
+    menu_item 3 "导出完整配置（包含 Token，私密迁移用）"
+    menu_item 4 "导出去敏配置（不含 Token，适合 GitHub/排查）"
+    menu_item 5 "导入配置（替换当前配置，自动备份旧配置）"
+    menu_item 0 "返回主菜单"
     echo
     read -r -p "请选择: " ans || true
+    ans="$(choice_num "$ans")"
     case "$ans" in
       1) list_backups; pause_enter ;;
       2) restore_backup_menu; pause_enter ;;
+      3) export_config_full_menu; pause_enter ;;
+      4) export_config_safe_menu; pause_enter ;;
+      5) import_config_menu; pause_enter ;;
       0) return 0 ;;
       *) log_msg WARN "无效选项"; pause_enter ;;
     esac
@@ -1376,12 +1485,13 @@ show_settings() {
 set_log_level_menu() {
   print_header
   section_title "日志等级"
-  echo "  1) DEBUG  最详细，排障用"
-  echo "  2) INFO   默认，记录主要动作"
-  echo "  3) WARN   只记录警告和错误"
-  echo "  4) ERROR  只记录错误"
-  echo "  5) OFF    关闭日志"
+  menu_item 1 "DEBUG  最详细，排障用"
+  menu_item 2 "INFO   默认，记录主要动作"
+  menu_item 3 "WARN   只记录警告和错误"
+  menu_item 4 "ERROR  只记录错误"
+  menu_item 5 "OFF    关闭日志"
   read -r -p "请选择 [1-5]: " ans || true
+  ans="$(choice_num "$ans")"
   local level
   case "$ans" in
     1) level=DEBUG ;;
@@ -1439,17 +1549,18 @@ settings_menu() {
   while true; do
     print_header
     section_title "系统设置"
-    echo "  1) 查看当前设置和定时器状态"
-    echo "  2) 设置日志等级"
-    echo "  3) 设置 curl 网络参数"
-    echo "  4) 设置时区 / 默认 TTL / 自动创建"
-    echo "  5) 重装/修复定时器"
-    echo "  6) 停用定时器"
-    echo "  7) 查看最近 80 行日志"
-    echo "  8) 实时查看日志"
-    echo "  0) 返回主菜单"
+    menu_item 1 "查看当前设置和定时器状态"
+    menu_item 2 "设置日志等级"
+    menu_item 3 "设置 curl 网络参数"
+    menu_item 4 "设置时区 / 默认 TTL / 自动创建"
+    menu_item 5 "重装/修复定时器"
+    menu_item 6 "停用定时器"
+    menu_item 7 "查看最近 80 行日志"
+    menu_item 8 "实时查看日志"
+    menu_item 0 "返回主菜单"
     echo
     read -r -p "请选择: " ans || true
+    ans="$(choice_num "$ans")"
     case "$ans" in
       1) show_settings; pause_enter ;;
       2) set_log_level_menu; pause_enter ;;
@@ -1515,6 +1626,8 @@ self_check() {
   fi
   if validate_config_file; then echo "✅ 配置 JSON 正常：${CONFIG_FILE}"; else echo "❌ 配置 JSON 异常：${CONFIG_FILE}"; ok=0; fi
   if [[ -x "$INSTALL_BIN" ]]; then echo "✅ 管理命令存在：${INSTALL_BIN}"; else echo "⚠️  管理命令不存在：${INSTALL_BIN}"; fi
+  if [[ -x "$INSTALL_BIN_COMPAT" || -L "$INSTALL_BIN_COMPAT" ]]; then echo "✅ sudo 兼容命令存在：${INSTALL_BIN_COMPAT}"; else echo "⚠️  sudo 兼容命令不存在：${INSTALL_BIN_COMPAT}"; fi
+  if command -v cfcname >/dev/null 2>&1; then echo "✅ 当前 PATH 可找到：$(command -v cfcname)"; else echo "⚠️  当前 PATH 找不到 cfcname，可执行 sudo bash $0 install 修复。"; fi
   local empty_tokens bad_zone pair_count legacy_count
   empty_tokens="$(jq '[.zones[]? | select((.token // "") == "")] | length' "$CONFIG_FILE" 2>/dev/null || echo 0)"
   bad_zone="$(jq -r '.zones[]? | select((.zone_id|test("^[a-fA-F0-9]{32}$")|not)) | .name + " => " + .zone_id' "$CONFIG_FILE" 2>/dev/null || true)"
@@ -1538,17 +1651,18 @@ main_menu() {
     print_header
     echo "推荐：第一次使用选 1；日常改互换规则选 3；排障选 6。"
     echo
-    echo "  1) 🚀 快速初始化：创建 21点互换 / 2点恢复任务"
-    echo "  2) 🌐 域名 / Token 配置"
-    echo "  3) 🔁 CNAME 成对互换任务"
-    echo "  4) 💾 备份 / 恢复"
-    echo "  5) ⚙️  系统设置 / 日志等级"
-    echo "  6) 🔎 自检"
-    echo "  7) ▶️  立即执行所有启用任务"
-    echo "  8) 🧹 卸载 cfcname"
-    echo "  0) 退出"
+    menu_item 1 "🚀 快速初始化：创建 21点互换 / 2点恢复任务"
+    menu_item 2 "🌐 域名 / Token 配置"
+    menu_item 3 "🔁 CNAME 成对互换任务"
+    menu_item 4 "💾 备份 / 恢复"
+    menu_item 5 "⚙️  系统设置 / 日志等级"
+    menu_item 6 "🔎 自检"
+    menu_item 7 "▶️  立即执行所有启用任务"
+    menu_item 8 "🧹 卸载 cfcname"
+    menu_item 0 "退出"
     echo
     read -r -p "请选择: " ans || true
+    ans="$(choice_num "$ans")"
     case "$ans" in
       1) quick_init_wizard; pause_enter ;;
       2) zone_menu ;;
@@ -1569,7 +1683,7 @@ usage() {
 cfcname v${APP_VERSION}
 
 用法：
-  sudo bash cfcname_v${APP_VERSION}.sh install     安装/更新到 /usr/local/bin/cfcname
+  sudo bash cfcname_v${APP_VERSION}.sh install     安装/更新管理命令 cfcname
   sudo cfcname                                    打开菜单
   sudo cfcname run --quiet                       定时器调用，按当前时间执行
   sudo cfcname run --force                       立即强制执行所有启用任务

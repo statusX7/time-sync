@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
 # cfcname - Cloudflare CNAME Scheduled Switch Manager
-# Version: 1.3
+# Version: 1.4
 # License: MIT
 #
 # 功能简要注释：
 # 1. 用 cfcname 菜单管理 Cloudflare 域名、API Token、多个 CNAME 定时切换任务。
 # 2. 支持快速初始化向导，不在脚本中写死任何真实域名、Zone ID、Token，适合 GitHub 公开。
 # 3. 支持多个时间点，例如 21:00 指向 A，02:00 指向 B。
-# 4. 支持日志等级、curl 超时/重试、HTTP/1.1 强制请求，规避部分 HTTP/2 PROTOCOL_ERROR。
+# 4. 支持日志等级、curl 超时/脚本内置重试、HTTP/1.1 优先请求，兼容旧版 curl。
 # 5. 每次修改 DNS 前自动备份当前记录，支持按备份恢复 CNAME 目标。
 # 6. 默认只处理 CNAME；遇到同名 A/AAAA/其他记录会停止，避免误删生产记录。
 
 set -Eeuo pipefail
 
 APP_NAME="cfcname"
-APP_VERSION="1.3"
+APP_VERSION="1.4"
 INSTALL_BIN="/usr/local/bin/${APP_NAME}"
 CONFIG_DIR="/etc/${APP_NAME}"
 CONFIG_FILE="${CONFIG_DIR}/config.json"
@@ -491,10 +491,31 @@ cf_setting() {
   jq -r --arg k "$key" --arg d "$default" '.settings[$k] // $d' "$CONFIG_FILE"
 }
 
-# 调用 Cloudflare API。这里强制检查 Token，避免再次出现 Authorization 头缺失。
+# 判断 curl 是否支持某个参数。兼容 CentOS 7 等旧系统 curl，避免未知参数导致请求根本没有发出。
+curl_supports_option() {
+  local opt="$1"
+  if curl --help all >/dev/null 2>&1; then
+    curl --help all 2>/dev/null | grep -q -- "$opt"
+  else
+    curl --help 2>/dev/null | grep -q -- "$opt" || curl --manual 2>/dev/null | grep -q -- "$opt"
+  fi
+}
+
+# 判断 HTTP 状态码是否值得重试。400/401/403 这类认证或权限错误不会重试，直接暴露真实原因。
+is_retryable_http_code() {
+  case "${1:-}" in
+    408|425|429|500|502|503|504) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# 调用 Cloudflare API。
+# v1.4 关键变化：不再依赖 curl --retry-all-errors，因为旧版 curl 不支持该参数；改为脚本自己循环重试。
 cf_api() {
   local zone_id="$1" token="$2" method="$3" endpoint="$4" data="${5:-}"
   local tmp_body tmp_err http_code retry retry_delay connect_timeout max_time http_version curl_http_arg token_clean
+  local attempts attempt rc curl_args shown_endpoint
+
   token_clean="$(sanitize_token "$token")"
   if [[ -z "$token_clean" ]]; then
     log_msg ERROR "Cloudflare API Token 为空，已停止请求。请重新编辑域名配置。"
@@ -510,20 +531,30 @@ cf_api() {
   connect_timeout="$(cf_setting connect_timeout 10)"
   max_time="$(cf_setting max_time 30)"
   http_version="$(cf_setting http_version 1.1)"
+
+  [[ "$retry" =~ ^[0-9]+$ ]] || retry=3
+  [[ "$retry_delay" =~ ^[0-9]+$ ]] || retry_delay=2
+  [[ "$connect_timeout" =~ ^[0-9]+$ ]] || connect_timeout=10
+  [[ "$max_time" =~ ^[0-9]+$ ]] || max_time=30
+  attempts=$((retry + 1))
+
+  # 老版本 curl 可能不支持 --http2 或 --http1.1。支持才加；不支持就让 curl 使用默认协议。
   if [[ "$http_version" == "2" || "$http_version" == "2.0" ]]; then
     curl_http_arg="--http2"
   else
     curl_http_arg="--http1.1"
   fi
+  if ! curl_supports_option "$curl_http_arg"; then
+    log_msg WARN "当前 curl 不支持 ${curl_http_arg}，将使用 curl 默认 HTTP 协议继续请求。"
+    curl_http_arg=""
+  fi
 
   tmp_body="$(mktemp)"
   tmp_err="$(mktemp)"
+  shown_endpoint="${method} ${endpoint}"
 
-  local curl_args=(
-    -sS "$curl_http_arg"
-    --retry "$retry"
-    --retry-delay "$retry_delay"
-    --retry-all-errors
+  curl_args=(
+    -sS
     --connect-timeout "$connect_timeout"
     --max-time "$max_time"
     -o "$tmp_body"
@@ -533,29 +564,56 @@ cf_api() {
     -H "Authorization: Bearer ${token_clean}"
     -H "Content-Type: application/json"
   )
-
+  [[ -n "$curl_http_arg" ]] && curl_args=("$curl_http_arg" "${curl_args[@]}")
   if [[ -n "$data" ]]; then
     curl_args+=(--data "$data")
   fi
 
-  set +e
-  http_code="$(curl "${curl_args[@]}" 2>"$tmp_err")"
-  local rc=$?
-  set -e
+  attempt=1
+  while (( attempt <= attempts )); do
+    : > "$tmp_body"
+    : > "$tmp_err"
 
-  if [[ $rc -ne 0 ]]; then
-    log_msg ERROR "curl 请求失败 rc=${rc}：${method} ${endpoint}"
-    if [[ -s "$tmp_err" ]]; then
-      while IFS= read -r line; do log_msg ERROR "curl错误：${line}"; done < "$tmp_err"
+    set +e
+    http_code="$(curl "${curl_args[@]}" 2>"$tmp_err")"
+    rc=$?
+    set -e
+
+    # curl 自身失败，例如 DNS、TLS、连接超时、网络中断。脚本层面重试，不依赖 curl 新参数。
+    if [[ $rc -ne 0 ]]; then
+      if (( attempt < attempts )); then
+        log_msg WARN "curl 请求失败 rc=${rc}，准备第 $((attempt + 1))/${attempts} 次重试：${shown_endpoint}"
+        if [[ -s "$tmp_err" ]]; then
+          while IFS= read -r line; do [[ -n "$line" ]] && log_msg DEBUG "curl错误：${line}"; done < "$tmp_err"
+        fi
+        sleep "$retry_delay"
+        attempt=$((attempt + 1))
+        continue
+      fi
+
+      log_msg ERROR "curl 请求失败 rc=${rc}：${shown_endpoint}"
+      if [[ -s "$tmp_err" ]]; then
+        while IFS= read -r line; do [[ -n "$line" ]] && log_msg ERROR "curl错误：${line}"; done < "$tmp_err"
+      fi
+      rm -f "$tmp_body" "$tmp_err"
+      return 1
     fi
-    rm -f "$tmp_body" "$tmp_err"
-    return 1
-  fi
 
-  log_msg DEBUG "Cloudflare API HTTP ${http_code}：${method} ${endpoint}"
+    log_msg DEBUG "Cloudflare API HTTP ${http_code}：${shown_endpoint}"
+
+    # Cloudflare 临时错误才重试；认证/权限类错误不重试，直接显示 API 返回的原因。
+    if is_retryable_http_code "$http_code" && (( attempt < attempts )); then
+      log_msg WARN "Cloudflare API HTTP ${http_code}，准备第 $((attempt + 1))/${attempts} 次重试：${shown_endpoint}"
+      sleep "$retry_delay"
+      attempt=$((attempt + 1))
+      continue
+    fi
+
+    break
+  done
 
   if [[ ! "$http_code" =~ ^2 ]]; then
-    log_msg ERROR "Cloudflare API HTTP ${http_code}：${method} ${endpoint}"
+    log_msg ERROR "Cloudflare API HTTP ${http_code}：${shown_endpoint}"
     if jq -e '.errors? | length > 0' "$tmp_body" >/dev/null 2>&1; then
       jq -r '.errors[]? | (.message // .)' "$tmp_body" | while read -r line; do
         [[ -n "$line" ]] && log_msg ERROR "API错误：${line}"
@@ -568,7 +626,7 @@ cf_api() {
   fi
 
   if ! jq -e '.success == true' "$tmp_body" >/dev/null 2>&1; then
-    log_msg ERROR "Cloudflare API 返回 success=false：${method} ${endpoint}"
+    log_msg ERROR "Cloudflare API 返回 success=false：${shown_endpoint}"
     jq -r '.errors[]? | (.message // .)' "$tmp_body" | while read -r line; do
       [[ -n "$line" ]] && log_msg ERROR "API错误：${line}"
     done
@@ -1231,7 +1289,7 @@ set_curl_menu() {
   print_header
   local http retry delay conn max
   echo "curl 网络参数设置"
-  echo "建议：HTTP 版本保持 1.1，可规避部分 HTTP/2 PROTOCOL_ERROR。"
+  echo "建议：HTTP 版本保持 1.1；v1.4 已改为脚本内置重试，兼容旧版 curl。"
   http="$(prompt_input "HTTP 版本，填 1.1 或 2" "$(jq -r '.settings.http_version' "$CONFIG_FILE")")"
   [[ "$http" == "2" || "$http" == "2.0" ]] && http="2" || http="1.1"
   retry="$(prompt_input "失败重试次数" "$(jq -r '.settings.curl_retry' "$CONFIG_FILE")")"
@@ -1330,6 +1388,19 @@ self_check() {
   for cmd in curl jq flock; do
     if command -v "$cmd" >/dev/null 2>&1; then echo "✅ 依赖存在：$cmd"; else echo "❌ 缺少依赖：$cmd"; ok=0; fi
   done
+  if command -v curl >/dev/null 2>&1; then
+    echo "ℹ️  curl 版本：$(curl --version | head -n 1)"
+    if curl_supports_option --retry-all-errors; then
+      echo "✅ curl 支持 --retry-all-errors；但 v1.4 已不再依赖它。"
+    else
+      echo "✅ curl 不支持 --retry-all-errors；v1.4 已使用脚本内置重试兼容旧版 curl。"
+    fi
+    if curl_supports_option --http1.1; then
+      echo "✅ curl 支持 --http1.1"
+    else
+      echo "⚠️  curl 不支持 --http1.1；脚本会自动使用默认 HTTP 协议。"
+    fi
+  fi
   if validate_config_file; then echo "✅ 配置 JSON 正常：${CONFIG_FILE}"; else echo "❌ 配置 JSON 异常：${CONFIG_FILE}"; ok=0; fi
   if [[ -x "$INSTALL_BIN" ]]; then echo "✅ 管理命令存在：${INSTALL_BIN}"; else echo "⚠️  管理命令不存在：${INSTALL_BIN}"; fi
   local empty_tokens bad_zone

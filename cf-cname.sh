@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # cfcname - Cloudflare CNAME Pair-Swap Manager
-# Version: 1.8
+# Version: 1.9
 # License: MIT
 #
 # 功能简要注释：
@@ -8,12 +8,13 @@
 # 2. 核心场景：A 记录正常指向 1.com，B 记录正常指向 2.com；到指定时间互换，到恢复时间换回。
 # 3. 不在脚本中写死任何真实域名、Zone ID、Token，适合 GitHub 公开。
 # 4. 支持多个域名配置、多个成对互换任务、日志等级、网络重试、备份恢复。
-# 5. 默认只处理 CNAME；遇到同名 A/AAAA/其他记录会停止，避免误删生产记录。
+# 5. 支持一键修复依赖、主程序、管理命令入口、定时服务。
+# 6. 默认只处理 CNAME；遇到同名 A/AAAA/其他记录会停止，避免误删生产记录。
 
 set -Eeuo pipefail
 
 APP_NAME="cfcname"
-APP_VERSION="1.8"
+APP_VERSION="1.9"
 INSTALL_DIR="/opt/${APP_NAME}"
 INSTALL_SCRIPT="${INSTALL_DIR}/${APP_NAME}.sh"
 INSTALL_BIN="/usr/local/bin/${APP_NAME}"
@@ -457,6 +458,126 @@ verify_launcher() {
   return $(( ok == 1 ? 0 : 1 ))
 }
 
+copy_current_script_to_install_dir() {
+  # 说明：修复 / 安装时，把当前正在运行的完整脚本写入 /opt/cfcname/cfcname.sh。
+  # 重点修复：通过 sudo bash xxx.sh install/repair 运行时，管理命令没有落盘的问题。
+  local src tmp marker copied=0
+  mkdir -p "$INSTALL_DIR"
+
+  if [[ -s "$INSTALL_SCRIPT" && "$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || true)" == "$(readlink -f "$INSTALL_SCRIPT" 2>/dev/null || true)" ]]; then
+    chmod 755 "$INSTALL_SCRIPT"
+    return 0
+  fi
+
+  marker='cfcname - Cloudflare CNAME Pair-Swap Manager'
+  tmp="$(mktemp)"
+
+  # 优先使用 BASH_SOURCE[0]，再尝试 $0 和 readlink 后路径。
+  # 不直接依赖 /dev/fd，因为部分环境下 fd 被读取后会变空。
+  local candidates=()
+  candidates+=("${BASH_SOURCE[0]:-}")
+  candidates+=("${0:-}")
+  src="$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || true)"; [[ -n "$src" ]] && candidates+=("$src")
+  src="$(readlink -f "${0:-}" 2>/dev/null || true)"; [[ -n "$src" ]] && candidates+=("$src")
+
+  for src in "${candidates[@]}"; do
+    [[ -n "$src" ]] || continue
+    [[ -r "$src" ]] || continue
+    : > "$tmp"
+    if cat "$src" > "$tmp" 2>/dev/null && [[ -s "$tmp" ]] && grep -qF "$marker" "$tmp"; then
+      install -m 755 "$tmp" "$INSTALL_SCRIPT"
+      copied=1
+      break
+    fi
+  done
+
+  rm -f "$tmp"
+  if [[ "$copied" -eq 1 && -s "$INSTALL_SCRIPT" ]]; then
+    return 0
+  fi
+
+  if [[ -s "$INSTALL_SCRIPT" ]]; then
+    chmod 755 "$INSTALL_SCRIPT"
+    return 0
+  fi
+
+  echo "无法写入主程序：${INSTALL_SCRIPT}" >&2
+  echo "请把完整脚本保存为文件后执行：sudo bash cfcname_v${APP_VERSION}.sh repair" >&2
+  return 1
+}
+
+repair_management_commands() {
+  # 说明：只修复 cfcname 管理命令入口，不改配置、不改任务。
+  need_root
+  ensure_dirs
+  copy_current_script_to_install_dir || return 1
+  write_launcher "$INSTALL_BIN"
+  write_launcher "$INSTALL_BIN_COMPAT"
+  hash -r 2>/dev/null || true
+  log_msg INFO "已修复管理命令入口：${INSTALL_BIN} ${INSTALL_BIN_COMPAT}"
+  verify_launcher || return 1
+}
+
+repair_dependencies() {
+  # 说明：检测依赖，缺什么安装什么；已有依赖不重复安装。
+  need_root
+  install_deps
+}
+
+repair_scheduler() {
+  # 说明：修复定时服务。会先确保管理命令存在，再重建 systemd timer 或 cron。
+  need_root
+  repair_management_commands || return 1
+  disable_scheduler || true
+  setup_scheduler
+  log_msg INFO "已修复定时服务。"
+}
+
+repair_all() {
+  # 说明：一键修复依赖、主程序、管理命令、配置目录、定时服务。
+  need_root
+  repair_dependencies
+  ensure_dirs
+  migrate_config
+  repair_management_commands || return 1
+  disable_scheduler || true
+  setup_scheduler
+  echo
+  echo "修复完成。入口自检如下："
+  verify_launcher || true
+  echo
+  echo "现在可以执行：sudo cfcname"
+}
+
+repair_menu() {
+  while true; do
+    print_header
+    section_title "修复工具"
+    echo "用于修复依赖、管理命令、主程序入口、定时服务。"
+    echo "不会修改你的 CNAME 任务内容，也不会删除 Token。"
+    echo
+    menu_item 1 "一键修复：依赖 + 主程序 + 管理命令 + 定时服务"
+    menu_item 2 "只检测/安装缺失依赖"
+    menu_item 3 "只修复管理命令 cfcname"
+    menu_item 4 "只修复定时服务 systemd timer / cron"
+    menu_item 5 "运行自检"
+    menu_item 0 "返回主菜单"
+    echo
+    local ans
+    read -r -p "请选择: " ans || true
+    ans="$(choice_num "$ans")"
+    case "$ans" in
+      1) repair_all; pause_enter ;;
+      2) repair_dependencies; pause_enter ;;
+      3) repair_management_commands; pause_enter ;;
+      4) repair_scheduler; pause_enter ;;
+      5) self_check; pause_enter ;;
+      0) return 0 ;;
+      *) log_msg WARN "无效选项"; pause_enter ;;
+    esac
+  done
+}
+
 remove_marked_deps() {
   # 只有“全部卸载”才会走到这里，并且还会二次确认。
   [[ -s "$DEPS_MARKER" ]] || { echo "没有找到依赖安装记录，跳过依赖卸载。"; return 0; }
@@ -487,14 +608,7 @@ install_self() {
   ensure_dirs
   migrate_config
 
-  mkdir -p "$INSTALL_DIR"
-  local self_path
-  self_path="$(readlink -f "$0" 2>/dev/null || echo "$0")"
-  if [[ "$self_path" != "$INSTALL_SCRIPT" ]]; then
-    install -m 755 "$self_path" "$INSTALL_SCRIPT"
-  else
-    chmod 755 "$INSTALL_SCRIPT"
-  fi
+  copy_current_script_to_install_dir || exit 1
 
   # 同时写入 /usr/local/bin 和 /usr/bin，解决 sudo secure_path 或 PATH 不一致导致的 command not found/空入口问题。
   write_launcher "$INSTALL_BIN"
@@ -599,8 +713,14 @@ CRON
 }
 
 setup_scheduler() {
-  if [[ ! -x "$INSTALL_BIN" && "$(readlink -f "$0" 2>/dev/null || echo "$0")" != "$INSTALL_BIN" ]]; then
-    return 0
+  # 说明：重建后台定时检查。这里不再因为入口缺失而静默跳过，避免“提示已启动但实际没有服务”。
+  if [[ ! -s "$INSTALL_SCRIPT" ]]; then
+    log_msg ERROR "主程序不存在或为空：${INSTALL_SCRIPT}，请先执行 repair 或 install。"
+    return 1
+  fi
+  if [[ ! -x "$INSTALL_BIN" || ! -x "$INSTALL_BIN_COMPAT" ]]; then
+    write_launcher "$INSTALL_BIN"
+    write_launcher "$INSTALL_BIN_COMPAT"
   fi
   if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
     setup_systemd_timer || setup_cron_timer
@@ -689,7 +809,7 @@ service_control_menu() {
       2) scheduler_restart; pause_enter ;;
       3) if confirm_select "确认停止 cfcname 定时服务？配置不会删除。"; then scheduler_stop; fi; pause_enter ;;
       4) print_header; scheduler_status; pause_enter ;;
-      5) setup_scheduler; pause_enter ;;
+      5) repair_scheduler; pause_enter ;;
       0) return 0 ;;
       *) log_msg WARN "无效选项"; pause_enter ;;
     esac
@@ -1749,7 +1869,7 @@ settings_menu() {
       2) set_log_level_menu; pause_enter ;;
       3) set_curl_menu; pause_enter ;;
       4) set_general_menu; pause_enter ;;
-      5) setup_scheduler; pause_enter ;;
+      5) repair_scheduler; pause_enter ;;
       6) disable_scheduler; pause_enter ;;
       7) print_header; tail -n 80 "$LOG_FILE" 2>/dev/null || echo "暂无日志"; pause_enter ;;
       8) print_header; echo "按 Ctrl+C 退出"; tail -f "$LOG_FILE" ;;
@@ -1814,7 +1934,7 @@ self_check() {
   if validate_config_file; then echo "✅ 配置 JSON 正常：${CONFIG_FILE}"; else echo "❌ 配置 JSON 异常：${CONFIG_FILE}"; ok=0; fi
   if [[ -x "$INSTALL_BIN" ]]; then echo "✅ 管理命令存在：${INSTALL_BIN}"; else echo "⚠️  管理命令不存在：${INSTALL_BIN}"; fi
   if [[ -x "$INSTALL_BIN_COMPAT" || -L "$INSTALL_BIN_COMPAT" ]]; then echo "✅ sudo 兼容命令存在：${INSTALL_BIN_COMPAT}"; else echo "⚠️  sudo 兼容命令不存在：${INSTALL_BIN_COMPAT}"; fi
-  if command -v cfcname >/dev/null 2>&1; then echo "✅ 当前 PATH 可找到：$(command -v cfcname)"; else echo "⚠️  当前 PATH 找不到 cfcname，可执行 sudo bash $0 install 修复。"; fi
+  if command -v cfcname >/dev/null 2>&1; then echo "✅ 当前 PATH 可找到：$(command -v cfcname)"; else echo "⚠️  当前 PATH 找不到 cfcname，可执行 sudo bash $0 repair 修复。"; fi
   for f in "$INSTALL_SCRIPT" "$INSTALL_BIN" "$INSTALL_BIN_COMPAT"; do
     if [[ -s "$f" ]]; then echo "✅ 入口文件正常：$f"; else echo "⚠️  入口文件不存在或为空：$f"; ok=0; fi
   done
@@ -1839,7 +1959,7 @@ main_menu() {
   migrate_config
   while true; do
     print_header
-    echo "推荐：第一次使用选 1；日常改互换规则选 3；服务启停选 5；排障选 7。"
+    echo "推荐：第一次使用选 1；日常改互换规则选 3；服务启停选 5；命令异常选 9。"
     echo
     menu_item 1 "🚀 快速初始化：创建 21点互换 / 2点恢复任务"
     menu_item 2 "🌐 域名 / Token 配置"
@@ -1849,7 +1969,8 @@ main_menu() {
     menu_item 6 "⚙️  系统设置 / 日志等级"
     menu_item 7 "🔎 自检"
     menu_item 8 "▶️  立即执行所有启用任务"
-    menu_item 9 "🧹 卸载 cfcname"
+    menu_item 9 "🛠️  修复工具：依赖 / 管理命令 / 定时服务"
+    menu_item 10 "🧹 卸载 cfcname"
     menu_item 0 "退出"
     echo
     read -r -p "请选择: " ans || true
@@ -1863,7 +1984,8 @@ main_menu() {
       6) settings_menu ;;
       7) self_check; pause_enter ;;
       8) run_tasks force; pause_enter ;;
-      9) uninstall_self; pause_enter ;;
+      9) repair_menu ;;
+      10) uninstall_self; pause_enter ;;
       0) exit 0 ;;
       *) log_msg WARN "无效选项"; pause_enter ;;
     esac
@@ -1885,6 +2007,8 @@ cfcname v${APP_VERSION}
   sudo cfcname restart                           重启定时服务
   sudo cfcname status                            查看定时服务状态
   sudo cfcname self-check                        自检
+  sudo cfcname repair                            一键修复依赖/管理命令/定时服务
+  sudo cfcname repair-menu                       打开修复工具菜单
   sudo cfcname uninstall                         卸载
 
 核心逻辑：
@@ -1922,6 +2046,11 @@ main() {
     restart) scheduler_restart ;;
     status) need_root; migrate_config; scheduler_status ;;
     self-check|check) need_root; migrate_config; self_check ;;
+    repair) repair_all ;;
+    repair-menu) repair_menu ;;
+    repair-cmd|fix-cmd) repair_management_commands ;;
+    repair-deps|fix-deps) repair_dependencies ;;
+    repair-scheduler|fix-scheduler) repair_scheduler ;;
     help|-h|--help) usage ;;
     *) usage; exit 1 ;;
   esac

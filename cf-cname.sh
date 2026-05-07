@@ -1,20 +1,19 @@
 #!/usr/bin/env bash
-# cfcname - Cloudflare CNAME Scheduled Switch Manager
-# Version: 1.4
+# cfcname - Cloudflare CNAME Pair-Swap Manager
+# Version: 1.5
 # License: MIT
 #
 # 功能简要注释：
-# 1. 用 cfcname 菜单管理 Cloudflare 域名、API Token、多个 CNAME 定时切换任务。
-# 2. 支持快速初始化向导，不在脚本中写死任何真实域名、Zone ID、Token，适合 GitHub 公开。
-# 3. 支持多个时间点，例如 21:00 指向 A，02:00 指向 B。
-# 4. 支持日志等级、curl 超时/脚本内置重试、HTTP/1.1 优先请求，兼容旧版 curl。
-# 5. 每次修改 DNS 前自动备份当前记录，支持按备份恢复 CNAME 目标。
-# 6. 默认只处理 CNAME；遇到同名 A/AAAA/其他记录会停止，避免误删生产记录。
+# 1. 用 cfcname 菜单管理 Cloudflare CNAME 定时互换任务。
+# 2. 核心场景：A 记录正常指向 1.com，B 记录正常指向 2.com；到指定时间互换，到恢复时间换回。
+# 3. 不在脚本中写死任何真实域名、Zone ID、Token，适合 GitHub 公开。
+# 4. 支持多个域名配置、多个成对互换任务、日志等级、网络重试、备份恢复。
+# 5. 默认只处理 CNAME；遇到同名 A/AAAA/其他记录会停止，避免误删生产记录。
 
 set -Eeuo pipefail
 
 APP_NAME="cfcname"
-APP_VERSION="1.4"
+APP_VERSION="1.5"
 INSTALL_BIN="/usr/local/bin/${APP_NAME}"
 CONFIG_DIR="/etc/${APP_NAME}"
 CONFIG_FILE="${CONFIG_DIR}/config.json"
@@ -36,23 +35,29 @@ else
   C_RESET=''; C_RED=''; C_GREEN=''; C_YELLOW=''; C_BLUE=''; C_CYAN=''; C_BOLD=''; C_DIM=''
 fi
 
-# 打印标题。用于菜单顶部。
 print_header() {
   clear 2>/dev/null || true
-  printf "%b\n" "${C_CYAN}${C_BOLD}┌──────────────────────────────────────────────────────────────┐${C_RESET}"
-  printf "%b\n" "${C_CYAN}${C_BOLD}│        cfcname v${APP_VERSION} - Cloudflare CNAME 管理器        │${C_RESET}"
-  printf "%b\n" "${C_CYAN}${C_BOLD}└──────────────────────────────────────────────────────────────┘${C_RESET}"
-  printf "%b\n" "${C_DIM}配置: ${CONFIG_FILE}    日志: ${LOG_FILE}${C_RESET}"
+  printf "%b\n" "${C_CYAN}${C_BOLD}╔══════════════════════════════════════════════════════════════╗${C_RESET}"
+  printf "%b\n" "${C_CYAN}${C_BOLD}║             cfcname v${APP_VERSION} - CNAME 成对互换管理器       ║${C_RESET}"
+  printf "%b\n" "${C_CYAN}${C_BOLD}╚══════════════════════════════════════════════════════════════╝${C_RESET}"
+  printf "%b\n" "${C_DIM}配置: ${CONFIG_FILE}${C_RESET}"
+  printf "%b\n" "${C_DIM}日志: ${LOG_FILE}${C_RESET}"
   echo
 }
 
-# 暂停等待用户回车。用于菜单返回。
+section_title() {
+  printf "%b\n" "${C_BOLD}${C_BLUE}▶ $*${C_RESET}"
+}
+
+hint() {
+  printf "%b\n" "${C_DIM}$*${C_RESET}"
+}
+
 pause_enter() {
   echo
-  read -r -p "按 Enter 返回菜单..." _ || true
+  read -r -p "按 Enter 返回..." _ || true
 }
 
-# 菜单确认，不再要求输入 done，只需选择 1 或 2。
 confirm_select() {
   local msg="$1" ans
   echo
@@ -64,13 +69,12 @@ confirm_select() {
     case "$ans" in
       1) return 0 ;;
       2) return 1 ;;
-      *) echo "请输入 1 或 2" ;;
+      *) echo "请输入 1 或 2。" ;;
     esac
   done
 }
 
 # ---------- 日志 ----------
-# 将日志等级转换为数字，方便比较。
 level_num() {
   case "${1^^}" in
     DEBUG) echo 10 ;;
@@ -82,7 +86,6 @@ level_num() {
   esac
 }
 
-# 读取当前日志等级。配置损坏时默认 INFO。
 current_log_level() {
   if [[ -f "$CONFIG_FILE" ]] && command -v jq >/dev/null 2>&1; then
     jq -r '.settings.log_level // "INFO"' "$CONFIG_FILE" 2>/dev/null || echo "INFO"
@@ -91,7 +94,6 @@ current_log_level() {
   fi
 }
 
-# 记录日志。受日志等级控制；--quiet 时不输出到屏幕。
 log_msg() {
   local level="${1^^}"; shift
   local msg="$*" cfg_level now
@@ -113,24 +115,20 @@ log_msg() {
 }
 
 # ---------- 通用工具 ----------
-# root 检查。安装、修改 systemd、写 /etc 都需要 root。
 need_root() {
   [[ "$(id -u)" -eq 0 ]] || { echo "请使用 root 运行：sudo $0" >&2; exit 1; }
 }
 
-# 安全创建目录和权限。
 ensure_dirs() {
   mkdir -p "$CONFIG_DIR" "$STATE_DIR" "$BACKUP_DIR" "$LOG_DIR"
   chmod 700 "$CONFIG_DIR" "$STATE_DIR" "$BACKUP_DIR" 2>/dev/null || true
   chmod 755 "$LOG_DIR" 2>/dev/null || true
 }
 
-# 清理用户输入的 Token，去除空格、TAB、CR、LF，修复粘贴换行导致 Authorization 头为空的问题。
 sanitize_token() {
   printf '%s' "${1:-}" | tr -d '[:space:]'
 }
 
-# 清理普通输入，去除首尾空白和 CR。
 trim_text() {
   local s="${1:-}"
   s="${s//$'\r'/}"
@@ -138,22 +136,24 @@ trim_text() {
   printf '%s' "$s"
 }
 
-# 校验 Cloudflare Zone ID。Zone ID 通常为 32 位十六进制。
 valid_zone_id() {
   [[ "${1:-}" =~ ^[a-fA-F0-9]{32}$ ]]
 }
 
-# 校验域名格式，避免把 URL 或空值写入配置。
 valid_domain() {
   [[ "${1:-}" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}\.?$ ]]
 }
 
-# 校验 HH:MM 时间。
 valid_hhmm() {
   [[ "${1:-}" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]]
 }
 
-# 将用户输入的 x001 或 www.example.com 统一成完整域名。
+hhmm_to_minutes() {
+  local t="$1" h m
+  h="${t%:*}"; m="${t#*:}"
+  echo $((10#$h * 60 + 10#$m))
+}
+
 normalize_record_name() {
   local input zone
   input="$(trim_text "$1")"
@@ -167,7 +167,6 @@ normalize_record_name() {
   fi
 }
 
-# 清理 CNAME 目标，只接受域名，不接受 http:// URL。
 normalize_cname_target() {
   local input
   input="$(trim_text "$1")"
@@ -178,18 +177,15 @@ normalize_cname_target() {
   printf '%s' "$input"
 }
 
-# URL 编码，用于 DNS 记录名查询。
 urlencode() {
   jq -rn --arg v "$1" '$v|@uri'
 }
 
-# 生成简单 ID。
 gen_id() {
   local prefix="$1"
-  printf '%s_%s' "$prefix" "$(date +%Y%m%d%H%M%S)_$((RANDOM * RANDOM % 99999))"
+  printf '%s_%s_%05d' "$prefix" "$(date +%Y%m%d%H%M%S)" "$((RANDOM * RANDOM % 100000))"
 }
 
-# 读取输入，带默认值。
 prompt_input() {
   local prompt="$1" default="${2:-}" value
   if [[ -n "$default" ]]; then
@@ -203,7 +199,6 @@ prompt_input() {
   printf '%s' "$value"
 }
 
-# 读取敏感 Token，不回显；读取后强制去空白和换行。
 prompt_secret_token() {
   local prompt="$1" value value2
   while true; do
@@ -226,7 +221,6 @@ prompt_secret_token() {
   done
 }
 
-# 将 Token 脱敏显示。
 mask_token() {
   local t
   t="$(sanitize_token "${1:-}")"
@@ -238,7 +232,6 @@ mask_token() {
 }
 
 # ---------- 配置读写 ----------
-# 创建默认空配置，使用 example.com 作为说明示例，不包含任何真实敏感信息。
 default_config_json() {
   cat <<JSON
 {
@@ -261,7 +254,6 @@ default_config_json() {
 JSON
 }
 
-# 初始化配置文件，不覆盖已有配置。
 init_config() {
   ensure_dirs
   if [[ ! -f "$CONFIG_FILE" ]]; then
@@ -271,13 +263,11 @@ init_config() {
   fi
 }
 
-# 校验 JSON 配置是否可读。
 validate_config_file() {
   [[ -f "$CONFIG_FILE" ]] || return 1
   jq -e '.settings and (.zones|type=="array") and (.tasks|type=="array")' "$CONFIG_FILE" >/dev/null 2>&1
 }
 
-# 保存 JSON 到配置文件，先写临时文件再原子替换，减少配置损坏风险。
 save_config_from_stdin() {
   local tmp
   tmp="$(mktemp)"
@@ -287,7 +277,6 @@ save_config_from_stdin() {
   rm -f "$tmp"
 }
 
-# 配置迁移：补齐 v1.3 新增字段。
 migrate_config() {
   init_config
   if ! validate_config_file; then
@@ -314,14 +303,13 @@ migrate_config() {
     .settings.default_ttl = (.settings.default_ttl // 1) |
     .settings.default_proxied = (.settings.default_proxied // false) |
     .zones = (.zones // []) |
-    .tasks = (.tasks // [])
+    .tasks = ((.tasks // []) | map(if (.task_type // "") == "" then . + {task_type:"legacy"} else . end))
   ' "$CONFIG_FILE" > "$tmp"
   install -m 600 "$tmp" "$CONFIG_FILE"
   rm -f "$tmp"
 }
 
 # ---------- 依赖和安装 ----------
-# 检测包管理器。
 detect_pkg_manager() {
   if command -v apt-get >/dev/null 2>&1; then echo apt
   elif command -v dnf >/dev/null 2>&1; then echo dnf
@@ -331,7 +319,6 @@ detect_pkg_manager() {
   fi
 }
 
-# 安装 curl jq flock cron 等依赖。
 install_deps() {
   local missing=() pm
   command -v curl >/dev/null 2>&1 || missing+=(curl)
@@ -362,7 +349,6 @@ install_deps() {
   esac
 }
 
-# 安装 cfcname 命令本体。
 install_self() {
   need_root
   install_deps
@@ -378,7 +364,6 @@ install_self() {
   echo "安装完成。输入 sudo cfcname 进入菜单。"
 }
 
-# 卸载程序，但默认保留配置和日志。
 uninstall_self() {
   need_root
   print_header
@@ -396,11 +381,10 @@ uninstall_self() {
 }
 
 # ---------- 调度器 ----------
-# 写入 systemd timer；用于每分钟检查是否需要切换。
 setup_systemd_timer() {
   cat > "$SYSTEMD_SERVICE" <<UNIT
 [Unit]
-Description=cfcname Cloudflare CNAME scheduled switch
+Description=cfcname Cloudflare CNAME pair swap
 After=network-online.target
 Wants=network-online.target
 
@@ -429,7 +413,6 @@ UNIT
   log_msg INFO "已启用 systemd timer：${APP_NAME}.timer"
 }
 
-# 写入 cron 任务；systemd 不可用时回退使用。
 setup_cron_timer() {
   cat > "$CRON_FILE" <<CRON
 # cfcname v${APP_VERSION} - run every minute
@@ -445,7 +428,6 @@ CRON
   log_msg INFO "已启用 cron 定时任务：${CRON_FILE}"
 }
 
-# 启用定时器。优先 systemd，失败则回退 cron。
 setup_scheduler() {
   if [[ ! -x "$INSTALL_BIN" && "$(readlink -f "$0" 2>/dev/null || echo "$0")" != "$INSTALL_BIN" ]]; then
     return 0
@@ -457,17 +439,17 @@ setup_scheduler() {
   fi
 }
 
-# 禁用定时器。
 disable_scheduler() {
   if command -v systemctl >/dev/null 2>&1; then
     systemctl disable --now "${APP_NAME}.timer" >/dev/null 2>&1 || true
-    systemctl daemon-reload >/dev/null 2>&1 || true
   fi
   rm -f "$SYSTEMD_SERVICE" "$SYSTEMD_TIMER" "$CRON_FILE"
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
   log_msg INFO "已移除定时器。"
 }
 
-# 查看定时器状态。
 scheduler_status() {
   echo "systemd timer:"
   if command -v systemctl >/dev/null 2>&1 && [[ -f "$SYSTEMD_TIMER" ]]; then
@@ -485,13 +467,11 @@ scheduler_status() {
 }
 
 # ---------- Cloudflare API ----------
-# 读取 curl 设置。
 cf_setting() {
   local key="$1" default="$2"
   jq -r --arg k "$key" --arg d "$default" '.settings[$k] // $d' "$CONFIG_FILE"
 }
 
-# 判断 curl 是否支持某个参数。兼容 CentOS 7 等旧系统 curl，避免未知参数导致请求根本没有发出。
 curl_supports_option() {
   local opt="$1"
   if curl --help all >/dev/null 2>&1; then
@@ -501,7 +481,6 @@ curl_supports_option() {
   fi
 }
 
-# 判断 HTTP 状态码是否值得重试。400/401/403 这类认证或权限错误不会重试，直接暴露真实原因。
 is_retryable_http_code() {
   case "${1:-}" in
     408|425|429|500|502|503|504) return 0 ;;
@@ -509,8 +488,6 @@ is_retryable_http_code() {
   esac
 }
 
-# 调用 Cloudflare API。
-# v1.4 关键变化：不再依赖 curl --retry-all-errors，因为旧版 curl 不支持该参数；改为脚本自己循环重试。
 cf_api() {
   local zone_id="$1" token="$2" method="$3" endpoint="$4" data="${5:-}"
   local tmp_body tmp_err http_code retry retry_delay connect_timeout max_time http_version curl_http_arg token_clean
@@ -538,7 +515,6 @@ cf_api() {
   [[ "$max_time" =~ ^[0-9]+$ ]] || max_time=30
   attempts=$((retry + 1))
 
-  # 老版本 curl 可能不支持 --http2 或 --http1.1。支持才加；不支持就让 curl 使用默认协议。
   if [[ "$http_version" == "2" || "$http_version" == "2.0" ]]; then
     curl_http_arg="--http2"
   else
@@ -579,7 +555,6 @@ cf_api() {
     rc=$?
     set -e
 
-    # curl 自身失败，例如 DNS、TLS、连接超时、网络中断。脚本层面重试，不依赖 curl 新参数。
     if [[ $rc -ne 0 ]]; then
       if (( attempt < attempts )); then
         log_msg WARN "curl 请求失败 rc=${rc}，准备第 $((attempt + 1))/${attempts} 次重试：${shown_endpoint}"
@@ -590,7 +565,6 @@ cf_api() {
         attempt=$((attempt + 1))
         continue
       fi
-
       log_msg ERROR "curl 请求失败 rc=${rc}：${shown_endpoint}"
       if [[ -s "$tmp_err" ]]; then
         while IFS= read -r line; do [[ -n "$line" ]] && log_msg ERROR "curl错误：${line}"; done < "$tmp_err"
@@ -600,15 +574,12 @@ cf_api() {
     fi
 
     log_msg DEBUG "Cloudflare API HTTP ${http_code}：${shown_endpoint}"
-
-    # Cloudflare 临时错误才重试；认证/权限类错误不重试，直接显示 API 返回的原因。
     if is_retryable_http_code "$http_code" && (( attempt < attempts )); then
       log_msg WARN "Cloudflare API HTTP ${http_code}，准备第 $((attempt + 1))/${attempts} 次重试：${shown_endpoint}"
       sleep "$retry_delay"
       attempt=$((attempt + 1))
       continue
     fi
-
     break
   done
 
@@ -638,20 +609,17 @@ cf_api() {
   rm -f "$tmp_body" "$tmp_err"
 }
 
-# 测试 Zone ID + Token 是否能访问 DNS Records 列表。
 test_zone_api() {
   local zone_id="$1" token="$2"
   cf_api "$zone_id" "$token" GET "/zones/${zone_id}/dns_records?per_page=1" >/dev/null
 }
 
-# 按记录名查询 DNS 记录。
 list_records_by_name() {
   local zone_id="$1" token="$2" name="$3" encoded
   encoded="$(urlencode "$name")"
   cf_api "$zone_id" "$token" GET "/zones/${zone_id}/dns_records?name=${encoded}&per_page=100"
 }
 
-# 查询单条 CNAME。遇到同名非 CNAME 或多个 CNAME 会报错停止。
 get_single_cname_record() {
   local zone_id="$1" token="$2" name="$3" resp total cname_count
   resp="$(list_records_by_name "$zone_id" "$token" "$name")" || return 1
@@ -674,7 +642,6 @@ get_single_cname_record() {
   fi
 }
 
-# 创建或更新 CNAME。
 update_or_create_cname() {
   local zone_id="$1" token="$2" name="$3" target="$4" ttl="$5" proxied="$6" auto_create="$7"
   local record id current old_ttl old_proxied payload
@@ -713,7 +680,6 @@ update_or_create_cname() {
 }
 
 # ---------- Zone 配置管理 ----------
-# 选择一个 Zone 配置，返回 zone id。
 select_zone() {
   local count idx zid
   count="$(jq '.zones | length' "$CONFIG_FILE")"
@@ -722,7 +688,7 @@ select_zone() {
     return 1
   fi
   echo "可选域名配置：" >&2
-  jq -r '.zones | to_entries[] | "  \(.key+1)) \(.value.name)  ZoneID=\(.value.zone_id)  Token=" + (.value.token[0:5] // "") + "..."' "$CONFIG_FILE" >&2
+  jq -r '.zones | to_entries[] | "  \(.key+1)) \(.value.name)  ZoneID=\(.value.zone_id)  Token=" + ((.value.token // "")[0:5]) + "..."' "$CONFIG_FILE" >&2
   while true; do
     read -r -p "请选择 [1-${count}]: " idx || return 1
     [[ "$idx" =~ ^[0-9]+$ ]] || { echo "请输入数字" >&2; continue; }
@@ -733,35 +699,30 @@ select_zone() {
   done
 }
 
-# 添加或编辑域名配置。保存前会立即 API 测试。
 add_zone_wizard() {
   print_header
-  echo "添加 Cloudflare 域名配置"
-  echo "说明：Zone ID 必须是 32 位十六进制；Token 建议只给 DNS Read + DNS Write 权限。"
+  section_title "添加 Cloudflare 域名配置"
+  echo "说明：Zone ID 是 32 位十六进制；API Token 建议只给该 Zone 的 DNS Read + DNS Write 权限。"
   echo
   local zone_name zone_id token zone_obj zone_ref
   while true; do
-    zone_name="$(prompt_input "请输入根域名" "example.com")"
+    zone_name="$(prompt_input "根域名" "example.com")"
     zone_name="${zone_name%.}"
     valid_domain "$zone_name" && break
     echo "域名格式不正确。示例：example.com"
   done
   while true; do
-    zone_id="$(prompt_input "请输入 Cloudflare Zone ID" "")"
+    zone_id="$(prompt_input "Cloudflare Zone ID" "")"
     if valid_zone_id "$zone_id"; then break; fi
     echo "Zone ID 格式不正确，应为 32 位十六进制。不要输入根域名。"
   done
-  token="$(prompt_secret_token "请输入 Cloudflare API Token")"
+  token="$(prompt_secret_token "Cloudflare API Token")"
 
   echo
-  echo "准备测试 API 权限..."
+  echo "正在测试 API 权限..."
   if ! test_zone_api "$zone_id" "$token"; then
     echo
-    echo "API 测试失败，常见原因："
-    echo "1. Token 粘贴为空或被换行打断。"
-    echo "2. Token 没有该 Zone 的 DNS Read/DNS Write 权限。"
-    echo "3. Zone ID 填成了根域名。"
-    echo "4. 服务器网络无法访问 api.cloudflare.com。"
+    echo "API 测试失败，未保存。请检查：Token 是否为空、权限是否包含 DNS Read/Write、Zone ID 是否正确、服务器能否访问 api.cloudflare.com。"
     return 1
   fi
   echo "API 测试通过。"
@@ -772,19 +733,17 @@ add_zone_wizard() {
   log_msg INFO "已保存域名配置：${zone_name}，ZoneID=${zone_id}，Token=$(mask_token "$token")"
 }
 
-# 列出域名配置。
 list_zones() {
   print_header
-  echo "域名配置列表"
+  section_title "域名配置列表"
   echo
   if [[ "$(jq '.zones | length' "$CONFIG_FILE")" -eq 0 ]]; then
     echo "暂无域名配置。"
   else
-    jq -r '.zones[] | "- 名称: \(.name)\n  内部ID: \(.id)\n  Zone ID: \(.zone_id)\n  Token: \(.token[0:5])...\(.token[-4:])\n"' "$CONFIG_FILE"
+    jq -r '.zones[] | "- 名称: \(.name)\n  内部ID: \(.id)\n  Zone ID: \(.zone_id)\n  Token: " + ((.token // "")[0:5]) + "..." + ((.token // "")[-4:]) + "\n"' "$CONFIG_FILE"
   fi
 }
 
-# 测试指定域名配置。
 test_zone_menu() {
   print_header
   local zid zone_id token name
@@ -800,10 +759,9 @@ test_zone_menu() {
   fi
 }
 
-# 编辑域名配置。
 edit_zone_menu() {
   print_header
-  local zid old_name old_zone_id old_token name zone_id token update_token
+  local zid old_name old_zone_id old_token name zone_id token
   zid="$(select_zone)" || return 0
   old_name="$(jq -r --arg id "$zid" '.zones[] | select(.id==$id) | .name' "$CONFIG_FILE")"
   old_zone_id="$(jq -r --arg id "$zid" '.zones[] | select(.id==$id) | .zone_id' "$CONFIG_FILE")"
@@ -821,7 +779,7 @@ edit_zone_menu() {
   done
   echo "当前 Token：$(mask_token "$old_token")"
   if confirm_select "是否更换 Token？"; then
-    token="$(prompt_secret_token "请输入新的 Cloudflare API Token")"
+    token="$(prompt_secret_token "新的 Cloudflare API Token")"
   else
     token="$old_token"
   fi
@@ -834,7 +792,6 @@ edit_zone_menu() {
   log_msg INFO "已修改域名配置：${name}，ZoneID=${zone_id}，Token=$(mask_token "$token")"
 }
 
-# 删除域名配置。已被任务引用时会提醒。
 delete_zone_menu() {
   print_header
   local zid refs
@@ -848,12 +805,10 @@ delete_zone_menu() {
   log_msg INFO "已删除域名配置：${zid}"
 }
 
-# 域名配置管理菜单。
 zone_menu() {
   while true; do
     print_header
-    echo "🌐 域名 / Token 配置管理"
-    echo
+    section_title "域名 / Token 配置"
     echo "  1) 查看域名配置"
     echo "  2) 添加域名配置"
     echo "  3) 编辑域名配置"
@@ -874,127 +829,275 @@ zone_menu() {
   done
 }
 
-# ---------- 任务管理 ----------
-# 选择任务，返回 task id。
+# ---------- 成对互换任务 ----------
 select_task() {
   local count idx tid
-  count="$(jq '.tasks | length' "$CONFIG_FILE")"
+  count="$(jq '[.tasks[] | select(.task_type=="pair_swap")] | length' "$CONFIG_FILE")"
   if [[ "$count" -eq 0 ]]; then
-    echo "当前没有任务。" >&2
+    echo "当前没有成对互换任务。" >&2
     return 1
   fi
   echo "可选任务：" >&2
-  jq -r '.tasks | to_entries[] | "  \(.key+1)) " + (if .value.enabled then "✅" else "⏸️" end) + " " + .value.name + "  ID=" + .value.id' "$CONFIG_FILE" >&2
+  jq -r '[.tasks[] | select(.task_type=="pair_swap")] | to_entries[] | "  \(.key+1)) " + (if .value.enabled then "✅" else "⏸️" end) + " " + .value.name + "  切换=" + .value.swap_time + " 恢复=" + .value.restore_time' "$CONFIG_FILE" >&2
   while true; do
     read -r -p "请选择 [1-${count}]: " idx || return 1
     [[ "$idx" =~ ^[0-9]+$ ]] || { echo "请输入数字" >&2; continue; }
     (( idx >= 1 && idx <= count )) || { echo "超出范围" >&2; continue; }
-    tid="$(jq -r --argjson i "$((idx-1))" '.tasks[$i].id' "$CONFIG_FILE")"
+    tid="$(jq -r --argjson i "$((idx-1))" '[.tasks[] | select(.task_type=="pair_swap")][$i].id' "$CONFIG_FILE")"
     echo "$tid"
     return 0
   done
 }
 
-# 列出任务。
-list_tasks() {
-  print_header
-  echo "任务列表"
-  echo
-  if [[ "$(jq '.tasks | length' "$CONFIG_FILE")" -eq 0 ]]; then
-    echo "暂无任务。"
-    return 0
+pair_mode_by_time() {
+  local swap_time="$1" restore_time="$2" tz now_min swap_min restore_min
+  tz="$(jq -r '.settings.timezone // "Asia/Shanghai"' "$CONFIG_FILE")"
+  now_min="$(TZ="$tz" date '+%H %M' | awk '{print $1*60+$2}')"
+  swap_min="$(hhmm_to_minutes "$swap_time")"
+  restore_min="$(hhmm_to_minutes "$restore_time")"
+
+  if (( swap_min == restore_min )); then
+    echo "invalid"
+    return 1
   fi
-  jq -r '
-    . as $root |
-    .tasks[] |
-    "- " + (if .enabled then "✅" else "⏸️" end) + " " + .name + "\n" +
-    "  ID: " + .id + "\n" +
-    "  域名配置: " + ((.zone_ref as $z | $root.zones[]? | select(.id==$z) | .name) // .zone_ref) + "\n" +
-    "  自动创建缺失记录: " + ((.auto_create_missing // true)|tostring) + "\n" +
-    "  时间点: " + ([.schedule[].time] | join(", ")) + "\n" +
-    "  记录: " + ([.records[].name] | join(", ")) + "\n"
-  ' "$CONFIG_FILE"
+
+  if (( swap_min < restore_min )); then
+    if (( now_min >= swap_min && now_min < restore_min )); then echo "swapped"; else echo "normal"; fi
+  else
+    if (( now_min >= swap_min || now_min < restore_min )); then echo "swapped"; else echo "normal"; fi
+  fi
 }
 
-# 添加任务向导。支持多个 CNAME 和多个时间点。
-add_task_wizard() {
+pair_mode_label() {
+  case "$1" in
+    normal) echo "正常/恢复模式" ;;
+    swapped) echo "互换模式" ;;
+    *) echo "$1" ;;
+  esac
+}
+
+pair_targets_json() {
+  local task_json="$1" mode="$2"
+  if [[ "$mode" == "swapped" ]]; then
+    jq -c '{(.record_a): .target_b, (.record_b): .target_a}' <<<"$task_json"
+  else
+    jq -c '{(.record_a): .target_a, (.record_b): .target_b}' <<<"$task_json"
+  fi
+}
+
+print_pair_task_human() {
+  local task_json="$1" mode
+  mode="$(pair_mode_by_time "$(jq -r '.swap_time' <<<"$task_json")" "$(jq -r '.restore_time' <<<"$task_json")" 2>/dev/null || echo normal)"
+  jq -r --arg mode "$mode" '
+    "任务名称：" + .name + "\n" +
+    "状态：" + (if .enabled then "启用" else "停用" end) + "\n" +
+    "当前应处于：" + (if $mode=="swapped" then "互换模式" else "正常/恢复模式" end) + "\n" +
+    "切换时间：" + .swap_time + "\n" +
+    "恢复时间：" + .restore_time + "\n\n" +
+    "正常/恢复模式：\n" +
+    "  " + .record_a + " -> " + .target_a + "\n" +
+    "  " + .record_b + " -> " + .target_b + "\n\n" +
+    "互换模式：\n" +
+    "  " + .record_a + " -> " + .target_b + "\n" +
+    "  " + .record_b + " -> " + .target_a
+  ' <<<"$task_json"
+}
+
+list_tasks() {
   print_header
-  echo "新增 CNAME 定时切换任务"
+  section_title "成对互换任务列表"
   echo
-  local zone_ref zone_name task_name task_id record_names_json schedule_json add_more rec target time_point records_count ttl proxied auto_create
+  if [[ "$(jq '[.tasks[] | select(.task_type=="pair_swap")] | length' "$CONFIG_FILE")" -eq 0 ]]; then
+    echo "暂无成对互换任务。"
+    echo
+    echo "适合你的目标示例："
+    echo "  正常：x001 -> 1.com，x002 -> 2.com"
+    echo "  21:00：x001 -> 2.com，x002 -> 1.com"
+    echo "  02:00：x001 -> 1.com，x002 -> 2.com"
+    return 0
+  fi
+
+  jq -c '.tasks[] | select(.task_type=="pair_swap")' "$CONFIG_FILE" | while read -r task; do
+    echo "────────────────────────────────────────"
+    print_pair_task_human "$task"
+    echo
+  done
+
+  local legacy_count
+  legacy_count="$(jq '[.tasks[] | select(.task_type=="legacy")] | length' "$CONFIG_FILE")"
+  if [[ "$legacy_count" -gt 0 ]]; then
+    echo "⚠️ 检测到 ${legacy_count} 个旧版通用任务。1.5 主逻辑已改为成对互换，建议重新创建任务。"
+  fi
+}
+
+add_pair_task_wizard() {
+  print_header
+  section_title "新增成对互换任务"
+  echo "这个向导专门对应你的场景："
+  echo "  正常：记录A -> 目标A，记录B -> 目标B"
+  echo "  到切换时间：记录A -> 目标B，记录B -> 目标A"
+  echo "  到恢复时间：记录A -> 目标A，记录B -> 目标B"
+  echo
+
+  local zone_ref zone_name task_name task_id record_a record_b target_a target_b swap_time restore_time ttl proxied auto_create task_json
   zone_ref="$(select_zone)" || { echo "请先添加域名配置。"; return 1; }
   zone_name="$(jq -r --arg id "$zone_ref" '.zones[] | select(.id==$id) | .name' "$CONFIG_FILE")"
-  task_name="$(prompt_input "任务名称" "example-cname-switch")"
+
+  task_name="$(prompt_input "任务名称" "x001-x002-pair-swap")"
   task_id="$(gen_id task)"
+
+  while true; do
+    record_a="$(prompt_input "记录A，例如 x001 或 x001.example.com" "x001")"
+    record_a="$(normalize_record_name "$record_a" "$zone_name")"
+    valid_domain "$record_a" && break
+    echo "记录A格式不正确。"
+  done
+  while true; do
+    record_b="$(prompt_input "记录B，例如 x002 或 x002.example.com" "x002")"
+    record_b="$(normalize_record_name "$record_b" "$zone_name")"
+    valid_domain "$record_b" && [[ "$record_b" != "$record_a" ]] && break
+    echo "记录B格式不正确，且不能与记录A相同。"
+  done
+  while true; do
+    target_a="$(prompt_input "正常模式下，记录A指向的 CNAME 目标" "target-a.example.net")"
+    target_a="$(normalize_cname_target "$target_a")"
+    valid_domain "$target_a" && break
+    echo "目标A格式不正确，不要输入 URL，只输入域名。"
+  done
+  while true; do
+    target_b="$(prompt_input "正常模式下，记录B指向的 CNAME 目标" "target-b.example.net")"
+    target_b="$(normalize_cname_target "$target_b")"
+    valid_domain "$target_b" && [[ "$target_b" != "$target_a" ]] && break
+    echo "目标B格式不正确，且建议不要与目标A相同。"
+  done
+  while true; do
+    swap_time="$(prompt_input "每天几点开始互换，格式 HH:MM" "21:00")"
+    valid_hhmm "$swap_time" && break
+    echo "时间格式不正确，例如 21:00。"
+  done
+  while true; do
+    restore_time="$(prompt_input "每天几点恢复原状，格式 HH:MM" "02:00")"
+    valid_hhmm "$restore_time" && [[ "$restore_time" != "$swap_time" ]] && break
+    echo "恢复时间格式不正确，且不能与切换时间相同。"
+  done
+
   ttl="$(jq -r '.settings.default_ttl' "$CONFIG_FILE")"
   proxied="$(jq -r '.settings.default_proxied' "$CONFIG_FILE")"
   auto_create="$(jq -r '.settings.auto_create_missing' "$CONFIG_FILE")"
 
-  record_names_json='[]'
-  while true; do
-    rec="$(prompt_input "请输入要管理的 CNAME 记录名，例如 www 或 www.example.com" "www")"
-    rec="$(normalize_record_name "$rec" "$zone_name")"
-    if ! valid_domain "$rec"; then echo "记录名格式不正确。"; continue; fi
-    record_names_json="$(jq --arg name "$rec" --argjson ttl "$ttl" --argjson proxied "$proxied" '. + [{name:$name, ttl:$ttl, proxied:$proxied}]' <<<"$record_names_json")"
-    if ! confirm_select "是否继续添加其它 CNAME 记录？"; then break; fi
-  done
-
-  records_count="$(jq 'length' <<<"$record_names_json")"
-  [[ "$records_count" -gt 0 ]] || { echo "至少需要一个 CNAME 记录。"; return 1; }
-
-  schedule_json='[]'
-  while true; do
-    while true; do
-      time_point="$(prompt_input "请输入切换时间，格式 HH:MM" "21:00")"
-      valid_hhmm "$time_point" && break
-      echo "时间格式不正确，例如 21:00 或 02:00。"
-    done
-    local targets_json='{}'
-    while IFS= read -r rec; do
-      target="$(prompt_input "${time_point} 时 ${rec} 指向的 CNAME 目标" "target-a.example.net")"
-      target="$(normalize_cname_target "$target")"
-      if ! valid_domain "$target"; then echo "目标格式不正确。"; return 1; fi
-      targets_json="$(jq --arg name "$rec" --arg target "$target" '. + {($name):$target}' <<<"$targets_json")"
-    done < <(jq -r '.[].name' <<<"$record_names_json")
-    schedule_json="$(jq --arg t "$time_point" --argjson targets "$targets_json" '. + [{time:$t, targets:$targets}]' <<<"$schedule_json")"
-    if ! confirm_select "是否继续添加其它切换时间点？"; then break; fi
-  done
-
-  local task_json
   task_json="$(jq -n \
     --arg id "$task_id" \
     --arg name "$task_name" \
     --arg zone_ref "$zone_ref" \
-    --argjson records "$record_names_json" \
-    --argjson schedule "$schedule_json" \
+    --arg record_a "$record_a" \
+    --arg record_b "$record_b" \
+    --arg target_a "$target_a" \
+    --arg target_b "$target_b" \
+    --arg swap_time "$swap_time" \
+    --arg restore_time "$restore_time" \
+    --argjson ttl "$ttl" \
+    --argjson proxied "$proxied" \
     --argjson auto_create "$auto_create" \
-    '{id:$id, name:$name, enabled:true, zone_ref:$zone_ref, auto_create_missing:$auto_create, records:$records, schedule:$schedule}')"
+    '{id:$id, task_type:"pair_swap", name:$name, enabled:true, zone_ref:$zone_ref, record_a:$record_a, record_b:$record_b, target_a:$target_a, target_b:$target_b, swap_time:$swap_time, restore_time:$restore_time, ttl:$ttl, proxied:$proxied, auto_create_missing:$auto_create}')"
 
   echo
-  echo "任务预览："
-  jq '.' <<<"$task_json"
+  section_title "任务预览"
+  print_pair_task_human "$task_json"
+  echo
+  hint "说明：如果切换时间是 21:00，恢复时间是 02:00，则 21:00-01:59 为互换模式，02:00-20:59 为正常模式。"
   confirm_select "确认保存并启用该任务？" || return 0
+
   jq --argjson task "$task_json" '.tasks += [$task]' "$CONFIG_FILE" | save_config_from_stdin
-  log_msg INFO "已新增任务：${task_name}，ID=${task_id}"
+  log_msg INFO "已新增成对互换任务：${task_name}，ID=${task_id}"
   setup_scheduler || true
 
-  if confirm_select "是否立即按当前时间窗口执行一次？"; then
-    run_tasks "force" "$task_id"
+  if confirm_select "是否立即按当前时间执行一次？"; then
+    apply_pair_task_by_id "$task_id" "current" "force"
   fi
 }
 
-# 启用或停用任务。
-toggle_task_menu() {
+edit_pair_task_menu() {
   print_header
-  local tid enabled new
+  section_title "编辑成对互换任务"
+  local tid task ans field value zone_name zone_ref
   tid="$(select_task)" || return 0
-  enabled="$(jq -r --arg id "$tid" '.tasks[] | select(.id==$id) | .enabled' "$CONFIG_FILE")"
-  if [[ "$enabled" == "true" ]]; then new=false; else new=true; fi
-  jq --arg id "$tid" --argjson e "$new" '(.tasks[] | select(.id==$id)).enabled = $e' "$CONFIG_FILE" | save_config_from_stdin
-  log_msg INFO "已将任务 ${tid} 启用状态改为 ${new}"
+  task="$(jq -c --arg id "$tid" '.tasks[] | select(.id==$id)' "$CONFIG_FILE")"
+  zone_ref="$(jq -r '.zone_ref' <<<"$task")"
+  zone_name="$(jq -r --arg id "$zone_ref" '.zones[]? | select(.id==$id) | .name' "$CONFIG_FILE")"
+
+  while true; do
+    print_header
+    section_title "当前任务"
+    task="$(jq -c --arg id "$tid" '.tasks[] | select(.id==$id)' "$CONFIG_FILE")"
+    print_pair_task_human "$task"
+    echo
+    echo "  1) 修改任务名称"
+    echo "  2) 修改记录A / 记录B"
+    echo "  3) 修改目标A / 目标B"
+    echo "  4) 修改切换时间 / 恢复时间"
+    echo "  5) 启用 / 停用"
+    echo "  0) 返回"
+    echo
+    read -r -p "请选择: " ans || true
+    case "$ans" in
+      1)
+        value="$(prompt_input "新的任务名称" "$(jq -r '.name' <<<"$task")")"
+        jq --arg id "$tid" --arg v "$value" '(.tasks[] | select(.id==$id)).name=$v' "$CONFIG_FILE" | save_config_from_stdin
+        ;;
+      2)
+        while true; do
+          value="$(prompt_input "记录A" "$(jq -r '.record_a' <<<"$task")")"
+          value="$(normalize_record_name "$value" "$zone_name")"
+          valid_domain "$value" && break; echo "记录A格式不正确。"
+        done
+        local new_a="$value" new_b
+        while true; do
+          new_b="$(prompt_input "记录B" "$(jq -r '.record_b' <<<"$task")")"
+          new_b="$(normalize_record_name "$new_b" "$zone_name")"
+          valid_domain "$new_b" && [[ "$new_b" != "$new_a" ]] && break; echo "记录B格式不正确，且不能与记录A相同。"
+        done
+        jq --arg id "$tid" --arg a "$new_a" --arg b "$new_b" '(.tasks[] | select(.id==$id)) |= (.record_a=$a | .record_b=$b)' "$CONFIG_FILE" | save_config_from_stdin
+        ;;
+      3)
+        while true; do
+          value="$(prompt_input "目标A" "$(jq -r '.target_a' <<<"$task")")"
+          value="$(normalize_cname_target "$value")"
+          valid_domain "$value" && break; echo "目标A格式不正确。"
+        done
+        local new_ta="$value" new_tb
+        while true; do
+          new_tb="$(prompt_input "目标B" "$(jq -r '.target_b' <<<"$task")")"
+          new_tb="$(normalize_cname_target "$new_tb")"
+          valid_domain "$new_tb" && [[ "$new_tb" != "$new_ta" ]] && break; echo "目标B格式不正确，且建议不要与目标A相同。"
+        done
+        jq --arg id "$tid" --arg a "$new_ta" --arg b "$new_tb" '(.tasks[] | select(.id==$id)) |= (.target_a=$a | .target_b=$b)' "$CONFIG_FILE" | save_config_from_stdin
+        ;;
+      4)
+        local new_swap new_restore
+        while true; do
+          new_swap="$(prompt_input "切换时间" "$(jq -r '.swap_time' <<<"$task")")"
+          valid_hhmm "$new_swap" && break; echo "时间格式不正确。"
+        done
+        while true; do
+          new_restore="$(prompt_input "恢复时间" "$(jq -r '.restore_time' <<<"$task")")"
+          valid_hhmm "$new_restore" && [[ "$new_restore" != "$new_swap" ]] && break; echo "恢复时间格式不正确，且不能与切换时间相同。"
+        done
+        jq --arg id "$tid" --arg s "$new_swap" --arg r "$new_restore" '(.tasks[] | select(.id==$id)) |= (.swap_time=$s | .restore_time=$r)' "$CONFIG_FILE" | save_config_from_stdin
+        ;;
+      5)
+        local enabled new_enabled
+        enabled="$(jq -r '.enabled' <<<"$task")"
+        [[ "$enabled" == "true" ]] && new_enabled=false || new_enabled=true
+        jq --arg id "$tid" --argjson e "$new_enabled" '(.tasks[] | select(.id==$id)).enabled=$e' "$CONFIG_FILE" | save_config_from_stdin
+        ;;
+      0) return 0 ;;
+      *) echo "无效选项"; pause_enter ;;
+    esac
+    rm -f "${STATE_DIR}/task_${tid}.state" 2>/dev/null || true
+    log_msg INFO "已修改任务：${tid}"
+  done
 }
 
-# 删除任务。
 delete_task_menu() {
   print_header
   local tid
@@ -1005,32 +1108,34 @@ delete_task_menu() {
   log_msg INFO "已删除任务：${tid}"
 }
 
-# 编辑任务：提供重建式编辑，降低复杂度和 bug 率。
-edit_task_menu() {
+query_pair_dns_menu() {
   print_header
-  echo "编辑任务建议：删除旧任务后重新添加，避免复杂 JSON 手工修改导致错误。"
-  echo "当前版本也支持直接打开配置文件修改：${CONFIG_FILE}"
-  echo
-  list_tasks
-  echo
-  echo "可选操作："
-  echo "  1) 启用/停用任务"
-  echo "  2) 删除任务后重新创建"
-  echo "  0) 返回"
-  read -r -p "请选择: " ans || true
-  case "$ans" in
-    1) toggle_task_menu ;;
-    2) delete_task_menu; add_task_wizard ;;
-    0) return 0 ;;
-    *) echo "无效选项" ;;
-  esac
+  section_title "查看任务对应 DNS 当前状态"
+  local tid task zone_ref zone_json zone_id token
+  tid="$(select_task)" || return 0
+  task="$(jq -c --arg id "$tid" '.tasks[] | select(.id==$id)' "$CONFIG_FILE")"
+  zone_ref="$(jq -r '.zone_ref' <<<"$task")"
+  zone_json="$(jq -c --arg id "$zone_ref" '.zones[]? | select(.id==$id)' "$CONFIG_FILE")"
+  [[ -n "$zone_json" && "$zone_json" != "null" ]] || { echo "该任务引用的域名配置不存在。"; return 1; }
+  zone_id="$(jq -r '.zone_id' <<<"$zone_json")"
+  token="$(jq -r '.token' <<<"$zone_json")"
+
+  for name in "$(jq -r '.record_a' <<<"$task")" "$(jq -r '.record_b' <<<"$task")"; do
+    echo "────────────────────────────────────────"
+    echo "${name}"
+    local resp
+    resp="$(list_records_by_name "$zone_id" "$token" "$name")" || continue
+    if [[ "$(jq '.result | length' <<<"$resp")" -eq 0 ]]; then
+      echo "  当前不存在记录。"
+    else
+      jq -r '.result[] | "  \(.type) -> \(.content)  ttl=\(.ttl)  proxied=\(.proxied)"' <<<"$resp"
+    fi
+  done
 }
 
-# 手动修改指定 CNAME，不依赖任务。
 manual_update_cname_menu() {
   print_header
-  echo "手动立即修改 CNAME"
-  echo
+  section_title "手动立即修改 CNAME"
   local zone_ref zone_id token zone_name name target ttl proxied auto_create
   zone_ref="$(select_zone)" || return 0
   zone_id="$(jq -r --arg id "$zone_ref" '.zones[] | select(.id==$id) | .zone_id' "$CONFIG_FILE")"
@@ -1050,28 +1155,50 @@ manual_update_cname_menu() {
   update_or_create_cname "$zone_id" "$token" "$name" "$target" "$ttl" "$proxied" "$auto_create"
 }
 
-# 任务管理菜单。
+apply_task_mode_menu() {
+  print_header
+  section_title "立即执行指定任务"
+  local tid ans mode
+  tid="$(select_task)" || return 0
+  echo
+  echo "  1) 按当前时间自动判断"
+  echo "  2) 强制执行正常/恢复模式"
+  echo "  3) 强制执行互换模式"
+  echo "  0) 返回"
+  echo
+  read -r -p "请选择: " ans || true
+  case "$ans" in
+    1) mode=current ;;
+    2) mode=normal ;;
+    3) mode=swapped ;;
+    0) return 0 ;;
+    *) echo "无效选项"; return 1 ;;
+  esac
+  apply_pair_task_by_id "$tid" "$mode" "force"
+}
+
 task_menu() {
   while true; do
     print_header
-    echo "🧩 CNAME 切换任务管理"
-    echo
+    section_title "CNAME 成对互换任务"
     echo "  1) 查看任务"
-    echo "  2) 新增任务"
-    echo "  3) 编辑任务 / 启停任务"
+    echo "  2) 新增成对互换任务"
+    echo "  3) 编辑任务"
     echo "  4) 删除任务"
-    echo "  5) 手动立即修改 CNAME"
-    echo "  6) 立即执行所有启用任务"
+    echo "  5) 查看任务对应 DNS 当前状态"
+    echo "  6) 立即执行指定任务"
+    echo "  7) 手动立即修改任意 CNAME"
     echo "  0) 返回主菜单"
     echo
     read -r -p "请选择: " ans || true
     case "$ans" in
       1) list_tasks; pause_enter ;;
-      2) add_task_wizard; pause_enter ;;
-      3) edit_task_menu; pause_enter ;;
+      2) add_pair_task_wizard; pause_enter ;;
+      3) edit_pair_task_menu; pause_enter ;;
       4) delete_task_menu; pause_enter ;;
-      5) manual_update_cname_menu; pause_enter ;;
-      6) run_tasks force ""; pause_enter ;;
+      5) query_pair_dns_menu; pause_enter ;;
+      6) apply_task_mode_menu; pause_enter ;;
+      7) manual_update_cname_menu; pause_enter ;;
       0) return 0 ;;
       *) log_msg WARN "无效选项"; pause_enter ;;
     esac
@@ -1079,33 +1206,11 @@ task_menu() {
 }
 
 # ---------- 任务执行 ----------
-# 根据时区获取当前分钟数。
-current_minutes_of_day() {
-  local tz
-  tz="$(jq -r '.settings.timezone // "Asia/Shanghai"' "$CONFIG_FILE")"
-  TZ="$tz" date '+%H %M' | awk '{print $1*60+$2}'
+state_key_for_pair() {
+  local task_id="$1" mode="$2" targets_json="$3"
+  printf '%s|%s|%s' "$task_id" "$mode" "$(jq -cS '.' <<<"$targets_json")" | sha256sum | awk '{print $1}'
 }
 
-# 选择当前应该生效的 schedule index。
-select_schedule_index() {
-  local task_json="$1" now_min t h m min idx=0 best=-1 max_min=-1 max_idx=0 i=0
-  now_min="$(current_minutes_of_day)"
-  while IFS= read -r t; do
-    h="${t%:*}"; m="${t#*:}"; min=$((10#$h * 60 + 10#$m))
-    if (( min <= now_min && min >= best )); then best=$min; idx=$i; fi
-    if (( min > max_min )); then max_min=$min; max_idx=$i; fi
-    i=$((i+1))
-  done < <(jq -r '.schedule[].time' <<<"$task_json")
-  if (( best == -1 )); then echo "$max_idx"; else echo "$idx"; fi
-}
-
-# 生成任务状态 key。目标不变时不会重复调用 Cloudflare。
-schedule_state_key() {
-  local task_id="$1" schedule_json="$2"
-  printf '%s|%s' "$task_id" "$(jq -cS '.' <<<"$schedule_json")" | sha256sum | awk '{print $1}'
-}
-
-# 修改前备份记录。只备份脚本即将触碰的记录。
 backup_records() {
   local zone_id="$1" token="$2" names_input="$3" reason="$4" ts file tmp name resp
   ts="$(date +%Y%m%d_%H%M%S)"
@@ -1127,79 +1232,89 @@ backup_records() {
   log_msg INFO "已备份 DNS 状态：${file}"
 }
 
-# 执行单个任务。
-apply_task() {
-  local task_json="$1" force="${2:-normal}" task_id task_name zone_ref zone_json zone_id token idx schedule_json key state_file old_key auto_create ttl proxied names
+apply_pair_task_json() {
+  local task_json="$1" desired_mode="${2:-current}" force="${3:-normal}"
+  local task_id task_name zone_ref zone_json zone_id token mode targets_json key state_file old_key auto_create ttl proxied names
+
   task_id="$(jq -r '.id' <<<"$task_json")"
   task_name="$(jq -r '.name' <<<"$task_json")"
   zone_ref="$(jq -r '.zone_ref' <<<"$task_json")"
-  zone_json="$(jq -c --arg id "$zone_ref" '.zones[] | select(.id==$id)' "$CONFIG_FILE")"
+  zone_json="$(jq -c --arg id "$zone_ref" '.zones[]? | select(.id==$id)' "$CONFIG_FILE")"
   if [[ -z "$zone_json" || "$zone_json" == "null" ]]; then
     log_msg ERROR "任务 ${task_name} 引用的域名配置不存在：${zone_ref}"
     return 1
   fi
   zone_id="$(jq -r '.zone_id' <<<"$zone_json")"
   token="$(jq -r '.token' <<<"$zone_json")"
-  idx="$(select_schedule_index "$task_json")"
-  schedule_json="$(jq -c --argjson i "$idx" '.schedule[$i]' <<<"$task_json")"
-  key="$(schedule_state_key "$task_id" "$schedule_json")"
+
+  if [[ "$desired_mode" == "current" ]]; then
+    mode="$(pair_mode_by_time "$(jq -r '.swap_time' <<<"$task_json")" "$(jq -r '.restore_time' <<<"$task_json")")" || return 1
+  else
+    mode="$desired_mode"
+  fi
+  if [[ "$mode" != "normal" && "$mode" != "swapped" ]]; then
+    log_msg ERROR "任务 ${task_name} 的模式无效：${mode}"
+    return 1
+  fi
+
+  targets_json="$(pair_targets_json "$task_json" "$mode")"
+  key="$(state_key_for_pair "$task_id" "$mode" "$targets_json")"
   state_file="${STATE_DIR}/task_${task_id}.state"
   old_key="$(cat "$state_file" 2>/dev/null || true)"
 
   if [[ "$force" != "force" && "$key" == "$old_key" ]]; then
-    log_msg DEBUG "任务 ${task_name} 当前时间点已执行过，跳过。"
+    log_msg DEBUG "任务 ${task_name} 当前已经是 $(pair_mode_label "$mode")，跳过。"
     return 0
   fi
 
-  auto_create="$(jq -r '.auto_create_missing // .settings.auto_create_missing // true' <<<"$(jq --argjson task "$task_json" '. + {task:$task}' "$CONFIG_FILE")" 2>/dev/null || echo true)"
-  auto_create="$(jq -r --arg id "$task_id" '(.tasks[] | select(.id==$id) | .auto_create_missing) // .settings.auto_create_missing // true' "$CONFIG_FILE")"
-  names="$(jq -r '.targets | keys[]' <<<"$schedule_json")"
-  backup_records "$zone_id" "$token" "$names" "$task_id" || true
+  auto_create="$(jq -r '.auto_create_missing // true' <<<"$task_json")"
+  ttl="$(jq -r '.ttl // 1' <<<"$task_json")"
+  proxied="$(jq -r '.proxied // false' <<<"$task_json")"
+  names="$(jq -r 'keys[]' <<<"$targets_json")"
 
-  log_msg INFO "开始执行任务：${task_name}，时间点：$(jq -r '.time' <<<"$schedule_json")"
+  backup_records "$zone_id" "$token" "$names" "$task_id" || true
+  log_msg INFO "开始执行任务：${task_name}，模式：$(pair_mode_label "$mode")"
+
   while IFS= read -r name; do
     [[ -z "$name" ]] && continue
-    local target rec_conf
-    target="$(jq -r --arg n "$name" '.targets[$n]' <<<"$schedule_json")"
-    rec_conf="$(jq -c --arg n "$name" '.records[]? | select(.name==$n)' <<<"$task_json")"
-    ttl="$(jq -r '.ttl // 1' <<<"${rec_conf:-{}}")"
-    proxied="$(jq -r '.proxied // false' <<<"${rec_conf:-{}}")"
+    local target
+    target="$(jq -r --arg n "$name" '.[$n]' <<<"$targets_json")"
     update_or_create_cname "$zone_id" "$token" "$name" "$target" "$ttl" "$proxied" "$auto_create" || return 1
   done <<<"$names"
 
   echo "$key" > "$state_file"
   chmod 600 "$state_file"
-  log_msg INFO "任务完成：${task_name}"
+  log_msg INFO "任务完成：${task_name}，模式：$(pair_mode_label "$mode")"
 }
 
-# 执行所有启用任务，或指定任务。
+apply_pair_task_by_id() {
+  local task_id="$1" mode="${2:-current}" force="${3:-normal}" task_json
+  task_json="$(jq -c --arg id "$task_id" '.tasks[] | select(.id==$id and .task_type=="pair_swap")' "$CONFIG_FILE")"
+  [[ -n "$task_json" && "$task_json" != "null" ]] || { log_msg ERROR "未找到任务：${task_id}"; return 1; }
+  apply_pair_task_json "$task_json" "$mode" "$force"
+}
+
 run_tasks() {
-  local force="${1:-normal}" only_task="${2:-}" tasks
+  local force="${1:-normal}" tasks
   migrate_config
-  if [[ -n "$only_task" ]]; then
-    tasks="$(jq -c --arg id "$only_task" '[.tasks[] | select(.id==$id)]' "$CONFIG_FILE")"
-  else
-    tasks="$(jq -c '[.tasks[] | select(.enabled==true)]' "$CONFIG_FILE")"
-  fi
+  tasks="$(jq -c '[.tasks[] | select(.enabled==true and .task_type=="pair_swap")]' "$CONFIG_FILE")"
   if [[ "$(jq 'length' <<<"$tasks")" -eq 0 ]]; then
-    log_msg DEBUG "没有需要执行的启用任务。"
+    log_msg DEBUG "没有需要执行的启用成对互换任务。"
     return 0
   fi
   jq -c '.[]' <<<"$tasks" | while read -r task; do
-    apply_task "$task" "$force" || true
+    apply_pair_task_json "$task" "current" "$force" || true
   done
 }
 
 # ---------- 备份恢复 ----------
-# 列出备份。
 list_backups() {
   print_header
-  echo "DNS 备份列表"
+  section_title "DNS 备份列表"
   echo
   ls -1t "$BACKUP_DIR"/*.json 2>/dev/null | head -n 30 || echo "暂无备份。"
 }
 
-# 恢复最近一次备份中的 CNAME 目标。
 restore_backup_menu() {
   print_header
   local files file idx zone_ref zone_id token
@@ -1230,12 +1345,10 @@ restore_backup_menu() {
   log_msg INFO "备份恢复完成：${file}"
 }
 
-# 备份管理菜单。
 backup_menu() {
   while true; do
     print_header
-    echo "💾 备份 / 恢复"
-    echo
+    section_title "备份 / 恢复"
     echo "  1) 查看最近备份"
     echo "  2) 从备份恢复 CNAME 目标"
     echo "  0) 返回主菜单"
@@ -1251,20 +1364,18 @@ backup_menu() {
 }
 
 # ---------- 系统设置 ----------
-# 查看当前设置。
 show_settings() {
   print_header
-  echo "当前系统设置"
+  section_title "当前系统设置"
   echo
   jq '.settings' "$CONFIG_FILE"
   echo
   scheduler_status
 }
 
-# 设置日志等级。
 set_log_level_menu() {
   print_header
-  echo "选择日志等级："
+  section_title "日志等级"
   echo "  1) DEBUG  最详细，排障用"
   echo "  2) INFO   默认，记录主要动作"
   echo "  3) WARN   只记录警告和错误"
@@ -1284,12 +1395,11 @@ set_log_level_menu() {
   log_msg INFO "日志等级已设置为：${level}"
 }
 
-# 设置 curl 网络参数。
 set_curl_menu() {
   print_header
+  section_title "curl 网络参数"
   local http retry delay conn max
-  echo "curl 网络参数设置"
-  echo "建议：HTTP 版本保持 1.1；v1.4 已改为脚本内置重试，兼容旧版 curl。"
+  echo "建议：HTTP 版本保持 1.1；旧版 curl 也可以使用脚本内置重试。"
   http="$(prompt_input "HTTP 版本，填 1.1 或 2" "$(jq -r '.settings.http_version' "$CONFIG_FILE")")"
   [[ "$http" == "2" || "$http" == "2.0" ]] && http="2" || http="1.1"
   retry="$(prompt_input "失败重试次数" "$(jq -r '.settings.curl_retry' "$CONFIG_FILE")")"
@@ -1306,9 +1416,9 @@ set_curl_menu() {
   log_msg INFO "curl 网络参数已更新。"
 }
 
-# 设置时区和自动创建策略。
 set_general_menu() {
   print_header
+  section_title "通用设置"
   local tz auto ttl proxied
   tz="$(prompt_input "定时判断时区" "$(jq -r '.settings.timezone' "$CONFIG_FILE")")"
   echo "缺失 CNAME 记录时是否自动创建？"
@@ -1325,12 +1435,10 @@ set_general_menu() {
   log_msg INFO "通用设置已更新。"
 }
 
-# 系统设置菜单。
 settings_menu() {
   while true; do
     print_header
-    echo "⚙️  系统设置 / 日志等级"
-    echo
+    section_title "系统设置"
     echo "  1) 查看当前设置和定时器状态"
     echo "  2) 设置日志等级"
     echo "  3) 设置 curl 网络参数"
@@ -1358,31 +1466,40 @@ settings_menu() {
 }
 
 # ---------- 快速初始化 ----------
-# 一站式初始化：添加 Zone、添加任务、启用定时器、可立即执行。
 quick_init_wizard() {
   print_header
-  echo "🚀 快速初始化向导"
+  section_title "快速初始化向导"
+  echo "推荐流程："
+  echo "  1. 添加或选择 Cloudflare 域名配置"
+  echo "  2. 创建一组成对互换任务"
+  echo "  3. 启用定时器"
   echo
-  echo "这个向导会依次完成："
-  echo "  1. 添加 Cloudflare 域名配置"
-  echo "  2. 测试 API 权限"
-  echo "  3. 添加一个或多个 CNAME 记录"
-  echo "  4. 添加一个或多个切换时间点"
-  echo "  5. 启用定时器"
+  echo "目标模型："
+  echo "  正常：记录A -> 目标A，记录B -> 目标B"
+  echo "  21:00：记录A -> 目标B，记录B -> 目标A"
+  echo "  02:00：记录A -> 目标A，记录B -> 目标B"
   echo
   confirm_select "是否开始快速初始化？" || return 0
-  add_zone_wizard || { echo "域名配置失败，向导已停止。"; return 1; }
-  add_task_wizard || { echo "任务创建失败，向导已停止。"; return 1; }
+
+  if [[ "$(jq '.zones | length' "$CONFIG_FILE")" -eq 0 ]]; then
+    add_zone_wizard || { echo "域名配置失败，向导已停止。"; return 1; }
+  else
+    echo "已检测到域名配置。"
+    if confirm_select "是否新增一个域名配置？选择取消则使用已有配置。"; then
+      add_zone_wizard || { echo "域名配置失败，向导已停止。"; return 1; }
+    fi
+  fi
+
+  add_pair_task_wizard || { echo "任务创建失败，向导已停止。"; return 1; }
   setup_scheduler || true
   echo
   echo "快速初始化完成。以后输入 sudo cfcname 即可管理。"
 }
 
 # ---------- 自检 ----------
-# 检查依赖、配置、定时器、API Token 是否为空。
 self_check() {
   print_header
-  echo "🔎 自检"
+  section_title "自检"
   echo
   local ok=1
   for cmd in curl jq flock; do
@@ -1390,11 +1507,6 @@ self_check() {
   done
   if command -v curl >/dev/null 2>&1; then
     echo "ℹ️  curl 版本：$(curl --version | head -n 1)"
-    if curl_supports_option --retry-all-errors; then
-      echo "✅ curl 支持 --retry-all-errors；但 v1.4 已不再依赖它。"
-    else
-      echo "✅ curl 不支持 --retry-all-errors；v1.4 已使用脚本内置重试兼容旧版 curl。"
-    fi
     if curl_supports_option --http1.1; then
       echo "✅ curl 支持 --http1.1"
     else
@@ -1403,11 +1515,15 @@ self_check() {
   fi
   if validate_config_file; then echo "✅ 配置 JSON 正常：${CONFIG_FILE}"; else echo "❌ 配置 JSON 异常：${CONFIG_FILE}"; ok=0; fi
   if [[ -x "$INSTALL_BIN" ]]; then echo "✅ 管理命令存在：${INSTALL_BIN}"; else echo "⚠️  管理命令不存在：${INSTALL_BIN}"; fi
-  local empty_tokens bad_zone
+  local empty_tokens bad_zone pair_count legacy_count
   empty_tokens="$(jq '[.zones[]? | select((.token // "") == "")] | length' "$CONFIG_FILE" 2>/dev/null || echo 0)"
   bad_zone="$(jq -r '.zones[]? | select((.zone_id|test("^[a-fA-F0-9]{32}$")|not)) | .name + " => " + .zone_id' "$CONFIG_FILE" 2>/dev/null || true)"
+  pair_count="$(jq '[.tasks[]? | select(.task_type=="pair_swap")] | length' "$CONFIG_FILE" 2>/dev/null || echo 0)"
+  legacy_count="$(jq '[.tasks[]? | select(.task_type=="legacy")] | length' "$CONFIG_FILE" 2>/dev/null || echo 0)"
   [[ "$empty_tokens" -eq 0 ]] && echo "✅ 未发现空 Token" || { echo "❌ 发现空 Token 配置：${empty_tokens} 个"; ok=0; }
   if [[ -n "$bad_zone" ]]; then echo "❌ 发现格式异常的 Zone ID："; echo "$bad_zone"; ok=0; else echo "✅ Zone ID 格式检查通过"; fi
+  echo "✅ 成对互换任务数量：${pair_count}"
+  [[ "$legacy_count" -eq 0 ]] || echo "⚠️  旧版通用任务数量：${legacy_count}，建议重新创建为成对互换任务。"
   echo
   scheduler_status
   echo
@@ -1420,9 +1536,11 @@ main_menu() {
   migrate_config
   while true; do
     print_header
-    echo "  1) 🚀 快速初始化向导"
-    echo "  2) 🌐 域名 / Token 配置管理"
-    echo "  3) 🧩 CNAME 切换任务管理"
+    echo "推荐：第一次使用选 1；日常改互换规则选 3；排障选 6。"
+    echo
+    echo "  1) 🚀 快速初始化：创建 21点互换 / 2点恢复任务"
+    echo "  2) 🌐 域名 / Token 配置"
+    echo "  3) 🔁 CNAME 成对互换任务"
     echo "  4) 💾 备份 / 恢复"
     echo "  5) ⚙️  系统设置 / 日志等级"
     echo "  6) 🔎 自检"
@@ -1438,7 +1556,7 @@ main_menu() {
       4) backup_menu ;;
       5) settings_menu ;;
       6) self_check; pause_enter ;;
-      7) run_tasks force ""; pause_enter ;;
+      7) run_tasks force; pause_enter ;;
       8) uninstall_self; pause_enter ;;
       0) exit 0 ;;
       *) log_msg WARN "无效选项"; pause_enter ;;
@@ -1457,6 +1575,10 @@ cfcname v${APP_VERSION}
   sudo cfcname run --force                       立即强制执行所有启用任务
   sudo cfcname self-check                        自检
   sudo cfcname uninstall                         卸载
+
+核心逻辑：
+  正常/恢复模式：记录A -> 目标A，记录B -> 目标B
+  互换模式：记录A -> 目标B，记录B -> 目标A
 
 配置路径：${CONFIG_FILE}
 日志路径：${LOG_FILE}
@@ -1481,7 +1603,7 @@ main() {
         esac
         shift || true
       done
-      run_tasks "$force" ""
+      run_tasks "$force"
       ;;
     self-check|check) need_root; migrate_config; self_check ;;
     help|-h|--help) usage ;;

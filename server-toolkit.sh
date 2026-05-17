@@ -1,10 +1,10 @@
 #!/bin/bash
 set -u
 
-SERVER_TOOLKIT_VERSION="v1.8"
+SERVER_TOOLKIT_VERSION="v1.9"
 
 # ============================================================
-# server-toolkit.sh v1.8
+# server-toolkit.sh v1.9
 # 适用：Debian / Ubuntu / CentOS / RHEL-like
 # 原则：先备份、先检测、尽量不破坏当前 SSH 会话。
 # ============================================================
@@ -21,6 +21,31 @@ echo_dim()   { echo -e "\e[2m$1\e[0m"; }
 pause_return() {
   echo
   read -r -p "按 Enter 返回菜单..."
+}
+
+# ========== UI 辅助函数（v1.9 统一风格） ==========
+ui_hr() {
+  printf "\e[1;36m%s\e[0m\n" "────────────────────────────────────────────────────────────"
+}
+
+ui_title() {
+  echo
+  ui_hr
+  printf "\e[1;35m  %s\e[0m\n" "$1"
+  ui_hr
+}
+
+ui_option() {
+  # 用简单行式菜单代替复杂边框，避免中文宽度在不同终端错位。
+  printf "  \e[1;32m%-4s\e[0m %s\n" "$1)" "$2"
+}
+
+ui_back() {
+  printf "  \e[1;31m%-4s\e[0m %s\n" "0)" "返回"
+}
+
+ui_prompt() {
+  read -r -p "请选择: " "$1"
 }
 
 # ========== 基础检测 ==========
@@ -87,7 +112,7 @@ set_sshd_kv() {
 get_current_ssh_ports() {
   local ports
   ports="$(sshd -T 2>/dev/null | awk '$1=="port"{print $2}' | sort -n | paste -sd, - 2>/dev/null || true)"
-  # v1.8：如果 sshd -T 不可用，回退到数字 22，避免防火墙放行时因 "ssh" 字符串被跳过。
+  # v1.9：如果 sshd -T 不可用，回退到数字 22，避免防火墙放行时因 "ssh" 字符串被跳过。
   if [ -z "$ports" ]; then
     ports="22"
   fi
@@ -96,34 +121,32 @@ get_current_ssh_ports() {
 
 # ========== 1. 时间同步 ==========
 time_sync() {
-  echo_color "正在配置 HTTP 时间同步（每30分钟自动同步）..."
+  ui_title "时间同步 · ntpdate + cron"
+  echo_color "正在配置 ntpdate 时间同步（每30分钟自动同步）..."
 
-  # v1.8 修复点：
-  # 1) 不再使用 curl -f，避免 403/301/302 等响应中明明有 Date 头却被当成失败。
-  # 2) 增加多个纯 HTTP 时间源，并同时尝试 HEAD / GET 取响应头。
-  # 3) 写入失败日志，方便判断是网络问题、Date 解析问题，还是系统不允许改时间。
-  # 4) 检查并安装 cron/cronie，避免写入 crontab 后实际没有定时服务。
+  # v1.9：按用户要求移除 HTTP Date Header 同步，恢复更传统的 ntpdate + cron。
+  # 同时清理 v1.8 写入的 HTTP 时间同步脚本和 cron 任务，避免两套同步逻辑并存。
 
-  if ! command -v curl >/dev/null 2>&1; then
-    echo_warn "未检测到 curl，正在安装..."
+  if ! command -v ntpdate >/dev/null 2>&1; then
+    echo_warn "未检测到 ntpdate，正在安装..."
     if is_redhat; then
-      yum install -y curl
+      yum install -y ntpdate || yum install -y ntp || true
     else
-      apt-get update -y && apt-get install -y curl
+      apt-get update -y && (apt-get install -y ntpdate || apt-get install -y ntpsec-ntpdate || true)
     fi
   fi
 
   if ! command -v crontab >/dev/null 2>&1; then
     echo_warn "未检测到 crontab，正在安装 cron 服务..."
     if is_redhat; then
-      yum install -y cronie
+      yum install -y cronie || true
     else
-      apt-get update -y && apt-get install -y cron
+      apt-get update -y && apt-get install -y cron || true
     fi
   fi
 
-  if ! command -v curl >/dev/null 2>&1; then
-    echo_error "curl 仍不可用，无法配置 HTTP 时间同步。请先修复软件源或手动安装 curl。"
+  if ! command -v ntpdate >/dev/null 2>&1; then
+    echo_error "ntpdate 仍不可用，无法配置 ntpdate 时间同步。请先修复软件源后再试。"
     return 1
   fi
 
@@ -132,103 +155,63 @@ time_sync() {
     return 1
   fi
 
-  local sync_bin="/usr/local/sbin/server-toolkit-http-time-sync"
-  local log_file="/var/log/server-toolkit-http-time-sync.log"
+  local sync_bin="/usr/local/sbin/server-toolkit-ntpdate-sync"
+  local log_file="/var/log/server-toolkit-ntpdate-sync.log"
 
   cat > "$sync_bin" <<'EOF'
 #!/bin/sh
-# server-toolkit: HTTP Date header time sync v1.8
-# 通过 HTTP 响应头 Date 字段校准系统时间，不依赖 NTP/chrony。
-# 如果 HTTP 被劫持、运营商/服务商改写 Date，时间可能不准确；生产环境更推荐 chrony/NTP。
+# server-toolkit: ntpdate time sync v1.9
+# 每次依次尝试多个 NTP 时间源；成功一个即退出。
+# -u 使用非特权源端口，能绕过部分网络环境下的 NTP 端口限制。
 
-LOG_FILE="/var/log/server-toolkit-http-time-sync.log"
-USER_AGENT="server-toolkit-http-time-sync/1.8"
-URLS="http://cp.cloudflare.com/generate_204 http://www.gstatic.com/generate_204 http://connectivitycheck.gstatic.com/generate_204 http://detectportal.firefox.com/success.txt http://www.msftconnecttest.com/connecttest.txt http://example.com/ http://neverssl.com/ http://www.baidu.com/ http://www.qq.com/ http://www.aliyun.com/"
+LOG_FILE="/var/log/server-toolkit-ntpdate-sync.log"
+NTP_BIN="$(command -v ntpdate 2>/dev/null || echo /usr/sbin/ntpdate)"
+SERVERS="time.google.com time.cloudflare.com"
 
 log_msg() {
   printf '%s %s\n' "$(date '+%F %T %Z' 2>/dev/null)" "$*" >> "$LOG_FILE" 2>/dev/null || true
 }
 
-extract_date_header() {
-  # 取最后一个 Date 头：遇到跳转时，最后一个响应通常更接近最终服务器时间。
-  awk 'BEGIN{IGNORECASE=1} /^date:[[:space:]]*/ {sub(/^date:[[:space:]]*/,""); d=$0} END{gsub(/\r/,"",d); print d}'
-}
+if [ ! -x "$NTP_BIN" ]; then
+  log_msg "FAIL ntpdate_not_found path=$NTP_BIN"
+  exit 1
+fi
 
-fetch_date_by_head() {
-  curl -sS -I --http1.1 --connect-timeout 5 --max-time 10 -A "$USER_AGENT" "$1" 2>/dev/null | extract_date_header
-}
-
-fetch_date_by_get() {
-  curl -sS --http1.1 --connect-timeout 5 --max-time 10 -A "$USER_AGENT" -D - -o /dev/null "$1" 2>/dev/null | extract_date_header
-}
-
-set_time_from_http_date() {
-  http_date="$1"
-  src_url="$2"
-
-  [ -n "$http_date" ] || return 1
-
-  epoch=$(LC_ALL=C date -u -d "$http_date" '+%s' 2>/dev/null || true)
-  if [ -z "$epoch" ]; then
-    log_msg "PARSE_FAILED url=$src_url date=$http_date"
-    return 1
-  fi
-
-  if date -u -s "@$epoch" >/dev/null 2>&1; then
+for server in $SERVERS; do
+  if "$NTP_BIN" -u "$server" >> "$LOG_FILE" 2>&1; then
     command -v hwclock >/dev/null 2>&1 && hwclock -w >/dev/null 2>&1 || true
-    log_msg "OK url=$src_url date=$http_date epoch=$epoch"
-    return 0
-  fi
-
-  log_msg "SET_FAILED url=$src_url date=$http_date epoch=$epoch maybe_no_permission_or_readonly_system"
-  return 1
-}
-
-if ! command -v curl >/dev/null 2>&1; then
-  log_msg "FAIL curl_not_found"
-  exit 1
-fi
-
-if ! command -v date >/dev/null 2>&1; then
-  log_msg "FAIL date_not_found"
-  exit 1
-fi
-
-for url in $URLS; do
-  http_date=$(fetch_date_by_head "$url")
-  if set_time_from_http_date "$http_date" "$url"; then
+    log_msg "OK server=$server"
     exit 0
+  else
+    log_msg "TRY_FAILED server=$server"
   fi
-
-  http_date=$(fetch_date_by_get "$url")
-  if set_time_from_http_date "$http_date" "$url"; then
-    exit 0
-  fi
-
-  log_msg "TRY_FAILED url=$url"
 done
 
-log_msg "FAIL all_http_sources_failed"
+log_msg "FAIL all_ntp_servers_failed"
 exit 1
 EOF
   chmod +x "$sync_bin"
 
-  # 先确保 cron 服务存在并运行。不同系统服务名不同：Debian/Ubuntu=cron，CentOS/RHEL=crond。
+  # 启动 cron 服务。不同系统服务名不同：Debian/Ubuntu=cron，CentOS/RHEL=crond。
   if systemctl list-unit-files 2>/dev/null | grep -q '^cron\.service'; then
     systemctl enable --now cron >/dev/null 2>&1 || true
   elif systemctl list-unit-files 2>/dev/null | grep -q '^crond\.service'; then
     systemctl enable --now crond >/dev/null 2>&1 || true
   fi
 
-  local marker="# server-toolkit: http_time_sync"
+  # 清理 v1.8 HTTP 时间同步遗留项。
+  rm -f /usr/local/sbin/server-toolkit-http-time-sync 2>/dev/null || true
+
+  local marker_ntp="# server-toolkit: time_sync"
+  local marker_http="# server-toolkit: http_time_sync"
   local tmpcron
   tmpcron="$(mktemp /tmp/server-toolkit-cron.XXXXXX)" || {
     echo_error "创建临时 crontab 文件失败。"
     return 1
   }
 
-  crontab -l 2>/dev/null | grep -v "$marker" > "$tmpcron" || true
-  echo "*/30 * * * * $sync_bin >/dev/null 2>&1 $marker" >> "$tmpcron"
+  crontab -l 2>/dev/null | grep -v "$marker_ntp" | grep -v "$marker_http" > "$tmpcron" || true
+  echo "*/30 * * * * $sync_bin >/dev/null 2>&1 $marker_ntp" >> "$tmpcron"
 
   if crontab "$tmpcron"; then
     rm -f "$tmpcron"
@@ -239,13 +222,13 @@ EOF
   fi
 
   if "$sync_bin"; then
-    echo_color "HTTP 时间同步成功：$(date '+%F %T %Z')"
-    echo_color "HTTP 时间同步配置完成：每30分钟同步一次（cron）。"
+    echo_color "ntpdate 时间同步成功：$(date '+%F %T %Z')"
+    echo_color "时间同步配置完成：每30分钟执行一次 ntpdate（cron）。"
   else
-    echo_warn "HTTP 时间同步本次立即执行失败，但同步脚本与 cron 已安装。"
-    echo_warn "可能原因：HTTP 出口被拦截、所有时间源不可达、系统不允许 date -s 修改时间，或容器/虚拟化限制 CAP_SYS_TIME。"
+    echo_warn "ntpdate 本次立即同步失败；已写入每30分钟自动同步任务。"
+    echo_warn "可能原因：NTP 出口被限制、时间源不可达、系统不允许修改时间，或容器/虚拟化限制 CAP_SYS_TIME。"
     echo_info "最近日志：$log_file"
-    tail -n 8 "$log_file" 2>/dev/null || true
+    tail -n 10 "$log_file" 2>/dev/null || true
   fi
 }
 
@@ -256,6 +239,8 @@ allow_ssh_ports_before_firewall_enable() {
   [ -z "$ports" ] && ports="22"
   for p in ${ports//,/ }; do
     if [[ "$p" =~ ^[0-9]+$ ]]; then
+      # firewalld 未启动时 firewall-cmd 可能失败，因此优先尝试 firewall-offline-cmd。
+      firewall-offline-cmd --add-port="${p}/tcp" >/dev/null 2>&1 || true
       firewall-cmd --permanent --add-port="${p}/tcp" >/dev/null 2>&1 || true
       ufw allow "${p}/tcp" >/dev/null 2>&1 || true
     fi
@@ -272,7 +257,7 @@ firewall_status() {
 manage_firewall() {
   while true; do
     echo
-    echo_info "防火墙管理"
+    ui_title "防火墙管理"
     echo "1) 查看防火墙状态"
     echo "2) 开启防火墙（自动放行当前 SSH 端口，尽量避免断连）"
     echo "3) 关闭防火墙"
@@ -289,6 +274,7 @@ manage_firewall() {
         allow_ssh_ports_before_firewall_enable
         if command -v firewall-cmd >/dev/null 2>&1 || systemctl list-unit-files | grep -q '^firewalld\.service'; then
           systemctl enable --now firewalld 2>/dev/null || true
+          allow_ssh_ports_before_firewall_enable
           firewall-cmd --reload >/dev/null 2>&1 || true
           echo_color "firewalld 已尝试开启，并已放行当前 SSH 端口。"
         elif command -v ufw >/dev/null 2>&1; then
@@ -319,7 +305,7 @@ manage_firewall() {
 manage_selinux() {
   while true; do
     echo
-    echo_info "SELinux 管理"
+    ui_title "SELinux 管理"
     if command -v getenforce >/dev/null 2>&1; then
       echo "当前状态: $(getenforce 2>/dev/null || true)"
     else
@@ -406,7 +392,7 @@ ssh_security_custom() {
 
   while true; do
     echo
-    echo_info "SSH 安全性增强 - 逐项配置"
+    ui_title "SSH 安全性增强 · 逐项配置"
     echo "1) MaxAuthTries：限制单次连接最大认证失败次数；优点：降低暴力破解效率；坏处：输错几次会断开。"
     echo "2) LoginGraceTime：限制登录认证窗口；优点：减少僵尸连接；坏处：弱网下登录时间更短。"
     echo "3) PermitEmptyPasswords：禁止空密码；强烈建议 no。"
@@ -479,7 +465,7 @@ secure_ssh() {
 
   while true; do
     echo
-    echo_info "SSH 安全性增强向导"
+    ui_title "SSH 安全性增强向导"
     echo "1) 查看当前 SSH 关键配置"
     echo "2) 一键保守增强（不禁 root、不禁密码、不改端口）"
     echo "3) 逐项配置（带说明）"
@@ -668,7 +654,7 @@ fail2ban_unban_ip() {
 manage_fail2ban() {
   while true; do
     echo
-    echo_info "Fail2Ban 管理"
+    ui_title "Fail2Ban 管理"
     echo "1) 安装/写入默认 SSH 防护配置（自动识别 SSH 端口）"
     echo "2) 自动识别当前 SSH 端口并刷新 Fail2Ban 配置"
     echo "3) 查看 Fail2Ban 服务状态"
@@ -849,7 +835,7 @@ generate_key_login_and_output_private() {
 configure_key_login() {
   while true; do
     echo
-    echo_info "SSH 密钥登录配置"
+    ui_title "SSH 密钥登录配置"
     echo "1) 粘贴已有公钥并写入 authorized_keys"
     echo "2) 自动生成 ed25519 密钥对，并输出私钥"
     echo "0) 返回"
@@ -865,6 +851,7 @@ configure_key_login() {
 }
 
 toggle_password_login() {
+  ui_title "密码登录开关"
   echo_warn "关闭密码登录前，必须确认你已经可以用密钥登录，否则可能无法登录服务器。"
   echo "1) 开启密码登录"
   echo "2) 关闭密码登录"
@@ -905,6 +892,7 @@ toggle_password_login() {
 }
 
 manage_root_login_user() {
+  ui_title "root 登录 / sudo 用户管理"
   echo_warn "关闭 root 登录前，必须新建并测试普通 sudo 用户，否则可能无法管理服务器。"
   echo "1) 新增 sudo 用户，并关闭 root SSH 登录"
   echo "2) 恢复 root SSH 登录"
@@ -1012,7 +1000,7 @@ change_ssh_port_password() {
   [ -f "$SSH_CONFIG_FILE" ] || { echo_error "找不到 $SSH_CONFIG_FILE"; return 1; }
 
   while true; do
-    echo
+    ui_title "SSH 端口 / 密码 / 密钥 / root 管理"
     echo_color "请不要关闭当前 SSH 连接，另开终端测试新连接是否成功！"
     echo "1) 只修改 SSH 端口"
     echo "2) 只修改 root 密码"
@@ -1180,17 +1168,18 @@ setup_cron_reboot() {
   fi
 
   local marker="# server-toolkit: reboot"
-  crontab -l 2>/dev/null | grep -v "$marker" > /tmp/cron.tmp || true
-  echo "0 */$interval * * * /sbin/reboot $marker" >> /tmp/cron.tmp
-  crontab /tmp/cron.tmp
-  rm -f /tmp/cron.tmp
+  local tmpcron
+  tmpcron="$(mktemp /tmp/server-toolkit-cron.XXXXXX)" || { echo_error "创建临时 crontab 文件失败。"; return 1; }
+  crontab -l 2>/dev/null | grep -v "$marker" > "$tmpcron" || true
+  echo "0 */$interval * * * /sbin/reboot $marker" >> "$tmpcron"
+  crontab "$tmpcron" && rm -f "$tmpcron" || { rm -f "$tmpcron"; echo_error "写入 crontab 失败。"; return 1; }
 
   echo_color "已设置每隔 $interval 小时自动重启系统。"
 }
 
 # ========== 11. 哪吒面板管理 ==========
 setup_nezha_agent_restart_cron() {
-  local interval marker
+  local interval marker tmpcron
   read -r -p "请输入每隔多少小时重启 nezha-agent（例如 12，输入 q 取消）: " interval
   [[ "$interval" =~ ^[Qq]$ ]] && { echo_warn "已取消。"; return 0; }
   if ! [[ "$interval" =~ ^[0-9]+$ ]] || [ "$interval" -lt 1 ] || [ "$interval" -gt 720 ]; then
@@ -1198,25 +1187,26 @@ setup_nezha_agent_restart_cron() {
     return 1
   fi
   marker="# server-toolkit: nezha-agent-restart"
-  crontab -l 2>/dev/null | grep -v "$marker" > /tmp/cron.tmp || true
-  echo "0 */$interval * * * systemctl restart nezha-agent >/dev/null 2>&1 $marker" >> /tmp/cron.tmp
-  crontab /tmp/cron.tmp
-  rm -f /tmp/cron.tmp
+  tmpcron="$(mktemp /tmp/server-toolkit-cron.XXXXXX)" || { echo_error "创建临时 crontab 文件失败。"; return 1; }
+  crontab -l 2>/dev/null | grep -v "$marker" > "$tmpcron" || true
+  echo "0 */$interval * * * systemctl restart nezha-agent >/dev/null 2>&1 $marker" >> "$tmpcron"
+  crontab "$tmpcron" && rm -f "$tmpcron" || { rm -f "$tmpcron"; echo_error "写入 crontab 失败。"; return 1; }
   echo_color "已设置每隔 $interval 小时自动重启 nezha-agent。"
 }
 
 remove_nezha_agent_restart_cron() {
   local marker="# server-toolkit: nezha-agent-restart"
-  crontab -l 2>/dev/null | grep -v "$marker" > /tmp/cron.tmp || true
-  crontab /tmp/cron.tmp
-  rm -f /tmp/cron.tmp
+  local tmpcron
+  tmpcron="$(mktemp /tmp/server-toolkit-cron.XXXXXX)" || { echo_error "创建临时 crontab 文件失败。"; return 1; }
+  crontab -l 2>/dev/null | grep -v "$marker" > "$tmpcron" || true
+  crontab "$tmpcron" && rm -f "$tmpcron" || { rm -f "$tmpcron"; echo_error "写入 crontab 失败。"; return 1; }
   echo_color "已移除 nezha-agent 定期重启任务。"
 }
 
 manage_nezha() {
   while true; do
     echo
-    echo_info "哪吒面板管理"
+    ui_title "哪吒面板管理"
     echo "1) 重启哪吒 Agent"
     echo "2) 重启哪吒 Dashboard"
     echo "3) 重启 Agent + Dashboard"
@@ -1289,7 +1279,7 @@ update_grub_ipv6_param() {
 }
 
 manage_ipv6() {
-  echo_color "IPv6 一键开启/关闭"
+  ui_title "IPv6 一键开启/关闭"
   echo_warn  "关闭 IPv6 将写入 sysctl + GRUB 参数，重启后也尽量保持生效。"
 
   local conf="/etc/sysctl.d/99-server-toolkit-ipv6.conf"
@@ -1572,7 +1562,7 @@ one_click_safe_hardening() {
 server_hardening() {
   while true; do
     echo
-    echo_info "服务器加固（保守模式，不主动影响 SSH 登录）"
+    ui_title "服务器加固（保守模式）"
     echo "1) 一键保守加固（sysctl + Copy Fail 临时缓解 + Fail2Ban端口刷新）"
     echo "2) 仅应用 CVE-2026-31431 / Copy Fail 临时缓解"
     echo "3) 移除 CVE-2026-31431 临时缓解"
@@ -1614,16 +1604,25 @@ get_os_codename() {
 }
 
 curl_has_release() {
-  local base="$1" suite="$2"
-  curl -fsIL --max-time 8 "${base%/}/dists/${suite}/InRelease" >/dev/null 2>&1 || \
-  curl -fsIL --max-time 8 "${base%/}/dists/${suite}/Release" >/dev/null 2>&1
+  local base="$1" suite="$2" url1 url2
+  url1="${base%/}/dists/${suite}/InRelease"
+  url2="${base%/}/dists/${suite}/Release"
+
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsIL --max-time 8 "$url1" >/dev/null 2>&1 || curl -fsIL --max-time 8 "$url2" >/dev/null 2>&1
+  elif command -v wget >/dev/null 2>&1; then
+    wget --spider -q --timeout=8 "$url1" >/dev/null 2>&1 || wget --spider -q --timeout=8 "$url2" >/dev/null 2>&1
+  else
+    echo_warn "未检测到 curl/wget，无法自动检测源有效性。"
+    return 1
+  fi
 }
 
 write_ubuntu_sources() {
   local base="$1" code="$2"
   backup_file /etc/apt/sources.list
   cat > /etc/apt/sources.list <<EOF
-# server-toolkit v1.7 generated Ubuntu sources
+# server-toolkit v1.9 generated Ubuntu sources
 # base: $base
 deb ${base} ${code} main restricted universe multiverse
 deb ${base} ${code}-updates main restricted universe multiverse
@@ -1636,7 +1635,7 @@ write_debian_sources() {
   local base="$1" secbase="$2" code="$3"
   backup_file /etc/apt/sources.list
   cat > /etc/apt/sources.list <<EOF
-# server-toolkit v1.7 generated Debian sources
+# server-toolkit v1.9 generated Debian sources
 # base: $base
 deb ${base} ${code} main contrib non-free non-free-firmware
 deb ${base} ${code}-updates main contrib non-free non-free-firmware
@@ -1771,7 +1770,7 @@ new_server_full_update() {
 new_server_init_menu() {
   while true; do
     echo
-    echo_info "新服务器初始化 / 源修复 / 更新"
+    ui_title "新服务器初始化 / 源修复 / 更新"
     echo "1) 自动检测并修复 APT 源（含旧发行版 old-releases/archive 修复）"
     echo "2) 保守更新：安装 wget/curl/sudo/vim/git/unzip，并顺带升级 OpenSSH"
     echo "3) 全量更新：upgrade/dist-upgrade/full-upgrade/autoremove + 常用工具 + OpenSSH"
@@ -1791,25 +1790,13 @@ new_server_init_menu() {
   done
 }
 
-# ========== 菜单：双竖排（v1.7 UI 修正版） ==========
-# 说明：上一版直接用 printf 宽度对齐中文，部分终端会因为中文双宽字符导致边框错位。
-# v1.7 只调整菜单 UI：新增显示宽度估算与自动补空格，不改变功能逻辑。
-menu_repeat() {
-  local char="$1"
-  local count="$2"
-  local i
-  for ((i=0; i<count; i++)); do
-    printf "%s" "$char"
-  done
-}
-
+# ========== 菜单：双竖排（v1.9 统一 UI） ==========
+# 说明：v1.9 取消复杂满框中文对齐，改为稳定双栏列表，避免不同终端/字体下错位。
 menu_text_width() {
   local text="$1"
   local chars bytes wide
   chars=$(printf "%s" "$text" | wc -m | awk '{print $1}')
   bytes=$(printf "%s" "$text" | wc -c | awk '{print $1}')
-  # 近似处理：常见中文为 UTF-8 三字节、显示宽度 2。
-  # 公式能解决菜单中文项目错位问题；菜单项避免使用 emoji，保证兼容性。
   wide=$(( (bytes - chars) / 2 ))
   echo $((chars + wide))
 }
@@ -1825,59 +1812,34 @@ menu_pad_right() {
   done
 }
 
-menu_line() {
-  local left="$1"
-  local right="$2"
-  printf "\e[1;36m║\e[0m  \e[1;32m"
-  menu_pad_right "$left" 36
-  printf "\e[0m\e[1;36m │ \e[0m\e[1;32m"
+menu_row() {
+  local left="$1" right="$2"
+  printf "  \e[1;32m"
+  menu_pad_right "$left" 38
+  printf "\e[0m │ \e[1;32m"
   menu_pad_right "$right" 38
-  printf "\e[0m \e[1;36m║\e[0m\n"
-}
-
-menu_title_line() {
-  local title="server-toolkit ${SERVER_TOOLKIT_VERSION} - Linux 服务器工具箱"
-  printf "\e[1;36m║\e[0m  \e[1;35m"
-  menu_pad_right "$title" 77
-  printf "\e[0m \e[1;36m║\e[0m\n"
-}
-
-menu_exit_line() {
-  local left="$1"
-  local right="$2"
-  printf "\e[1;36m║\e[0m  \e[1;32m"
-  menu_pad_right "$left" 36
-  printf "\e[0m\e[1;36m │ \e[0m\e[1;31m"
-  menu_pad_right "$right" 38
-  printf "\e[0m \e[1;36m║\e[0m\n"
+  printf "\e[0m\n"
 }
 
 print_menu() {
   [ -n "${TERM:-}" ] && clear 2>/dev/null || true
-  printf "\e[1;36m╔"
-  menu_repeat "═" 80
-  printf "╗\e[0m\n"
-  menu_title_line
-  printf "\e[1;36m╠"
-  menu_repeat "═" 39
-  printf "╦"
-  menu_repeat "═" 40
-  printf "╣\e[0m\n"
-
-  menu_line "1)  HTTP 时间同步"              "9)  YABS 测试"
-  menu_line "2)  防火墙开启/关闭"           "10) 设置定时重启"
-  menu_line "3)  SELinux 开启/关闭"          "11) 哪吒面板管理"
-  menu_line "4)  SSH 安全性增强向导"         "12) IP 质量检测"
-  menu_line "5)  Fail2Ban 管理"              "13) IPv6 一键开启/关闭"
-  menu_line "6)  SSH 端口/密码/密钥/root 管理" "14) 服务器加固"
-  menu_line "7)  流媒体解锁检测"             "15) 新服务器初始化/源修复"
-  menu_exit_line "8)  显示服务器基本信息"       "0)  退出"
-
-  printf "\e[1;36m╚"
-  menu_repeat "═" 39
-  printf "╩"
-  menu_repeat "═" 40
-  printf "╝\e[0m\n"
+  printf "\n"
+  printf "\e[1;36m┌──────────────────────────────────────────────────────────────────────────────┐\e[0m\n"
+  printf "\e[1;36m│\e[0m  \e[1;35m"
+  menu_pad_right "server-toolkit ${SERVER_TOOLKIT_VERSION} · Linux 服务器工具箱" 74
+  printf "\e[0m \e[1;36m│\e[0m\n"
+  printf "\e[1;36m└──────────────────────────────────────────────────────────────────────────────┘\e[0m\n"
+  printf "\e[1;36m功能菜单\e[0m\n"
+  printf "\e[2m──────────────────────────────────────────────────────────────────────────────\e[0m\n"
+  menu_row "1)  时间同步（ntpdate+cron）"      "9)  YABS 测试"
+  menu_row "2)  防火墙开启/关闭"              "10) 设置定时重启"
+  menu_row "3)  SELinux 开启/关闭"             "11) 哪吒面板管理"
+  menu_row "4)  SSH 安全性增强向导"            "12) IP 质量检测"
+  menu_row "5)  Fail2Ban 管理"                 "13) IPv6 一键开启/关闭"
+  menu_row "6)  SSH 端口/密码/密钥/root 管理"  "14) 服务器加固"
+  menu_row "7)  流媒体解锁检测"                "15) 新服务器初始化/源修复"
+  menu_row "8)  显示服务器基本信息"            "0)  退出"
+  printf "\e[2m──────────────────────────────────────────────────────────────────────────────\e[0m\n"
 }
 
 require_root

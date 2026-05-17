@@ -1,10 +1,10 @@
 #!/bin/bash
 set -u
 
-SERVER_TOOLKIT_VERSION="v1.9"
+SERVER_TOOLKIT_VERSION="v2.0"
 
 # ============================================================
-# server-toolkit.sh v1.9
+# server-toolkit.sh v2.0
 # 适用：Debian / Ubuntu / CentOS / RHEL-like
 # 原则：先备份、先检测、尽量不破坏当前 SSH 会话。
 # ============================================================
@@ -23,9 +23,11 @@ pause_return() {
   read -r -p "按 Enter 返回菜单..."
 }
 
-# ========== UI 辅助函数（v1.9 统一风格） ==========
+# ========== UI 辅助函数（v2.0 统一风格） ==========
+UI_LINE="────────────────────────────────────────────────────────────"
+
 ui_hr() {
-  printf "\e[1;36m%s\e[0m\n" "────────────────────────────────────────────────────────────"
+  printf "\e[1;36m%s\e[0m\n" "$UI_LINE"
 }
 
 ui_title() {
@@ -36,12 +38,14 @@ ui_title() {
 }
 
 ui_option() {
-  # 用简单行式菜单代替复杂边框，避免中文宽度在不同终端错位。
-  printf "  \e[1;32m%-4s\e[0m %s\n" "$1)" "$2"
+  # 统一子菜单风格：不用复杂边框，避免中文宽度在不同终端错位。
+  local num="$1"
+  local text="$2"
+  printf "  \e[1;32m%2s\e[0m  %s\n" "${num})" "$text"
 }
 
 ui_back() {
-  printf "  \e[1;31m%-4s\e[0m %s\n" "0)" "返回"
+  printf "  \e[1;31m%2s\e[0m  %s\n" "0)" "返回"
 }
 
 ui_prompt() {
@@ -124,8 +128,8 @@ time_sync() {
   ui_title "时间同步 · ntpdate + cron"
   echo_color "正在配置 ntpdate 时间同步（每30分钟自动同步）..."
 
-  # v1.9：按用户要求移除 HTTP Date Header 同步，恢复更传统的 ntpdate + cron。
-  # 同时清理 v1.8 写入的 HTTP 时间同步脚本和 cron 任务，避免两套同步逻辑并存。
+  # v2.0：按要求只保留 Google 与 Cloudflare 两个 NTP 源。
+  # 同时继续清理 v1.8 遗留的 HTTP 时间同步脚本和 cron 任务，避免两套同步逻辑并存。
 
   if ! command -v ntpdate >/dev/null 2>&1; then
     echo_warn "未检测到 ntpdate，正在安装..."
@@ -146,7 +150,7 @@ time_sync() {
   fi
 
   if ! command -v ntpdate >/dev/null 2>&1; then
-    echo_error "ntpdate 仍不可用，无法配置 ntpdate 时间同步。请先修复软件源后再试。"
+    echo_error "ntpdate 仍不可用，无法配置时间同步。请先修复软件源后再试。"
     return 1
   fi
 
@@ -160,8 +164,8 @@ time_sync() {
 
   cat > "$sync_bin" <<'EOF'
 #!/bin/sh
-# server-toolkit: ntpdate time sync v1.9
-# 每次依次尝试多个 NTP 时间源；成功一个即退出。
+# server-toolkit: ntpdate time sync v2.0
+# 仅保留 Google 与 Cloudflare 两个 NTP 源；成功一个即退出。
 # -u 使用非特权源端口，能绕过部分网络环境下的 NTP 端口限制。
 
 LOG_FILE="/var/log/server-toolkit-ntpdate-sync.log"
@@ -192,14 +196,12 @@ exit 1
 EOF
   chmod +x "$sync_bin"
 
-  # 启动 cron 服务。不同系统服务名不同：Debian/Ubuntu=cron，CentOS/RHEL=crond。
   if systemctl list-unit-files 2>/dev/null | grep -q '^cron\.service'; then
     systemctl enable --now cron >/dev/null 2>&1 || true
   elif systemctl list-unit-files 2>/dev/null | grep -q '^crond\.service'; then
     systemctl enable --now crond >/dev/null 2>&1 || true
   fi
 
-  # 清理 v1.8 HTTP 时间同步遗留项。
   rm -f /usr/local/sbin/server-toolkit-http-time-sync 2>/dev/null || true
 
   local marker_ntp="# server-toolkit: time_sync"
@@ -226,7 +228,7 @@ EOF
     echo_color "时间同步配置完成：每30分钟执行一次 ntpdate（cron）。"
   else
     echo_warn "ntpdate 本次立即同步失败；已写入每30分钟自动同步任务。"
-    echo_warn "可能原因：NTP 出口被限制、时间源不可达、系统不允许修改时间，或容器/虚拟化限制 CAP_SYS_TIME。"
+    echo_warn "可能原因：NTP 出口被限制、Google/Cloudflare 时间源不可达、系统不允许修改时间，或容器/虚拟化限制 CAP_SYS_TIME。"
     echo_info "最近日志：$log_file"
     tail -n 10 "$log_file" 2>/dev/null || true
   fi
@@ -258,10 +260,10 @@ manage_firewall() {
   while true; do
     echo
     ui_title "防火墙管理"
-    echo "1) 查看防火墙状态"
-    echo "2) 开启防火墙（自动放行当前 SSH 端口，尽量避免断连）"
-    echo "3) 关闭防火墙"
-    echo "0) 返回"
+    ui_option 1 "查看防火墙状态"
+    ui_option 2 "开启防火墙（自动放行当前 SSH 端口，尽量避免断连）"
+    ui_option 3 "关闭防火墙"
+    ui_back
     read -r -p "请选择: " opt
     case "$opt" in
       1)
@@ -311,10 +313,10 @@ manage_selinux() {
     else
       echo_warn "未检测到 getenforce；Debian/Ubuntu 通常不使用 SELinux。"
     fi
-    echo "1) 开启 SELinux（Enforcing，可能需要重启）"
-    echo "2) 关闭 SELinux（Disabled，需重启后完全生效）"
-    echo "3) 设置为宽容模式（Permissive，当前会话生效）"
-    echo "0) 返回"
+    ui_option 1 "开启 SELinux（Enforcing，可能需要重启）"
+    ui_option 2 "关闭 SELinux（Disabled，需重启后完全生效）"
+    ui_option 3 "设置为宽容模式（Permissive，当前会话生效）"
+    ui_back
     read -r -p "请选择: " opt
     case "$opt" in
       1)
@@ -393,15 +395,15 @@ ssh_security_custom() {
   while true; do
     echo
     ui_title "SSH 安全性增强 · 逐项配置"
-    echo "1) MaxAuthTries：限制单次连接最大认证失败次数；优点：降低暴力破解效率；坏处：输错几次会断开。"
-    echo "2) LoginGraceTime：限制登录认证窗口；优点：减少僵尸连接；坏处：弱网下登录时间更短。"
-    echo "3) PermitEmptyPasswords：禁止空密码；强烈建议 no。"
-    echo "4) UseDNS：关闭反向 DNS 查询；优点：登录更快；坏处：日志中少部分主机名信息减少。"
-    echo "5) X11Forwarding：关闭 X11 转发；优点：减少攻击面；坏处：不能通过 SSH 转发图形界面。"
-    echo "6) AllowTcpForwarding：是否允许 SSH 隧道；关闭可减少滥用；坏处：影响端口转发/跳板用途。"
-    echo "7) ClientAliveInterval/CountMax：空闲连接保活/断开策略；优点：减少僵尸会话；坏处：长时间挂机会断开。"
-    echo "8) 查看当前 SSH 生效配置"
-    echo "0) 返回并应用"
+    ui_option 1 "MaxAuthTries：限制单次连接最大认证失败次数；优点：降低暴力破解效率；坏处：输错几次会断开。"
+    ui_option 2 "LoginGraceTime：限制登录认证窗口；优点：减少僵尸连接；坏处：弱网下登录时间更短。"
+    ui_option 3 "PermitEmptyPasswords：禁止空密码；强烈建议 no。"
+    ui_option 4 "UseDNS：关闭反向 DNS 查询；优点：登录更快；坏处：日志中少部分主机名信息减少。"
+    ui_option 5 "X11Forwarding：关闭 X11 转发；优点：减少攻击面；坏处：不能通过 SSH 转发图形界面。"
+    ui_option 6 "AllowTcpForwarding：是否允许 SSH 隧道；关闭可减少滥用；坏处：影响端口转发/跳板用途。"
+    ui_option 7 "ClientAliveInterval/CountMax：空闲连接保活/断开策略；优点：减少僵尸会话；坏处：长时间挂机会断开。"
+    ui_option 8 "查看当前 SSH 生效配置"
+    ui_option 0 "返回并应用"
     read -r -p "请选择: " opt
 
     case "$opt" in
@@ -466,10 +468,10 @@ secure_ssh() {
   while true; do
     echo
     ui_title "SSH 安全性增强向导"
-    echo "1) 查看当前 SSH 关键配置"
-    echo "2) 一键保守增强（不禁 root、不禁密码、不改端口）"
-    echo "3) 逐项配置（带说明）"
-    echo "0) 返回"
+    ui_option 1 "查看当前 SSH 关键配置"
+    ui_option 2 "一键保守增强（不禁 root、不禁密码、不改端口）"
+    ui_option 3 "逐项配置（带说明）"
+    ui_back
     read -r -p "请选择: " opt
 
     case "$opt" in
@@ -491,72 +493,125 @@ fail2ban_log_path() {
   fi
 }
 
+fail2ban_detect_backend_lines() {
+  # v2.0：Debian 12/Ubuntu minimal 常常没有 /var/log/auth.log，使用 systemd backend 更稳。
+  # 若非 systemd 环境，则回退到传统日志文件，并尽量创建空日志文件避免服务启动失败。
+  local logpath
+  logpath="$(fail2ban_log_path)"
+
+  if command -v journalctl >/dev/null 2>&1 && [ -d /run/systemd/system ] && python3 -c 'import systemd.journal' >/dev/null 2>&1; then
+    printf 'backend = systemd\n'
+  else
+    [ -e "$logpath" ] || touch "$logpath" 2>/dev/null || true
+    printf 'backend = auto\n'
+    printf 'logpath = %s\n' "$logpath"
+  fi
+}
+
+fail2ban_write_base_local() {
+  local level="${1:-INFO}"
+  mkdir -p /etc/fail2ban
+  cat > /etc/fail2ban/fail2ban.local <<EOF
+# server-toolkit: fail2ban 全局配置
+# allowipv6 = auto 可消除部分新版 fail2ban 的 allowipv6 警告。
+# loglevel 越低日志越少，DEBUG 最详细但日志最多。
+[Definition]
+allowipv6 = auto
+loglevel = $level
+EOF
+}
+
+fail2ban_validate_and_restart() {
+  if command -v fail2ban-server >/dev/null 2>&1; then
+    if ! fail2ban-server -t >/tmp/server-toolkit-fail2ban-test.log 2>&1; then
+      echo_error "Fail2Ban 配置检测失败，未重启服务。检测输出如下："
+      cat /tmp/server-toolkit-fail2ban-test.log 2>/dev/null || true
+      return 1
+    fi
+  fi
+
+  systemctl enable fail2ban >/dev/null 2>&1 || true
+  if systemctl restart fail2ban; then
+    echo_color "Fail2Ban 服务已成功启动/重启。"
+    return 0
+  else
+    echo_error "Fail2Ban 重启失败，最近日志如下："
+    journalctl -u fail2ban -n 30 --no-pager 2>/dev/null || true
+    return 1
+  fi
+}
+
+fail2ban_write_sshd_jail() {
+  local ssh_ports="$1"
+  local bantime="$2"
+  local findtime="$3"
+  local maxretry="$4"
+  local ignoreip="$5"
+  local backend_lines
+  backend_lines="$(fail2ban_detect_backend_lines)"
+
+  mkdir -p /etc/fail2ban
+  backup_file /etc/fail2ban/jail.local
+
+  cat > /etc/fail2ban/jail.local <<EOF
+# server-toolkit: fail2ban sshd 防护配置
+# bantime  = 封禁时长，单位秒；3600 = 1 小时
+# findtime = 统计失败次数的时间窗口，单位秒；600 = 10 分钟
+# maxretry = 在 findtime 内失败多少次后封禁
+# ignoreip = 白名单 IP，不会被封禁；建议加入你的固定管理 IP
+# port     = 当前 SSH 端口；支持多个端口，例如 22,2222
+# backend  = v2.0 自动选择；systemd 环境优先用 journal，避免 /var/log/auth.log 不存在导致启动失败
+
+[DEFAULT]
+bantime = $bantime
+findtime = $findtime
+maxretry = $maxretry
+ignoreip = 127.0.0.1/8 ::1 $ignoreip
+
+[sshd]
+enabled = true
+port = $ssh_ports
+$backend_lines
+EOF
+}
+
 setup_fail2ban_default() {
   echo_color "正在安装并配置 Fail2Ban..."
   if is_redhat; then
-    yum install -y epel-release
-    yum install -y fail2ban
+    yum install -y epel-release || true
+    yum install -y fail2ban python3-systemd || yum install -y fail2ban || return 1
   else
-    apt-get update -y && apt-get install -y fail2ban
+    apt-get update -y || return 1
+    apt-get install -y fail2ban python3-systemd || apt-get install -y fail2ban || return 1
   fi
 
-  local logpath ssh_ports
-  logpath="$(fail2ban_log_path)"
+  local ssh_ports
   ssh_ports="$(get_current_ssh_ports)"
-  backup_file /etc/fail2ban/jail.local
 
-  cat > /etc/fail2ban/jail.local <<EOF
-# server-toolkit: fail2ban sshd 基础防护
-#
-# bantime  = 封禁时长，3600 秒 = 1 小时
-# findtime = 统计失败次数的时间窗口，600 秒 = 10 分钟
-# maxretry = 在 findtime 内失败多少次后封禁
-# port     = 自动识别当前 sshd 监听端口：${ssh_ports}
-#
-# sshd jail 只监控 SSH 登录失败，不会影响普通网站/代理服务。
+  fail2ban_write_base_local "INFO"
+  fail2ban_write_sshd_jail "$ssh_ports" "3600" "600" "3" ""
 
-[DEFAULT]
-bantime = 3600
-findtime = 600
-maxretry = 3
-backend = auto
-
-[sshd]
-enabled = true
-port = ${ssh_ports}
-logpath = $logpath
-EOF
-
-  systemctl enable fail2ban >/dev/null 2>&1 || true
-  systemctl restart fail2ban
-  echo_color "Fail2Ban 已安装并配置完成。"
-  echo_info "已自动写入当前 SSH 端口：${ssh_ports}"
+  if fail2ban_validate_and_restart; then
+    echo_color "Fail2Ban 已安装并配置完成。"
+    echo_info "已自动写入当前 SSH 端口：${ssh_ports}"
+  else
+    echo_error "Fail2Ban 安装完成，但配置/启动失败。已保留备份文件，请根据上方日志排查。"
+    return 1
+  fi
 }
 
 fail2ban_refresh_ssh_port() {
-  local ssh_ports logpath
+  local ssh_ports
   ssh_ports="$(get_current_ssh_ports)"
-  logpath="$(fail2ban_log_path)"
 
-  backup_file /etc/fail2ban/jail.local
-  cat > /etc/fail2ban/jail.local <<EOF
-# server-toolkit: fail2ban sshd 自动端口配置
-# port 自动识别自 sshd -T，当前端口：${ssh_ports}
+  fail2ban_write_base_local "INFO"
+  fail2ban_write_sshd_jail "$ssh_ports" "3600" "600" "3" ""
 
-[DEFAULT]
-bantime = 3600
-findtime = 600
-maxretry = 3
-backend = auto
-
-[sshd]
-enabled = true
-port = ${ssh_ports}
-logpath = $logpath
-EOF
-
-  systemctl restart fail2ban
-  echo_color "已自动识别并刷新 Fail2Ban SSH 端口：${ssh_ports}"
+  if fail2ban_validate_and_restart; then
+    echo_color "已自动识别并刷新 Fail2Ban SSH 端口：${ssh_ports}"
+  else
+    return 1
+  fi
 }
 
 fail2ban_status() {
@@ -583,26 +638,23 @@ fail2ban_set_loglevel() {
     *) echo_error "日志等级无效"; return 1 ;;
   esac
 
-  mkdir -p /etc/fail2ban
-  cat > /etc/fail2ban/fail2ban.local <<EOF
-# server-toolkit: fail2ban 日志等级配置
-# loglevel 越低日志越少，DEBUG 最详细但日志最多。
-[Definition]
-loglevel = $level
-EOF
-
-  systemctl restart fail2ban
+  fail2ban_write_base_local "$level"
+  fail2ban_validate_and_restart || return 1
   echo_color "Fail2Ban 日志等级已设置为：$level"
 }
 
 fail2ban_config_jail() {
-  local logpath bantime findtime maxretry ignoreip ssh_ports custom_ports
-  logpath="$(fail2ban_log_path)"
+  local bantime findtime maxretry ignoreip ssh_ports custom_ports
   ssh_ports="$(get_current_ssh_ports)"
 
   echo_info "自动识别到当前 SSH 端口：${ssh_ports}"
   read -r -p "是否手动覆盖端口？直接回车使用自动识别端口，或输入例如 22,2222: " custom_ports
   [ -n "$custom_ports" ] && ssh_ports="$custom_ports"
+
+  if ! [[ "$ssh_ports" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+    echo_error "端口格式无效，只支持数字或逗号分隔，例如 22 或 22,2222。"
+    return 1
+  fi
 
   read -r -p "封禁时长 bantime 秒（默认 3600）: " bantime
   read -r -p "统计窗口 findtime 秒（默认 600）: " findtime
@@ -618,31 +670,14 @@ fail2ban_config_jail() {
     return 1
   fi
 
-  backup_file /etc/fail2ban/jail.local
+  fail2ban_write_base_local "INFO"
+  fail2ban_write_sshd_jail "$ssh_ports" "$bantime" "$findtime" "$maxretry" "$ignoreip"
 
-  cat > /etc/fail2ban/jail.local <<EOF
-# server-toolkit: fail2ban sshd 自定义配置
-# bantime  = 封禁时长，单位秒
-# findtime = 统计失败次数的时间窗口
-# maxretry = 在统计窗口内失败多少次后封禁
-# ignoreip = 白名单 IP，不会被封禁；建议加入你的固定管理 IP
-# port     = SSH 端口，默认自动识别：${ssh_ports}
-
-[DEFAULT]
-bantime = $bantime
-findtime = $findtime
-maxretry = $maxretry
-backend = auto
-ignoreip = 127.0.0.1/8 ::1 $ignoreip
-
-[sshd]
-enabled = true
-port = $ssh_ports
-logpath = $logpath
-EOF
-
-  systemctl restart fail2ban
-  echo_color "Fail2Ban jail 配置已更新。"
+  if fail2ban_validate_and_restart; then
+    echo_color "Fail2Ban jail 配置已更新。"
+  else
+    return 1
+  fi
 }
 
 fail2ban_unban_ip() {
@@ -655,15 +690,15 @@ manage_fail2ban() {
   while true; do
     echo
     ui_title "Fail2Ban 管理"
-    echo "1) 安装/写入默认 SSH 防护配置（自动识别 SSH 端口）"
-    echo "2) 自动识别当前 SSH 端口并刷新 Fail2Ban 配置"
-    echo "3) 查看 Fail2Ban 服务状态"
-    echo "4) 查看 sshd jail 状态"
-    echo "5) 查看最近 50 条 Fail2Ban 日志"
-    echo "6) 设置 Fail2Ban 日志等级"
-    echo "7) 配置 sshd 防护参数（bantime/findtime/maxretry/ignoreip/port）"
-    echo "8) 解封指定 IP"
-    echo "0) 返回"
+    ui_option 1 "安装/写入默认 SSH 防护配置（自动识别 SSH 端口）"
+    ui_option 2 "自动识别当前 SSH 端口并刷新 Fail2Ban 配置"
+    ui_option 3 "查看 Fail2Ban 服务状态"
+    ui_option 4 "查看 sshd jail 状态"
+    ui_option 5 "查看最近 50 条 Fail2Ban 日志"
+    ui_option 6 "设置 Fail2Ban 日志等级"
+    ui_option 7 "配置 sshd 防护参数（bantime/findtime/maxretry/ignoreip/port）"
+    ui_option 8 "解封指定 IP"
+    ui_back
     read -r -p "请选择: " opt
 
     case "$opt" in
@@ -836,9 +871,9 @@ configure_key_login() {
   while true; do
     echo
     ui_title "SSH 密钥登录配置"
-    echo "1) 粘贴已有公钥并写入 authorized_keys"
-    echo "2) 自动生成 ed25519 密钥对，并输出私钥"
-    echo "0) 返回"
+    ui_option 1 "粘贴已有公钥并写入 authorized_keys"
+    ui_option 2 "自动生成 ed25519 密钥对，并输出私钥"
+    ui_back
     read -r -p "请选择: " opt
 
     case "$opt" in
@@ -853,9 +888,9 @@ configure_key_login() {
 toggle_password_login() {
   ui_title "密码登录开关"
   echo_warn "关闭密码登录前，必须确认你已经可以用密钥登录，否则可能无法登录服务器。"
-  echo "1) 开启密码登录"
-  echo "2) 关闭密码登录"
-  echo "0) 取消"
+  ui_option 1 "开启密码登录"
+  ui_option 2 "关闭密码登录"
+  ui_option 0 "取消"
   read -r -p "请选择: " opt
 
   case "$opt" in
@@ -894,9 +929,9 @@ toggle_password_login() {
 manage_root_login_user() {
   ui_title "root 登录 / sudo 用户管理"
   echo_warn "关闭 root 登录前，必须新建并测试普通 sudo 用户，否则可能无法管理服务器。"
-  echo "1) 新增 sudo 用户，并关闭 root SSH 登录"
-  echo "2) 恢复 root SSH 登录"
-  echo "0) 返回"
+  ui_option 1 "新增 sudo 用户，并关闭 root SSH 登录"
+  ui_option 2 "恢复 root SSH 登录"
+  ui_back
   read -r -p "请选择: " opt
 
   case "$opt" in
@@ -1002,14 +1037,14 @@ change_ssh_port_password() {
   while true; do
     ui_title "SSH 端口 / 密码 / 密钥 / root 管理"
     echo_color "请不要关闭当前 SSH 连接，另开终端测试新连接是否成功！"
-    echo "1) 只修改 SSH 端口"
-    echo "2) 只修改 root 密码"
-    echo "3) 同时修改 SSH 端口和 root 密码"
-    echo "4) 配置密钥登录 / 自动生成密钥"
-    echo "5) 开启/关闭密码登录"
-    echo "6) 关闭 root 登录并新增 sudo 用户 / 恢复 root 登录"
-    echo "7) 查看当前 SSH 关键配置"
-    echo "0) 返回"
+    ui_option 1 "只修改 SSH 端口"
+    ui_option 2 "只修改 root 密码"
+    ui_option 3 "同时修改 SSH 端口和 root 密码"
+    ui_option 4 "配置密钥登录 / 自动生成密钥"
+    ui_option 5 "开启/关闭密码登录"
+    ui_option 6 "关闭 root 登录并新增 sudo 用户 / 恢复 root 登录"
+    ui_option 7 "查看当前 SSH 关键配置"
+    ui_back
     read -p "请选择: " mode
 
     case "$mode" in
@@ -1207,13 +1242,13 @@ manage_nezha() {
   while true; do
     echo
     ui_title "哪吒面板管理"
-    echo "1) 重启哪吒 Agent"
-    echo "2) 重启哪吒 Dashboard"
-    echo "3) 重启 Agent + Dashboard"
-    echo "4) 设置定期重启 Agent"
-    echo "5) 移除 Agent 定期重启任务"
-    echo "6) 卸载哪吒面板/探针"
-    echo "0) 返回"
+    ui_option 1 "重启哪吒 Agent"
+    ui_option 2 "重启哪吒 Dashboard"
+    ui_option 3 "重启 Agent + Dashboard"
+    ui_option 4 "设置定期重启 Agent"
+    ui_option 5 "移除 Agent 定期重启任务"
+    ui_option 6 "卸载哪吒面板/探针"
+    ui_back
     read -p "请选择: " nezha_opt
 
     case "$nezha_opt" in
@@ -1284,10 +1319,10 @@ manage_ipv6() {
 
   local conf="/etc/sysctl.d/99-server-toolkit-ipv6.conf"
 
-  echo "1) 一键开启 IPv6"
-  echo "2) 一键关闭 IPv6"
-  echo "3) 查看 IPv6 状态"
-  echo "0) 返回"
+  ui_option 1 "一键开启 IPv6"
+  ui_option 2 "一键关闭 IPv6"
+  ui_option 3 "查看 IPv6 状态"
+  ui_back
   read -p "请选择: " ipv6_opt
 
   case "$ipv6_opt" in
@@ -1448,9 +1483,9 @@ EOF
 toggle_unpriv_userns() {
   echo_warn "关闭 unprivileged user namespaces 可降低部分本地提权/容器逃逸风险。"
   echo_warn "坏处：可能影响 rootless Docker、部分容器、Chrome/Snap/某些沙箱程序。"
-  echo "1) 关闭 unprivileged userns"
-  echo "2) 恢复 unprivileged userns"
-  echo "0) 返回"
+  ui_option 1 "关闭 unprivileged userns"
+  ui_option 2 "恢复 unprivileged userns"
+  ui_back
   read -r -p "请选择: " opt
 
   local conf="/etc/sysctl.d/97-server-toolkit-userns.conf"
@@ -1563,15 +1598,15 @@ server_hardening() {
   while true; do
     echo
     ui_title "服务器加固（保守模式）"
-    echo "1) 一键保守加固（sysctl + Copy Fail 临时缓解 + Fail2Ban端口刷新）"
-    echo "2) 仅应用 CVE-2026-31431 / Copy Fail 临时缓解"
-    echo "3) 移除 CVE-2026-31431 临时缓解"
-    echo "4) 应用 CVE-2024-6387 / regreSSHion 临时缓解"
-    echo "5) 恢复 CVE-2024-6387 临时缓解相关 SSH 参数"
-    echo "6) 关闭/恢复 unprivileged user namespaces（可选强力加固）"
-    echo "7) 更新内核 / sudo / OpenSSH / glibc 等关键安全包"
-    echo "8) 查看漏洞/加固状态"
-    echo "0) 返回"
+    ui_option 1 "一键保守加固（sysctl + Copy Fail 临时缓解 + Fail2Ban端口刷新）"
+    ui_option 2 "仅应用 CVE-2026-31431 / Copy Fail 临时缓解"
+    ui_option 3 "移除 CVE-2026-31431 临时缓解"
+    ui_option 4 "应用 CVE-2024-6387 / regreSSHion 临时缓解"
+    ui_option 5 "恢复 CVE-2024-6387 临时缓解相关 SSH 参数"
+    ui_option 6 "关闭/恢复 unprivileged user namespaces（可选强力加固）"
+    ui_option 7 "更新内核 / sudo / OpenSSH / glibc 等关键安全包"
+    ui_option 8 "查看漏洞/加固状态"
+    ui_back
     read -r -p "请选择: " opt
 
     case "$opt" in
@@ -1771,12 +1806,12 @@ new_server_init_menu() {
   while true; do
     echo
     ui_title "新服务器初始化 / 源修复 / 更新"
-    echo "1) 自动检测并修复 APT 源（含旧发行版 old-releases/archive 修复）"
-    echo "2) 保守更新：安装 wget/curl/sudo/vim/git/unzip，并顺带升级 OpenSSH"
-    echo "3) 全量更新：upgrade/dist-upgrade/full-upgrade/autoremove + 常用工具 + OpenSSH"
-    echo "4) 仅尝试修复 OpenSSH 高危漏洞（升级 openssh-server/client）"
-    echo "5) 查看当前 sources.list"
-    echo "0) 返回"
+    ui_option 1 "自动检测并修复 APT 源（含旧发行版 old-releases/archive 修复）"
+    ui_option 2 "保守更新：安装 wget/curl/sudo/vim/git/unzip，并顺带升级 OpenSSH"
+    ui_option 3 "全量更新：upgrade/dist-upgrade/full-upgrade/autoremove + 常用工具 + OpenSSH"
+    ui_option 4 "仅尝试修复 OpenSSH 高危漏洞（升级 openssh-server/client）"
+    ui_option 5 "查看当前 sources.list"
+    ui_back
     read -r -p "请选择: " opt
     case "$opt" in
       1) repair_apt_sources_auto ;;
@@ -1790,8 +1825,8 @@ new_server_init_menu() {
   done
 }
 
-# ========== 菜单：双竖排（v1.9 统一 UI） ==========
-# 说明：v1.9 取消复杂满框中文对齐，改为稳定双栏列表，避免不同终端/字体下错位。
+# ========== 菜单：双竖排（v2.0 统一 UI） ==========
+# 说明：v2.0 继续使用稳定双栏列表，避免不同终端/字体下中文宽度错位。
 menu_text_width() {
   local text="$1"
   local chars bytes wide

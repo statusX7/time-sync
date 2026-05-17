@@ -1,10 +1,10 @@
 #!/bin/bash
 set -u
 
-SERVER_TOOLKIT_VERSION="v1.6"
+SERVER_TOOLKIT_VERSION="v1.7"
 
 # ============================================================
-# server-toolkit.sh v1.6
+# server-toolkit.sh v1.7
 # 适用：Debian / Ubuntu / CentOS / RHEL-like
 # 原则：先备份、先检测、尽量不破坏当前 SSH 会话。
 # ============================================================
@@ -1503,7 +1503,7 @@ write_ubuntu_sources() {
   local base="$1" code="$2"
   backup_file /etc/apt/sources.list
   cat > /etc/apt/sources.list <<EOF
-# server-toolkit v1.6 generated Ubuntu sources
+# server-toolkit v1.7 generated Ubuntu sources
 # base: $base
 deb ${base} ${code} main restricted universe multiverse
 deb ${base} ${code}-updates main restricted universe multiverse
@@ -1516,7 +1516,7 @@ write_debian_sources() {
   local base="$1" secbase="$2" code="$3"
   backup_file /etc/apt/sources.list
   cat > /etc/apt/sources.list <<EOF
-# server-toolkit v1.6 generated Debian sources
+# server-toolkit v1.7 generated Debian sources
 # base: $base
 deb ${base} ${code} main contrib non-free non-free-firmware
 deb ${base} ${code}-updates main contrib non-free non-free-firmware
@@ -1671,21 +1671,93 @@ new_server_init_menu() {
   done
 }
 
-# ========== 菜单：双竖排 ==========
+# ========== 菜单：双竖排（v1.7 UI 修正版） ==========
+# 说明：上一版直接用 printf 宽度对齐中文，部分终端会因为中文双宽字符导致边框错位。
+# v1.7 只调整菜单 UI：新增显示宽度估算与自动补空格，不改变功能逻辑。
+menu_repeat() {
+  local char="$1"
+  local count="$2"
+  local i
+  for ((i=0; i<count; i++)); do
+    printf "%s" "$char"
+  done
+}
+
+menu_text_width() {
+  local text="$1"
+  local chars bytes wide
+  chars=$(printf "%s" "$text" | wc -m | awk '{print $1}')
+  bytes=$(printf "%s" "$text" | wc -c | awk '{print $1}')
+  # 近似处理：常见中文为 UTF-8 三字节、显示宽度 2。
+  # 公式能解决菜单中文项目错位问题；菜单项避免使用 emoji，保证兼容性。
+  wide=$(( (bytes - chars) / 2 ))
+  echo $((chars + wide))
+}
+
+menu_pad_right() {
+  local text="$1"
+  local target="$2"
+  local width i
+  width=$(menu_text_width "$text")
+  printf "%s" "$text"
+  for ((i=width; i<target; i++)); do
+    printf " "
+  done
+}
+
+menu_line() {
+  local left="$1"
+  local right="$2"
+  printf "\e[1;36m║\e[0m  \e[1;32m"
+  menu_pad_right "$left" 36
+  printf "\e[0m\e[1;36m │ \e[0m\e[1;32m"
+  menu_pad_right "$right" 38
+  printf "\e[0m \e[1;36m║\e[0m\n"
+}
+
+menu_title_line() {
+  local title="server-toolkit ${SERVER_TOOLKIT_VERSION} - Linux 服务器工具箱"
+  printf "\e[1;36m║\e[0m  \e[1;35m"
+  menu_pad_right "$title" 77
+  printf "\e[0m \e[1;36m║\e[0m\n"
+}
+
+menu_exit_line() {
+  local left="$1"
+  local right="$2"
+  printf "\e[1;36m║\e[0m  \e[1;32m"
+  menu_pad_right "$left" 36
+  printf "\e[0m\e[1;36m │ \e[0m\e[1;31m"
+  menu_pad_right "$right" 38
+  printf "\e[0m \e[1;36m║\e[0m\n"
+}
+
 print_menu() {
-  clear
-  echo -e "\e[1;36m╔══════════════════════════════════════════════════════════════════════════════╗\e[0m"
-  printf "\e[1;36m║\e[0m  \e[1;35m%-72s\e[0m\e[1;36m║\e[0m\n" "server-toolkit ${SERVER_TOOLKIT_VERSION} · Linux 服务器工具箱"
-  echo -e "\e[1;36m╠══════════════════════════════════╦═══════════════════════════════════════════╣\e[0m"
-  printf "\e[1;36m║\e[0m  \e[1;32m%-30s\e[0m \e[1;36m║\e[0m  \e[1;32m%-39s\e[0m\e[1;36m║\e[0m\n" "1) HTTP 时间同步" "9) YABS 测试"
-  printf "\e[1;36m║\e[0m  \e[1;32m%-30s\e[0m \e[1;36m║\e[0m  \e[1;32m%-39s\e[0m\e[1;36m║\e[0m\n" "2) 防火墙开启/关闭" "10) 设置定时重启"
-  printf "\e[1;36m║\e[0m  \e[1;32m%-30s\e[0m \e[1;36m║\e[0m  \e[1;32m%-39s\e[0m\e[1;36m║\e[0m\n" "3) SELinux 开启/关闭" "11) 哪吒面板管理"
-  printf "\e[1;36m║\e[0m  \e[1;32m%-30s\e[0m \e[1;36m║\e[0m  \e[1;32m%-39s\e[0m\e[1;36m║\e[0m\n" "4) SSH 安全性增强向导" "12) IP 质量检测"
-  printf "\e[1;36m║\e[0m  \e[1;32m%-30s\e[0m \e[1;36m║\e[0m  \e[1;32m%-39s\e[0m\e[1;36m║\e[0m\n" "5) Fail2Ban 管理" "13) IPv6 一键开启/关闭"
-  printf "\e[1;36m║\e[0m  \e[1;32m%-30s\e[0m \e[1;36m║\e[0m  \e[1;32m%-39s\e[0m\e[1;36m║\e[0m\n" "6) SSH 端口/密码/密钥/root" "14) 服务器加固"
-  printf "\e[1;36m║\e[0m  \e[1;32m%-30s\e[0m \e[1;36m║\e[0m  \e[1;32m%-39s\e[0m\e[1;36m║\e[0m\n" "7) 流媒体解锁检测" "15) 新服务器初始化/源修复"
-  printf "\e[1;36m║\e[0m  \e[1;32m%-30s\e[0m \e[1;36m║\e[0m  \e[1;31m%-39s\e[0m\e[1;36m║\e[0m\n" "8) 显示服务器基本信息" "0) 退出"
-  echo -e "\e[1;36m╚══════════════════════════════════╩═══════════════════════════════════════════╝\e[0m"
+  [ -n "${TERM:-}" ] && clear 2>/dev/null || true
+  printf "\e[1;36m╔"
+  menu_repeat "═" 80
+  printf "╗\e[0m\n"
+  menu_title_line
+  printf "\e[1;36m╠"
+  menu_repeat "═" 39
+  printf "╦"
+  menu_repeat "═" 40
+  printf "╣\e[0m\n"
+
+  menu_line "1)  HTTP 时间同步"              "9)  YABS 测试"
+  menu_line "2)  防火墙开启/关闭"           "10) 设置定时重启"
+  menu_line "3)  SELinux 开启/关闭"          "11) 哪吒面板管理"
+  menu_line "4)  SSH 安全性增强向导"         "12) IP 质量检测"
+  menu_line "5)  Fail2Ban 管理"              "13) IPv6 一键开启/关闭"
+  menu_line "6)  SSH 端口/密码/密钥/root 管理" "14) 服务器加固"
+  menu_line "7)  流媒体解锁检测"             "15) 新服务器初始化/源修复"
+  menu_exit_line "8)  显示服务器基本信息"       "0)  退出"
+
+  printf "\e[1;36m╚"
+  menu_repeat "═" 39
+  printf "╩"
+  menu_repeat "═" 40
+  printf "╝\e[0m\n"
 }
 
 require_root

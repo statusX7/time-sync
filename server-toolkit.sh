@@ -1,10 +1,10 @@
 #!/bin/bash
 set -u
 
-SERVER_TOOLKIT_VERSION="v1.7"
+SERVER_TOOLKIT_VERSION="v1.8"
 
 # ============================================================
-# server-toolkit.sh v1.7
+# server-toolkit.sh v1.8
 # 适用：Debian / Ubuntu / CentOS / RHEL-like
 # 原则：先备份、先检测、尽量不破坏当前 SSH 会话。
 # ============================================================
@@ -87,8 +87,9 @@ set_sshd_kv() {
 get_current_ssh_ports() {
   local ports
   ports="$(sshd -T 2>/dev/null | awk '$1=="port"{print $2}' | sort -n | paste -sd, - 2>/dev/null || true)"
+  # v1.8：如果 sshd -T 不可用，回退到数字 22，避免防火墙放行时因 "ssh" 字符串被跳过。
   if [ -z "$ports" ]; then
-    ports="ssh"
+    ports="22"
   fi
   echo "$ports"
 }
@@ -96,6 +97,12 @@ get_current_ssh_ports() {
 # ========== 1. 时间同步 ==========
 time_sync() {
   echo_color "正在配置 HTTP 时间同步（每30分钟自动同步）..."
+
+  # v1.8 修复点：
+  # 1) 不再使用 curl -f，避免 403/301/302 等响应中明明有 Date 头却被当成失败。
+  # 2) 增加多个纯 HTTP 时间源，并同时尝试 HEAD / GET 取响应头。
+  # 3) 写入失败日志，方便判断是网络问题、Date 解析问题，还是系统不允许改时间。
+  # 4) 检查并安装 cron/cronie，避免写入 crontab 后实际没有定时服务。
 
   if ! command -v curl >/dev/null 2>&1; then
     echo_warn "未检测到 curl，正在安装..."
@@ -106,35 +113,140 @@ time_sync() {
     fi
   fi
 
+  if ! command -v crontab >/dev/null 2>&1; then
+    echo_warn "未检测到 crontab，正在安装 cron 服务..."
+    if is_redhat; then
+      yum install -y cronie
+    else
+      apt-get update -y && apt-get install -y cron
+    fi
+  fi
+
+  if ! command -v curl >/dev/null 2>&1; then
+    echo_error "curl 仍不可用，无法配置 HTTP 时间同步。请先修复软件源或手动安装 curl。"
+    return 1
+  fi
+
+  if ! command -v crontab >/dev/null 2>&1; then
+    echo_error "crontab 仍不可用，无法写入定时任务。请先安装 cron/cronie。"
+    return 1
+  fi
+
   local sync_bin="/usr/local/sbin/server-toolkit-http-time-sync"
+  local log_file="/var/log/server-toolkit-http-time-sync.log"
+
   cat > "$sync_bin" <<'EOF'
 #!/bin/sh
-# server-toolkit: HTTP Date header time sync
-# 通过 HTTP 响应头中的 Date 字段校准系统时间，适合 ntp/chrony 不方便使用的环境。
-URLS="http://www.gstatic.com/generate_204 http://www.google.com/generate_204 http://cp.cloudflare.com/generate_204 http://detectportal.firefox.com/success.txt"
-for url in $URLS; do
-  http_date=$(curl -fsSI --max-time 8 "$url" 2>/dev/null | awk 'BEGIN{IGNORECASE=1} /^date:/ {sub(/^date:[[:space:]]*/,""); print; exit}')
-  if [ -n "$http_date" ]; then
-    date -u -s "$http_date" >/dev/null 2>&1 && exit 0
+# server-toolkit: HTTP Date header time sync v1.8
+# 通过 HTTP 响应头 Date 字段校准系统时间，不依赖 NTP/chrony。
+# 如果 HTTP 被劫持、运营商/服务商改写 Date，时间可能不准确；生产环境更推荐 chrony/NTP。
+
+LOG_FILE="/var/log/server-toolkit-http-time-sync.log"
+USER_AGENT="server-toolkit-http-time-sync/1.8"
+URLS="http://cp.cloudflare.com/generate_204 http://www.gstatic.com/generate_204 http://connectivitycheck.gstatic.com/generate_204 http://detectportal.firefox.com/success.txt http://www.msftconnecttest.com/connecttest.txt http://example.com/ http://neverssl.com/ http://www.baidu.com/ http://www.qq.com/ http://www.aliyun.com/"
+
+log_msg() {
+  printf '%s %s\n' "$(date '+%F %T %Z' 2>/dev/null)" "$*" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+extract_date_header() {
+  # 取最后一个 Date 头：遇到跳转时，最后一个响应通常更接近最终服务器时间。
+  awk 'BEGIN{IGNORECASE=1} /^date:[[:space:]]*/ {sub(/^date:[[:space:]]*/,""); d=$0} END{gsub(/\r/,"",d); print d}'
+}
+
+fetch_date_by_head() {
+  curl -sS -I --http1.1 --connect-timeout 5 --max-time 10 -A "$USER_AGENT" "$1" 2>/dev/null | extract_date_header
+}
+
+fetch_date_by_get() {
+  curl -sS --http1.1 --connect-timeout 5 --max-time 10 -A "$USER_AGENT" -D - -o /dev/null "$1" 2>/dev/null | extract_date_header
+}
+
+set_time_from_http_date() {
+  http_date="$1"
+  src_url="$2"
+
+  [ -n "$http_date" ] || return 1
+
+  epoch=$(LC_ALL=C date -u -d "$http_date" '+%s' 2>/dev/null || true)
+  if [ -z "$epoch" ]; then
+    log_msg "PARSE_FAILED url=$src_url date=$http_date"
+    return 1
   fi
+
+  if date -u -s "@$epoch" >/dev/null 2>&1; then
+    command -v hwclock >/dev/null 2>&1 && hwclock -w >/dev/null 2>&1 || true
+    log_msg "OK url=$src_url date=$http_date epoch=$epoch"
+    return 0
+  fi
+
+  log_msg "SET_FAILED url=$src_url date=$http_date epoch=$epoch maybe_no_permission_or_readonly_system"
+  return 1
+}
+
+if ! command -v curl >/dev/null 2>&1; then
+  log_msg "FAIL curl_not_found"
+  exit 1
+fi
+
+if ! command -v date >/dev/null 2>&1; then
+  log_msg "FAIL date_not_found"
+  exit 1
+fi
+
+for url in $URLS; do
+  http_date=$(fetch_date_by_head "$url")
+  if set_time_from_http_date "$http_date" "$url"; then
+    exit 0
+  fi
+
+  http_date=$(fetch_date_by_get "$url")
+  if set_time_from_http_date "$http_date" "$url"; then
+    exit 0
+  fi
+
+  log_msg "TRY_FAILED url=$url"
 done
+
+log_msg "FAIL all_http_sources_failed"
 exit 1
 EOF
   chmod +x "$sync_bin"
 
-  if "$sync_bin"; then
-    echo_color "HTTP 时间同步成功：$(date '+%F %T %Z')"
-  else
-    echo_warn "HTTP 时间同步失败，可能是网络无法访问 HTTP 时间源。"
+  # 先确保 cron 服务存在并运行。不同系统服务名不同：Debian/Ubuntu=cron，CentOS/RHEL=crond。
+  if systemctl list-unit-files 2>/dev/null | grep -q '^cron\.service'; then
+    systemctl enable --now cron >/dev/null 2>&1 || true
+  elif systemctl list-unit-files 2>/dev/null | grep -q '^crond\.service'; then
+    systemctl enable --now crond >/dev/null 2>&1 || true
   fi
 
   local marker="# server-toolkit: http_time_sync"
-  crontab -l 2>/dev/null | grep -v "$marker" > /tmp/cron.tmp || true
-  echo "*/30 * * * * $sync_bin >/dev/null 2>&1 $marker" >> /tmp/cron.tmp
-  crontab /tmp/cron.tmp
-  rm -f /tmp/cron.tmp
+  local tmpcron
+  tmpcron="$(mktemp /tmp/server-toolkit-cron.XXXXXX)" || {
+    echo_error "创建临时 crontab 文件失败。"
+    return 1
+  }
 
-  echo_color "HTTP 时间同步配置完成：每30分钟同步一次（cron）。"
+  crontab -l 2>/dev/null | grep -v "$marker" > "$tmpcron" || true
+  echo "*/30 * * * * $sync_bin >/dev/null 2>&1 $marker" >> "$tmpcron"
+
+  if crontab "$tmpcron"; then
+    rm -f "$tmpcron"
+  else
+    rm -f "$tmpcron"
+    echo_error "写入 crontab 失败。"
+    return 1
+  fi
+
+  if "$sync_bin"; then
+    echo_color "HTTP 时间同步成功：$(date '+%F %T %Z')"
+    echo_color "HTTP 时间同步配置完成：每30分钟同步一次（cron）。"
+  else
+    echo_warn "HTTP 时间同步本次立即执行失败，但同步脚本与 cron 已安装。"
+    echo_warn "可能原因：HTTP 出口被拦截、所有时间源不可达、系统不允许 date -s 修改时间，或容器/虚拟化限制 CAP_SYS_TIME。"
+    echo_info "最近日志：$log_file"
+    tail -n 8 "$log_file" 2>/dev/null || true
+  fi
 }
 
 # ========== 2. 防火墙管理 ==========
@@ -1385,11 +1497,19 @@ security_update_core_packages() {
 
   if is_redhat; then
     yum makecache -y || true
-    yum update -y kernel sudo openssh-server glibc || yum update -y
+    yum update -y kernel sudo openssh-server openssh-clients glibc || yum update -y
   else
-    export DEBIAN_FRONTEND=noninteractive
+    export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a APT_LISTCHANGES_FRONTEND=none UCF_FORCE_CONFFOLD=1
     apt-get update -y
-    apt-get install -y --only-upgrade linux-image-amd64 sudo openssh-server libc6 2>/dev/null || apt-get -y upgrade
+    apt-get install -y --only-upgrade -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" sudo openssh-server openssh-client libc6 || true
+
+    # Debian 常见内核元包：linux-image-amd64；Ubuntu 常见内核元包：linux-generic。
+    if dpkg -l 2>/dev/null | awk '{print $2}' | grep -qx 'linux-image-amd64'; then
+      apt-get install -y --only-upgrade -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" linux-image-amd64 || true
+    fi
+    if dpkg -l 2>/dev/null | awk '{print $2}' | grep -qx 'linux-generic'; then
+      apt-get install -y --only-upgrade -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" linux-generic || true
+    fi
   fi
 
   echo_color "安全更新已执行。若更新了内核/glibc/openssh/sudo，建议评估后重启。"

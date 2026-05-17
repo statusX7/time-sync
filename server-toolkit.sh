@@ -1,10 +1,10 @@
 #!/bin/bash
 set -u
 
-SERVER_TOOLKIT_VERSION="v1.5"
+SERVER_TOOLKIT_VERSION="v1.6"
 
 # ============================================================
-# server-toolkit.sh v1.5
+# server-toolkit.sh v1.6
 # 适用：Debian / Ubuntu / CentOS / RHEL-like
 # 原则：先备份、先检测、尽量不破坏当前 SSH 会话。
 # ============================================================
@@ -14,6 +14,9 @@ echo_color() { echo -e "\e[1;32m$1\e[0m"; }
 echo_warn()  { echo -e "\e[1;33m$1\e[0m"; }
 echo_error() { echo -e "\e[1;31m$1\e[0m"; }
 echo_info()  { echo -e "\e[1;36m$1\e[0m"; }
+echo_blue()  { echo -e "\e[1;34m$1\e[0m"; }
+echo_pink()  { echo -e "\e[1;35m$1\e[0m"; }
+echo_dim()   { echo -e "\e[2m$1\e[0m"; }
 
 pause_return() {
   echo
@@ -92,55 +95,164 @@ get_current_ssh_ports() {
 
 # ========== 1. 时间同步 ==========
 time_sync() {
-  echo_color "正在配置每30分钟自动同步时间..."
+  echo_color "正在配置 HTTP 时间同步（每30分钟自动同步）..."
 
-  if ! command -v ntpdate &>/dev/null; then
-    echo_color "ntpdate 未安装，正在安装..."
+  if ! command -v curl >/dev/null 2>&1; then
+    echo_warn "未检测到 curl，正在安装..."
     if is_redhat; then
-      yum install -y ntpdate
+      yum install -y curl
     else
-      apt-get update -y && apt-get install -y ntpdate
+      apt-get update -y && apt-get install -y curl
     fi
-  else
-    echo_color "ntpdate 已安装"
   fi
 
-  ntpdate time.google.com || echo_warn "ntpdate 同步失败（可能被阻断/解析异常），稍后可再试。"
+  local sync_bin="/usr/local/sbin/server-toolkit-http-time-sync"
+  cat > "$sync_bin" <<'EOF'
+#!/bin/sh
+# server-toolkit: HTTP Date header time sync
+# 通过 HTTP 响应头中的 Date 字段校准系统时间，适合 ntp/chrony 不方便使用的环境。
+URLS="http://www.gstatic.com/generate_204 http://www.google.com/generate_204 http://cp.cloudflare.com/generate_204 http://detectportal.firefox.com/success.txt"
+for url in $URLS; do
+  http_date=$(curl -fsSI --max-time 8 "$url" 2>/dev/null | awk 'BEGIN{IGNORECASE=1} /^date:/ {sub(/^date:[[:space:]]*/,""); print; exit}')
+  if [ -n "$http_date" ]; then
+    date -u -s "$http_date" >/dev/null 2>&1 && exit 0
+  fi
+done
+exit 1
+EOF
+  chmod +x "$sync_bin"
 
-  local marker="# server-toolkit: time_sync"
+  if "$sync_bin"; then
+    echo_color "HTTP 时间同步成功：$(date '+%F %T %Z')"
+  else
+    echo_warn "HTTP 时间同步失败，可能是网络无法访问 HTTP 时间源。"
+  fi
+
+  local marker="# server-toolkit: http_time_sync"
   crontab -l 2>/dev/null | grep -v "$marker" > /tmp/cron.tmp || true
-  echo "*/30 * * * * /usr/sbin/ntpdate time.google.com >/dev/null 2>&1 $marker" >> /tmp/cron.tmp
+  echo "*/30 * * * * $sync_bin >/dev/null 2>&1 $marker" >> /tmp/cron.tmp
   crontab /tmp/cron.tmp
   rm -f /tmp/cron.tmp
 
-  echo_color "时间同步配置完成：每30分钟同步一次（cron）。"
+  echo_color "HTTP 时间同步配置完成：每30分钟同步一次（cron）。"
 }
 
-# ========== 2. 关闭防火墙 ==========
-disable_firewall() {
-  echo_warn "此操作只关闭系统内 firewalld / ufw，不影响云厂商安全组。"
-  read -r -p "确认关闭防火墙服务？[y/N]: " confirm
-  [[ "$confirm" =~ ^[Yy]$ ]] || { echo_warn "已取消。"; return 0; }
-
-  echo_color "正在关闭防火墙..."
-  systemctl stop firewalld 2>/dev/null || true
-  systemctl disable firewalld 2>/dev/null || true
-  systemctl stop ufw 2>/dev/null || true
-  systemctl disable ufw 2>/dev/null || true
-  echo_color "防火墙服务已尝试关闭。"
+# ========== 2. 防火墙管理 ==========
+allow_ssh_ports_before_firewall_enable() {
+  local ports p
+  ports="$(get_current_ssh_ports)"
+  [ -z "$ports" ] && ports="22"
+  for p in ${ports//,/ }; do
+    if [[ "$p" =~ ^[0-9]+$ ]]; then
+      firewall-cmd --permanent --add-port="${p}/tcp" >/dev/null 2>&1 || true
+      ufw allow "${p}/tcp" >/dev/null 2>&1 || true
+    fi
+  done
 }
 
-# ========== 3. 关闭SELinux ==========
-disable_selinux() {
-  echo_color "正在关闭SELinux..."
-  if [ -f /etc/selinux/config ]; then
-    backup_file /etc/selinux/config
-    sed -i 's/^SELINUX=.*/SELINUX=disabled/' /etc/selinux/config
-    setenforce 0 2>/dev/null || true
-    echo_color "SELinux 已关闭（需重启后完全生效）。"
-  else
-    echo_warn "未找到 SELinux 配置文件（Debian/Ubuntu 属正常）。"
-  fi
+firewall_status() {
+  echo_info "firewalld 状态："
+  systemctl is-active firewalld 2>/dev/null || true
+  echo_info "ufw 状态："
+  ufw status 2>/dev/null || echo_warn "ufw 未安装或不可用"
+}
+
+manage_firewall() {
+  while true; do
+    echo
+    echo_info "防火墙管理"
+    echo "1) 查看防火墙状态"
+    echo "2) 开启防火墙（自动放行当前 SSH 端口，尽量避免断连）"
+    echo "3) 关闭防火墙"
+    echo "0) 返回"
+    read -r -p "请选择: " opt
+    case "$opt" in
+      1)
+        firewall_status
+        ;;
+      2)
+        echo_warn "开启防火墙前会自动放行当前 SSH 端口：$(get_current_ssh_ports)"
+        read -r -p "确认开启？[y/N]: " confirm
+        [[ "$confirm" =~ ^[Yy]$ ]] || { echo_warn "已取消。"; continue; }
+        allow_ssh_ports_before_firewall_enable
+        if command -v firewall-cmd >/dev/null 2>&1 || systemctl list-unit-files | grep -q '^firewalld\.service'; then
+          systemctl enable --now firewalld 2>/dev/null || true
+          firewall-cmd --reload >/dev/null 2>&1 || true
+          echo_color "firewalld 已尝试开启，并已放行当前 SSH 端口。"
+        elif command -v ufw >/dev/null 2>&1; then
+          yes | ufw enable >/dev/null 2>&1 || true
+          echo_color "ufw 已尝试开启，并已放行当前 SSH 端口。"
+        else
+          echo_warn "未检测到 firewalld/ufw，未执行开启。"
+        fi
+        ;;
+      3)
+        echo_warn "此操作只关闭系统内 firewalld / ufw，不影响云厂商安全组。"
+        read -r -p "确认关闭防火墙服务？[y/N]: " confirm
+        [[ "$confirm" =~ ^[Yy]$ ]] || { echo_warn "已取消。"; continue; }
+        systemctl stop firewalld 2>/dev/null || true
+        systemctl disable firewalld 2>/dev/null || true
+        ufw disable >/dev/null 2>&1 || true
+        systemctl stop ufw 2>/dev/null || true
+        systemctl disable ufw 2>/dev/null || true
+        echo_color "防火墙服务已尝试关闭。"
+        ;;
+      0) return 0 ;;
+      *) echo_error "无效选项" ;;
+    esac
+  done
+}
+
+# ========== 3. SELinux 管理 ==========
+manage_selinux() {
+  while true; do
+    echo
+    echo_info "SELinux 管理"
+    if command -v getenforce >/dev/null 2>&1; then
+      echo "当前状态: $(getenforce 2>/dev/null || true)"
+    else
+      echo_warn "未检测到 getenforce；Debian/Ubuntu 通常不使用 SELinux。"
+    fi
+    echo "1) 开启 SELinux（Enforcing，可能需要重启）"
+    echo "2) 关闭 SELinux（Disabled，需重启后完全生效）"
+    echo "3) 设置为宽容模式（Permissive，当前会话生效）"
+    echo "0) 返回"
+    read -r -p "请选择: " opt
+    case "$opt" in
+      1)
+        if [ -f /etc/selinux/config ]; then
+          backup_file /etc/selinux/config
+          sed -i 's/^SELINUX=.*/SELINUX=enforcing/' /etc/selinux/config
+          setenforce 1 2>/dev/null || true
+          echo_color "SELinux 已设置为 Enforcing；如当前未完全生效，请重启。"
+        else
+          echo_warn "未找到 /etc/selinux/config。"
+        fi
+        ;;
+      2)
+        if [ -f /etc/selinux/config ]; then
+          backup_file /etc/selinux/config
+          sed -i 's/^SELINUX=.*/SELINUX=disabled/' /etc/selinux/config
+          setenforce 0 2>/dev/null || true
+          echo_color "SELinux 已设置为 Disabled，需重启后完全生效。"
+        else
+          echo_warn "未找到 SELinux 配置文件（Debian/Ubuntu 属正常）。"
+        fi
+        ;;
+      3)
+        if [ -f /etc/selinux/config ]; then
+          backup_file /etc/selinux/config
+          sed -i 's/^SELINUX=.*/SELINUX=permissive/' /etc/selinux/config
+          setenforce 0 2>/dev/null || true
+          echo_color "SELinux 已设置为 Permissive。"
+        else
+          echo_warn "未找到 SELinux 配置文件。"
+        fi
+        ;;
+      0) return 0 ;;
+      *) echo_error "无效选项" ;;
+    esac
+  done
 }
 
 # ========== 4. SSH 安全性增强 ==========
@@ -742,6 +854,47 @@ manage_root_login_user() {
   esac
 }
 
+change_ssh_port_and_password_together() {
+  local SSH_CONFIG_FILE="/etc/ssh/sshd_config"
+  local new_port new_password
+
+  read -p "请输入新的 SSH 端口 (1-65535，输入 q 取消): " new_port
+  [[ "$new_port" =~ ^[Qq]$ ]] && { echo_warn "已取消。"; return 0; }
+
+  if ! [[ "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -lt 1 ] || [ "$new_port" -gt 65535 ]; then
+    echo_error "端口不合法。"
+    return 1
+  fi
+
+  if ss -lnt | awk '{print $4}' | grep -Eq "[:.]${new_port}$"; then
+    echo_error "端口 $new_port 已被占用，请换一个。"
+    return 1
+  fi
+
+  read -s -p "请输入 root 新密码（直接回车取消）: " new_password
+  echo
+  [ -z "$new_password" ] && { echo_warn "已取消。"; return 0; }
+
+  backup_file "$SSH_CONFIG_FILE"
+
+  if grep -Eq "^[#[:space:]]*Port[[:space:]]+" "$SSH_CONFIG_FILE"; then
+    sed -i -E "s|^[#[:space:]]*Port[[:space:]]+.*|Port ${new_port}|g" "$SSH_CONFIG_FILE"
+  else
+    echo "Port ${new_port}" >> "$SSH_CONFIG_FILE"
+  fi
+
+  if ! test_sshd_config; then
+    echo_error "sshd 配置检测失败，未重启，也未修改密码。"
+    return 1
+  fi
+
+  echo "root:${new_password}" | chpasswd || { echo_error "修改密码失败。"; return 1; }
+  restart_ssh_service || return 1
+  echo_color "SSH 端口已更新为：$new_port，root 密码已更新。"
+  echo_warn "请另开终端测试：ssh -p ${new_port} root@你的服务器IP"
+  echo_warn "如已启用 Fail2Ban，请进入第 5 项刷新 SSH 端口。"
+}
+
 change_ssh_port_password() {
   local SSH_CONFIG_FILE="/etc/ssh/sshd_config"
   [ -f "$SSH_CONFIG_FILE" ] || { echo_error "找不到 $SSH_CONFIG_FILE"; return 1; }
@@ -751,20 +904,22 @@ change_ssh_port_password() {
     echo_color "请不要关闭当前 SSH 连接，另开终端测试新连接是否成功！"
     echo "1) 只修改 SSH 端口"
     echo "2) 只修改 root 密码"
-    echo "3) 配置密钥登录 / 自动生成密钥"
-    echo "4) 开启/关闭密码登录"
-    echo "5) 关闭 root 登录并新增 sudo 用户 / 恢复 root 登录"
-    echo "6) 查看当前 SSH 关键配置"
+    echo "3) 同时修改 SSH 端口和 root 密码"
+    echo "4) 配置密钥登录 / 自动生成密钥"
+    echo "5) 开启/关闭密码登录"
+    echo "6) 关闭 root 登录并新增 sudo 用户 / 恢复 root 登录"
+    echo "7) 查看当前 SSH 关键配置"
     echo "0) 返回"
     read -p "请选择: " mode
 
     case "$mode" in
       1) change_ssh_port_only ;;
       2) change_root_password_only ;;
-      3) configure_key_login ;;
-      4) toggle_password_login ;;
-      5) manage_root_login_user ;;
-      6) show_ssh_effective_config ;;
+      3) change_ssh_port_and_password_together ;;
+      4) configure_key_login ;;
+      5) toggle_password_login ;;
+      6) manage_root_login_user ;;
+      7) show_ssh_effective_config ;;
       0) return 0 ;;
       *) echo_error "无效选项" ;;
     esac
@@ -775,46 +930,130 @@ change_ssh_port_password() {
 check_media_unlock() { bash <(curl -L -s check.unlock.media); }
 
 # ========== 8. 显示服务器基本信息 ==========
-show_system_info() {
-  echo_color "---------------------服务器基本信息如下---------------------"
-  CPU_MODEL=$(awk -F: '/model name/ {print $2; exit}' /proc/cpuinfo | sed 's/^ //')
-  CPU_CORES=$(nproc)
-  CPU_FREQ=$(awk -F: '/cpu MHz/ {print $2; exit}' /proc/cpuinfo | sed 's/^ //')
-  CACHE=$(lscpu 2>/dev/null | awk -F: '
-    /L1d cache/ {gsub(/^[ \t]+/, "", $2); l1=$2}
-    /L2 cache/  {gsub(/^[ \t]+/, "", $2); l2=$2}
-    /L3 cache/  {gsub(/^[ \t]+/, "", $2); l3=$2}
-    END {printf "L1: %s / L2: %s / L3: %s", l1?l1:"-", l2?l2:"-", l3?l3:"-"}'
-  )
-  AES_SUPPORT=$(lscpu 2>/dev/null | grep -qi aes && echo "✔ Enabled" || echo "✘ Disabled")
-  VM_SUPPORT=$(egrep -q 'vmx|svm' /proc/cpuinfo && echo "✔ Enabled" || echo "✘ Disabled")
-  MEM_USED=$(free -m | awk '/Mem:/ {print $3}')
-  MEM_TOTAL=$(free -m | awk '/Mem:/ {print $2}')
-  SWAP_USED=$(free -m | awk '/Swap:/ {print $3}')
-  SWAP_TOTAL=$(free -m | awk '/Swap:/ {print $2}')
-  DISK_INFO=$(df -h / | awk 'NR==2 {print $3 " / " $2}')
-  BOOT_DISK=$(df -h / | awk 'NR==2 {print $1}')
-  UPTIME=$(uptime -p)
-  LOAD_AVG=$(uptime | awk -F'load average:' '{ print $2 }')
-  OS_INFO=$(hostnamectl 2>/dev/null | grep "Operating System" | cut -d: -f2 | sed 's/^ //')
-  ARCH_INFO=$(uname -m)
-  KERNEL=$(uname -r)
+format_bytes() {
+  local b="$1"
+  awk -v b="$b" 'BEGIN{
+    if (b>=1099511627776) printf "%.2fT", b/1099511627776;
+    else if (b>=1073741824) printf "%.2fG", b/1073741824;
+    else if (b>=1048576) printf "%.2fM", b/1048576;
+    else if (b>=1024) printf "%.2fK", b/1024;
+    else printf "%dB", b;
+  }'
+}
 
-  echo -e " CPU 型号          : $CPU_MODEL"
-  echo -e " CPU 核心数        : $CPU_CORES"
-  echo -e " CPU 频率          : ${CPU_FREQ} MHz"
-  echo -e " CPU 缓存          : $CACHE"
-  echo -e " AES-NI指令集      : $AES_SUPPORT"
-  echo -e " VM-x/AMD-V支持    : $VM_SUPPORT"
-  echo -e " 内存              : ${MEM_USED} MiB / ${MEM_TOTAL} MiB"
-  echo -e " Swap              : ${SWAP_USED} MiB / ${SWAP_TOTAL} MiB"
-  echo -e " 硬盘空间          : $DISK_INFO"
-  echo -e " 启动盘路径        : $BOOT_DISK"
-  echo -e " 系统在线时间      : $UPTIME"
-  echo -e " 负载              : $LOAD_AVG"
-  echo -e " 系统              : ${OS_INFO:-$(cat /etc/os-release 2>/dev/null | grep PRETTY_NAME | cut -d= -f2 | tr -d \" )}" 
-  echo -e " 架构              : $ARCH_INFO"
-  echo -e " 内核              : $KERNEL"
+get_default_iface() {
+  ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}'
+}
+
+cpu_usage_percent() {
+  local a b idle1 total1 idle2 total2 diff_idle diff_total
+  read -r _ a b c d e f g h i j < /proc/stat
+  idle1=$((d+e)); total1=$((a+b+c+d+e+f+g+h+i+j))
+  sleep 1
+  read -r _ a b c d e f g h i j < /proc/stat
+  idle2=$((d+e)); total2=$((a+b+c+d+e+f+g+h+i+j))
+  diff_idle=$((idle2-idle1)); diff_total=$((total2-total1))
+  if [ "$diff_total" -le 0 ]; then echo "0"; else awk -v i="$diff_idle" -v t="$diff_total" 'BEGIN{printf "%.0f", (1-i/t)*100}'; fi
+}
+
+show_system_info() {
+  local hostname osver kernel arch cpu_model cpu_cores cpu_freq cpu_usage loadavg tcp_count udp_count
+  local mem_total mem_avail mem_used mem_pct swap_total swap_free swap_used swap_pct disk_total disk_used disk_pct
+  local iface rx tx algo qdisc dns ipinfo public_ip asn org loc tz now uptime_sec days hours mins
+
+  hostname="$(hostname 2>/dev/null || echo '-')"
+  osver="$(. /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-unknown}" || echo '-')"
+  kernel="$(uname -r)"
+  arch="$(uname -m)"
+  cpu_model="$(awk -F: '/model name/ {print $2; exit}' /proc/cpuinfo | sed 's/^ //')"
+  [ -z "$cpu_model" ] && cpu_model="$(lscpu 2>/dev/null | awk -F: '/Model name/ {gsub(/^[ \t]+/,"",$2); print $2; exit}')"
+  cpu_cores="$(nproc 2>/dev/null || echo '-')"
+  cpu_freq="$(awk -F: '/cpu MHz/ {mhz=$2; gsub(/^[ \t]+/,"",mhz); printf "%.1f GHz", mhz/1000; exit}' /proc/cpuinfo)"
+  [ -z "$cpu_freq" ] && cpu_freq="-"
+  cpu_usage="$(cpu_usage_percent)%"
+  loadavg="$(awk '{print $1", "$2", "$3}' /proc/loadavg)"
+  tcp_count="$(ss -tan 2>/dev/null | awk 'NR>1{c++} END{print c+0}')"
+  udp_count="$(ss -uan 2>/dev/null | awk 'NR>1{c++} END{print c+0}')"
+
+  mem_total="$(awk '/MemTotal/ {print $2}' /proc/meminfo)"
+  mem_avail="$(awk '/MemAvailable/ {print $2}' /proc/meminfo)"
+  mem_used=$((mem_total-mem_avail))
+  mem_pct="$(awk -v u="$mem_used" -v t="$mem_total" 'BEGIN{printf "%.2f", u/t*100}')"
+  mem_used="$(awk -v k="$mem_used" 'BEGIN{printf "%.2fM", k/1024}')"
+  mem_total="$(awk -v k="$mem_total" 'BEGIN{printf "%.2fM", k/1024}')"
+
+  swap_total="$(awk '/SwapTotal/ {print $2}' /proc/meminfo)"
+  swap_free="$(awk '/SwapFree/ {print $2}' /proc/meminfo)"
+  swap_used=$((swap_total-swap_free))
+  if [ "$swap_total" -gt 0 ]; then
+    swap_pct="$(awk -v u="$swap_used" -v t="$swap_total" 'BEGIN{printf "%.0f", u/t*100}')"
+  else
+    swap_pct="0"
+  fi
+  swap_used="$(awk -v k="$swap_used" 'BEGIN{printf "%.0fM", k/1024}')"
+  swap_total="$(awk -v k="$swap_total" 'BEGIN{printf "%.0fM", k/1024}')"
+
+  disk_used="$(df -h / | awk 'NR==2{print $3}')"
+  disk_total="$(df -h / | awk 'NR==2{print $2}')"
+  disk_pct="$(df -h / | awk 'NR==2{print $5}')"
+
+  iface="$(get_default_iface)"
+  [ -z "$iface" ] && iface="$(ls /sys/class/net | grep -v '^lo$' | head -n1)"
+  if [ -n "$iface" ] && [ -e "/sys/class/net/$iface/statistics/rx_bytes" ]; then
+    rx="$(cat /sys/class/net/$iface/statistics/rx_bytes)"
+    tx="$(cat /sys/class/net/$iface/statistics/tx_bytes)"
+  else
+    rx=0; tx=0
+  fi
+
+  algo="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '-')"
+  qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || echo '-')"
+  dns="$(grep -E '^nameserver ' /etc/resolv.conf 2>/dev/null | awk '{print $2}' | paste -sd' ' -)"
+  [ -z "$dns" ] && dns="-"
+
+  public_ip="$(curl -4 -fsS --max-time 4 https://api.ipify.org 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}')"
+  ipinfo="$(curl -4 -fsS --max-time 5 "http://ip-api.com/line/${public_ip}?fields=as,query,country,regionName,city" 2>/dev/null || true)"
+  asn="$(echo "$ipinfo" | sed -n '1p')"
+  [ -z "$asn" ] && asn="-"
+  loc="$(echo "$ipinfo" | awk 'NR==3{country=$0} NR==4{region=$0} NR==5{city=$0} END{print country" "region" "city}' | sed 's/[[:space:]]*$//')"
+  [ -z "$loc" ] && loc="-"
+
+  tz="$(timedatectl 2>/dev/null | awk -F': ' '/Time zone/ {print $2}' | awk '{print $1}')"
+  [ -z "$tz" ] && tz="$(date +%Z)"
+  now="$(date '+%F %I:%M %p')"
+  uptime_sec="$(awk '{print int($1)}' /proc/uptime)"
+  days=$((uptime_sec/86400)); hours=$((uptime_sec%86400/3600)); mins=$((uptime_sec%3600/60))
+
+  echo_color "系统信息查询"
+  echo "-------------"
+  printf "%-16s %s\n" "主机名:" "$hostname"
+  printf "%-16s %s\n" "系统版本:" "$osver"
+  printf "%-16s %s\n" "Linux版本:" "$kernel"
+  echo "-------------"
+  printf "%-16s %s\n" "CPU架构:" "$arch"
+  printf "%-16s %s\n" "CPU型号:" "$cpu_model"
+  printf "%-16s %s\n" "CPU核心数:" "$cpu_cores"
+  printf "%-16s %s\n" "CPU频率:" "$cpu_freq"
+  echo "-------------"
+  printf "%-16s %s\n" "CPU占用:" "$cpu_usage"
+  printf "%-16s %s\n" "系统负载:" "$loadavg"
+  printf "%-16s %s|%s\n" "TCP|UDP连接数:" "$tcp_count" "$udp_count"
+  printf "%-16s %s/%s (%s%%)\n" "物理内存:" "$mem_used" "$mem_total" "$mem_pct"
+  printf "%-16s %s/%s (%s%%)\n" "虚拟内存:" "$swap_used" "$swap_total" "$swap_pct"
+  printf "%-16s %s/%s (%s)\n" "硬盘占用:" "$disk_used" "$disk_total" "$disk_pct"
+  echo "-------------"
+  printf "%-16s %s\n" "总接收:" "$(format_bytes "$rx")"
+  printf "%-16s %s\n" "总发送:" "$(format_bytes "$tx")"
+  echo "-------------"
+  printf "%-16s %s %s\n" "网络算法:" "$algo" "$qdisc"
+  echo "-------------"
+  printf "%-16s %s\n" "运营商:" "$asn"
+  printf "%-16s %s\n" "IPv4地址:" "$public_ip"
+  printf "%-16s %s\n" "DNS地址:" "$dns"
+  printf "%-16s %s\n" "地理位置:" "$loc"
+  printf "%-16s %s %s\n" "系统时间:" "$tz" "$now"
+  echo "-------------"
+  printf "%-16s %s天 %s时 %s分\n" "运行时长:" "$days" "$hours" "$mins"
 }
 
 # ========== 9. YABS 测试 ==========
@@ -838,50 +1077,67 @@ setup_cron_reboot() {
 }
 
 # ========== 11. 哪吒面板管理 ==========
+setup_nezha_agent_restart_cron() {
+  local interval marker
+  read -r -p "请输入每隔多少小时重启 nezha-agent（例如 12，输入 q 取消）: " interval
+  [[ "$interval" =~ ^[Qq]$ ]] && { echo_warn "已取消。"; return 0; }
+  if ! [[ "$interval" =~ ^[0-9]+$ ]] || [ "$interval" -lt 1 ] || [ "$interval" -gt 720 ]; then
+    echo_error "请输入 1-720 的有效小时数。"
+    return 1
+  fi
+  marker="# server-toolkit: nezha-agent-restart"
+  crontab -l 2>/dev/null | grep -v "$marker" > /tmp/cron.tmp || true
+  echo "0 */$interval * * * systemctl restart nezha-agent >/dev/null 2>&1 $marker" >> /tmp/cron.tmp
+  crontab /tmp/cron.tmp
+  rm -f /tmp/cron.tmp
+  echo_color "已设置每隔 $interval 小时自动重启 nezha-agent。"
+}
+
+remove_nezha_agent_restart_cron() {
+  local marker="# server-toolkit: nezha-agent-restart"
+  crontab -l 2>/dev/null | grep -v "$marker" > /tmp/cron.tmp || true
+  crontab /tmp/cron.tmp
+  rm -f /tmp/cron.tmp
+  echo_color "已移除 nezha-agent 定期重启任务。"
+}
+
 manage_nezha() {
-  echo "1) 重启哪吒 Agent"
-  echo "2) 重启哪吒 Dashboard"
-  echo "3) 重启 Agent + Dashboard"
-  echo "4) 卸载哪吒面板/探针"
-  echo "0) 返回"
-  read -p "请选择: " nezha_opt
+  while true; do
+    echo
+    echo_info "哪吒面板管理"
+    echo "1) 重启哪吒 Agent"
+    echo "2) 重启哪吒 Dashboard"
+    echo "3) 重启 Agent + Dashboard"
+    echo "4) 设置定期重启 Agent"
+    echo "5) 移除 Agent 定期重启任务"
+    echo "6) 卸载哪吒面板/探针"
+    echo "0) 返回"
+    read -p "请选择: " nezha_opt
 
-  case "$nezha_opt" in
-    1)
-      systemctl restart nezha-agent 2>/dev/null || true
-      echo_color "已尝试重启 nezha-agent。"
-      ;;
-    2)
-      systemctl restart nezha-dashboard 2>/dev/null || true
-      echo_color "已尝试重启 nezha-dashboard。"
-      ;;
-    3)
-      systemctl restart nezha-agent 2>/dev/null || true
-      systemctl restart nezha-dashboard 2>/dev/null || true
-      echo_color "已尝试重启哪吒相关服务。"
-      ;;
-    4)
-      echo_warn "此操作会删除 /opt/nezha /etc/nezha /var/log/nezha。"
-      read -r -p "确认卸载？[y/N]: " confirm
-      [[ "$confirm" =~ ^[Yy]$ ]] || { echo_warn "已取消。"; return 0; }
-
-      systemctl stop nezha-agent 2>/dev/null || true
-      systemctl stop nezha-dashboard 2>/dev/null || true
-      systemctl disable nezha-agent 2>/dev/null || true
-      systemctl disable nezha-dashboard 2>/dev/null || true
-      rm -f /etc/systemd/system/nezha-agent.service
-      rm -f /etc/systemd/system/nezha-dashboard.service
-      rm -rf /opt/nezha /etc/nezha /var/log/nezha
-      systemctl daemon-reload
-      echo_color "哪吒面板/探针已移除。"
-      ;;
-    0)
-      return 0
-      ;;
-    *)
-      echo_error "无效选项"
-      ;;
-  esac
+    case "$nezha_opt" in
+      1) systemctl restart nezha-agent 2>/dev/null || true; echo_color "已尝试重启 nezha-agent。" ;;
+      2) systemctl restart nezha-dashboard 2>/dev/null || true; echo_color "已尝试重启 nezha-dashboard。" ;;
+      3) systemctl restart nezha-agent 2>/dev/null || true; systemctl restart nezha-dashboard 2>/dev/null || true; echo_color "已尝试重启哪吒相关服务。" ;;
+      4) setup_nezha_agent_restart_cron ;;
+      5) remove_nezha_agent_restart_cron ;;
+      6)
+        echo_warn "此操作会删除 /opt/nezha /etc/nezha /var/log/nezha。"
+        read -r -p "确认卸载？[y/N]: " confirm
+        [[ "$confirm" =~ ^[Yy]$ ]] || { echo_warn "已取消。"; continue; }
+        systemctl stop nezha-agent 2>/dev/null || true
+        systemctl stop nezha-dashboard 2>/dev/null || true
+        systemctl disable nezha-agent 2>/dev/null || true
+        systemctl disable nezha-dashboard 2>/dev/null || true
+        rm -f /etc/systemd/system/nezha-agent.service
+        rm -f /etc/systemd/system/nezha-dashboard.service
+        rm -rf /opt/nezha /etc/nezha /var/log/nezha
+        systemctl daemon-reload
+        echo_color "哪吒面板/探针已移除。"
+        ;;
+      0) return 0 ;;
+      *) echo_error "无效选项" ;;
+    esac
+  done
 }
 
 # ========== 12. IP 质量检测 ==========
@@ -1223,18 +1479,213 @@ server_hardening() {
   done
 }
 
+
+# ========== 15. 新服务器初始化 / 源修复 / 更新 ==========
+apt_env_prefix() {
+  echo "DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a APT_LISTCHANGES_FRONTEND=none UCF_FORCE_CONFFOLD=1"
+}
+
+get_os_id() {
+  . /etc/os-release 2>/dev/null && echo "${ID:-unknown}" || echo "unknown"
+}
+
+get_os_codename() {
+  . /etc/os-release 2>/dev/null && echo "${VERSION_CODENAME:-${UBUNTU_CODENAME:-}}" || true
+}
+
+curl_has_release() {
+  local base="$1" suite="$2"
+  curl -fsIL --max-time 8 "${base%/}/dists/${suite}/InRelease" >/dev/null 2>&1 || \
+  curl -fsIL --max-time 8 "${base%/}/dists/${suite}/Release" >/dev/null 2>&1
+}
+
+write_ubuntu_sources() {
+  local base="$1" code="$2"
+  backup_file /etc/apt/sources.list
+  cat > /etc/apt/sources.list <<EOF
+# server-toolkit v1.6 generated Ubuntu sources
+# base: $base
+deb ${base} ${code} main restricted universe multiverse
+deb ${base} ${code}-updates main restricted universe multiverse
+deb ${base} ${code}-security main restricted universe multiverse
+deb ${base} ${code}-backports main restricted universe multiverse
+EOF
+}
+
+write_debian_sources() {
+  local base="$1" secbase="$2" code="$3"
+  backup_file /etc/apt/sources.list
+  cat > /etc/apt/sources.list <<EOF
+# server-toolkit v1.6 generated Debian sources
+# base: $base
+deb ${base} ${code} main contrib non-free non-free-firmware
+deb ${base} ${code}-updates main contrib non-free non-free-firmware
+deb ${secbase} ${code}-security main contrib non-free non-free-firmware
+EOF
+}
+
+repair_apt_sources_auto() {
+  if ! is_debian_like; then
+    echo_warn "当前不是 Debian/Ubuntu 系，跳过 APT 源修复。"
+    return 0
+  fi
+
+  local os code base secbase
+  os="$(get_os_id)"
+  code="$(get_os_codename)"
+  [ -z "$code" ] && { echo_error "无法识别系统代号，无法自动换源。"; return 1; }
+
+  mkdir -p /etc/apt/apt.conf.d
+
+  if [ "$os" = "ubuntu" ]; then
+    echo_info "检测到 Ubuntu：$code，开始检测可用源..."
+    for base in \
+      "https://mirror.yandex.ru/ubuntu/" \
+      "https://ru.archive.ubuntu.com/ubuntu/" \
+      "https://archive.ubuntu.com/ubuntu/" \
+      "http://archive.ubuntu.com/ubuntu/" \
+      "https://old-releases.ubuntu.com/ubuntu/" \
+      "http://old-releases.ubuntu.com/ubuntu/"; do
+      if curl_has_release "$base" "$code"; then
+        echo_color "找到可用 Ubuntu 源：$base"
+        write_ubuntu_sources "$base" "$code"
+        apt-get clean
+        apt-get update -y && return 0
+      fi
+    done
+    echo_error "未找到可用 Ubuntu 源。"
+    return 1
+  else
+    echo_info "检测到 Debian-like：$code，开始检测可用源..."
+    for base in \
+      "https://deb.debian.org/debian/" \
+      "https://mirror.yandex.ru/debian/" \
+      "http://deb.debian.org/debian/" \
+      "https://archive.debian.org/debian/" \
+      "http://archive.debian.org/debian/"; do
+      if curl_has_release "$base" "$code"; then
+        if echo "$base" | grep -q 'archive.debian.org'; then
+          secbase="$base"
+          cat >/etc/apt/apt.conf.d/99-server-toolkit-archive <<EOF
+Acquire::Check-Valid-Until "false";
+EOF
+        else
+          if curl_has_release "https://security.debian.org/debian-security/" "${code}-security"; then
+            secbase="https://security.debian.org/debian-security/"
+          elif curl_has_release "https://mirror.yandex.ru/debian-security/" "${code}-security"; then
+            secbase="https://mirror.yandex.ru/debian-security/"
+          else
+            secbase="$base"
+          fi
+        fi
+        echo_color "找到可用 Debian 源：$base"
+        write_debian_sources "$base" "$secbase" "$code"
+        apt-get clean
+        apt-get update -y && return 0
+      fi
+    done
+    echo_error "未找到可用 Debian 源。"
+    return 1
+  fi
+}
+
+openssh_security_upgrade() {
+  echo_info "正在尝试升级/安装 OpenSSH 安全更新..."
+  if is_redhat; then
+    yum makecache -y || true
+    yum update -y openssh openssh-server openssh-clients || yum update -y openssh-server || true
+  elif is_debian_like; then
+    export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a APT_LISTCHANGES_FRONTEND=none UCF_FORCE_CONFFOLD=1
+    apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" openssh-server openssh-client || true
+    apt-get install -y --only-upgrade -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" openssh-server openssh-client || true
+  fi
+  echo_color "OpenSSH 安全更新流程已执行。"
+}
+
+new_server_basic_update() {
+  echo_warn "保守更新：修复源 -> apt update -> 安装 wget/curl/sudo/vim/git/unzip -> 尝试升级 OpenSSH。"
+  read -r -p "确认执行？[y/N]: " confirm
+  [[ "$confirm" =~ ^[Yy]$ ]] || { echo_warn "已取消。"; return 0; }
+
+  if is_debian_like; then
+    repair_apt_sources_auto || true
+    export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a APT_LISTCHANGES_FRONTEND=none UCF_FORCE_CONFFOLD=1
+    apt-get update -y
+    apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" wget curl sudo vim git unzip openssh-server openssh-client
+    openssh_security_upgrade
+  elif is_redhat; then
+    yum makecache -y || true
+    yum install -y wget curl sudo vim git unzip openssh-server openssh-clients
+    openssh_security_upgrade
+  else
+    echo_error "暂不支持当前系统。"
+  fi
+}
+
+new_server_full_update() {
+  echo_warn "全量更新会执行 upgrade/dist-upgrade/full-upgrade/autoremove，并尝试升级 OpenSSH。"
+  echo_warn "可能更新内核，更新完成后通常需要你自行决定是否重启。"
+  read -r -p "确认执行？[y/N]: " confirm
+  [[ "$confirm" =~ ^[Yy]$ ]] || { echo_warn "已取消。"; return 0; }
+
+  if is_debian_like; then
+    repair_apt_sources_auto || true
+    export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a APT_LISTCHANGES_FRONTEND=none UCF_FORCE_CONFFOLD=1
+    apt-get update -y
+    apt-get -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" upgrade
+    apt-get -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" dist-upgrade
+    apt-get -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" full-upgrade
+    apt-get -y autoremove --purge
+    apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" unzip vim git curl screen htop vnstat net-tools dnsutils sudo wget openssh-server openssh-client
+    openssh_security_upgrade
+  elif is_redhat; then
+    yum makecache -y || true
+    yum update -y
+    yum install -y unzip vim git curl screen htop vnstat net-tools bind-utils sudo wget openssh-server openssh-clients
+    openssh_security_upgrade
+  else
+    echo_error "暂不支持当前系统。"
+  fi
+}
+
+new_server_init_menu() {
+  while true; do
+    echo
+    echo_info "新服务器初始化 / 源修复 / 更新"
+    echo "1) 自动检测并修复 APT 源（含旧发行版 old-releases/archive 修复）"
+    echo "2) 保守更新：安装 wget/curl/sudo/vim/git/unzip，并顺带升级 OpenSSH"
+    echo "3) 全量更新：upgrade/dist-upgrade/full-upgrade/autoremove + 常用工具 + OpenSSH"
+    echo "4) 仅尝试修复 OpenSSH 高危漏洞（升级 openssh-server/client）"
+    echo "5) 查看当前 sources.list"
+    echo "0) 返回"
+    read -r -p "请选择: " opt
+    case "$opt" in
+      1) repair_apt_sources_auto ;;
+      2) new_server_basic_update ;;
+      3) new_server_full_update ;;
+      4) openssh_security_upgrade ;;
+      5) cat /etc/apt/sources.list 2>/dev/null || echo_warn "未找到 /etc/apt/sources.list" ;;
+      0) return 0 ;;
+      *) echo_error "无效选项" ;;
+    esac
+  done
+}
+
 # ========== 菜单：双竖排 ==========
 print_menu() {
-  echo_color "\n====================== server-toolkit ${SERVER_TOOLKIT_VERSION} ======================"
-  printf "  %-42s | %-42s\n" "1) 时间同步" "8) 显示服务器基本信息"
-  printf "  %-42s | %-42s\n" "2) 关闭防火墙" "9) YABS 测试"
-  printf "  %-42s | %-42s\n" "3) 关闭 SELinux" "10) 设置定时重启"
-  printf "  %-42s | %-42s\n" "4) SSH 安全性增强向导" "11) 哪吒面板管理"
-  printf "  %-42s | %-42s\n" "5) Fail2Ban 管理" "12) IP 质量检测"
-  printf "  %-42s | %-42s\n" "6) SSH 端口/密码/密钥/root 管理" "13) IPv6 一键开启/关闭"
-  printf "  %-42s | %-42s\n" "7) 流媒体解锁检测" "14) 服务器加固"
-  printf "  %-42s\n" "0) 退出"
-  echo_color "================================================================================="
+  clear
+  echo -e "\e[1;36m╔══════════════════════════════════════════════════════════════════════════════╗\e[0m"
+  printf "\e[1;36m║\e[0m  \e[1;35m%-72s\e[0m\e[1;36m║\e[0m\n" "server-toolkit ${SERVER_TOOLKIT_VERSION} · Linux 服务器工具箱"
+  echo -e "\e[1;36m╠══════════════════════════════════╦═══════════════════════════════════════════╣\e[0m"
+  printf "\e[1;36m║\e[0m  \e[1;32m%-30s\e[0m \e[1;36m║\e[0m  \e[1;32m%-39s\e[0m\e[1;36m║\e[0m\n" "1) HTTP 时间同步" "9) YABS 测试"
+  printf "\e[1;36m║\e[0m  \e[1;32m%-30s\e[0m \e[1;36m║\e[0m  \e[1;32m%-39s\e[0m\e[1;36m║\e[0m\n" "2) 防火墙开启/关闭" "10) 设置定时重启"
+  printf "\e[1;36m║\e[0m  \e[1;32m%-30s\e[0m \e[1;36m║\e[0m  \e[1;32m%-39s\e[0m\e[1;36m║\e[0m\n" "3) SELinux 开启/关闭" "11) 哪吒面板管理"
+  printf "\e[1;36m║\e[0m  \e[1;32m%-30s\e[0m \e[1;36m║\e[0m  \e[1;32m%-39s\e[0m\e[1;36m║\e[0m\n" "4) SSH 安全性增强向导" "12) IP 质量检测"
+  printf "\e[1;36m║\e[0m  \e[1;32m%-30s\e[0m \e[1;36m║\e[0m  \e[1;32m%-39s\e[0m\e[1;36m║\e[0m\n" "5) Fail2Ban 管理" "13) IPv6 一键开启/关闭"
+  printf "\e[1;36m║\e[0m  \e[1;32m%-30s\e[0m \e[1;36m║\e[0m  \e[1;32m%-39s\e[0m\e[1;36m║\e[0m\n" "6) SSH 端口/密码/密钥/root" "14) 服务器加固"
+  printf "\e[1;36m║\e[0m  \e[1;32m%-30s\e[0m \e[1;36m║\e[0m  \e[1;32m%-39s\e[0m\e[1;36m║\e[0m\n" "7) 流媒体解锁检测" "15) 新服务器初始化/源修复"
+  printf "\e[1;36m║\e[0m  \e[1;32m%-30s\e[0m \e[1;36m║\e[0m  \e[1;31m%-39s\e[0m\e[1;36m║\e[0m\n" "8) 显示服务器基本信息" "0) 退出"
+  echo -e "\e[1;36m╚══════════════════════════════════╩═══════════════════════════════════════════╝\e[0m"
 }
 
 require_root
@@ -1245,8 +1696,8 @@ while true; do
 
   case $option in
     1) time_sync; pause_return ;;
-    2) disable_firewall; pause_return ;;
-    3) disable_selinux; pause_return ;;
+    2) manage_firewall ;;
+    3) manage_selinux ;;
     4) secure_ssh ;;
     5) manage_fail2ban ;;
     6) change_ssh_port_password ;;
@@ -1258,6 +1709,7 @@ while true; do
     12) check_ip_quality ;;
     13) manage_ipv6 ;;
     14) server_hardening ;;
+    15) new_server_init_menu ;;
     0) echo_color "退出"; exit 0 ;;
     *) echo_error "无效的选项，请重新输入"; pause_return ;;
   esac

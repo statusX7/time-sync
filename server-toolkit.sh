@@ -1,10 +1,10 @@
 #!/bin/bash
 set -u
 
-SERVER_TOOLKIT_VERSION="v2.0"
+SERVER_TOOLKIT_VERSION="v2.1"
 
 # ============================================================
-# server-toolkit.sh v2.0
+# server-toolkit.sh v2.1
 # 适用：Debian / Ubuntu / CentOS / RHEL-like
 # 原则：先备份、先检测、尽量不破坏当前 SSH 会话。
 # ============================================================
@@ -23,7 +23,7 @@ pause_return() {
   read -r -p "按 Enter 返回菜单..."
 }
 
-# ========== UI 辅助函数（v2.0 统一风格） ==========
+# ========== UI 辅助函数（v2.1 统一风格） ==========
 UI_LINE="────────────────────────────────────────────────────────────"
 
 ui_hr() {
@@ -41,11 +41,11 @@ ui_option() {
   # 统一子菜单风格：不用复杂边框，避免中文宽度在不同终端错位。
   local num="$1"
   local text="$2"
-  printf "  \e[1;32m%2s\e[0m  %s\n" "${num})" "$text"
+  printf "  \e[1;32m%-4s\e[0m %s\n" "${num})" "$text"
 }
 
 ui_back() {
-  printf "  \e[1;31m%2s\e[0m  %s\n" "0)" "返回"
+  printf "  \e[1;31m%-4s\e[0m %s\n" "0)" "返回"
 }
 
 ui_prompt() {
@@ -116,11 +116,22 @@ set_sshd_kv() {
 get_current_ssh_ports() {
   local ports
   ports="$(sshd -T 2>/dev/null | awk '$1=="port"{print $2}' | sort -n | paste -sd, - 2>/dev/null || true)"
-  # v1.9：如果 sshd -T 不可用，回退到数字 22，避免防火墙放行时因 "ssh" 字符串被跳过。
+  # v2.1：如果 sshd -T 不可用，回退到数字 22，避免防火墙放行时因 "ssh" 字符串被跳过。
   if [ -z "$ports" ]; then
     ports="22"
   fi
   echo "$ports"
+}
+
+port_in_use() {
+  local port="$1"
+  if command -v ss >/dev/null 2>&1; then
+    ss -lnt 2>/dev/null | awk '{print $4}' | grep -Eq "[:.]${port}$"
+  elif command -v netstat >/dev/null 2>&1; then
+    netstat -lnt 2>/dev/null | awk '{print $4}' | grep -Eq "[:.]${port}$"
+  else
+    return 1
+  fi
 }
 
 # ========== 1. 时间同步 ==========
@@ -128,7 +139,7 @@ time_sync() {
   ui_title "时间同步 · ntpdate + cron"
   echo_color "正在配置 ntpdate 时间同步（每30分钟自动同步）..."
 
-  # v2.0：按要求只保留 Google 与 Cloudflare 两个 NTP 源。
+  # v2.1：继续只保留 Google 与 Cloudflare 两个 NTP 源。
   # 同时继续清理 v1.8 遗留的 HTTP 时间同步脚本和 cron 任务，避免两套同步逻辑并存。
 
   if ! command -v ntpdate >/dev/null 2>&1; then
@@ -164,7 +175,7 @@ time_sync() {
 
   cat > "$sync_bin" <<'EOF'
 #!/bin/sh
-# server-toolkit: ntpdate time sync v2.0
+# server-toolkit: ntpdate time sync v2.1
 # 仅保留 Google 与 Cloudflare 两个 NTP 源；成功一个即退出。
 # -u 使用非特权源端口，能绕过部分网络环境下的 NTP 端口限制。
 
@@ -494,7 +505,7 @@ fail2ban_log_path() {
 }
 
 fail2ban_detect_backend_lines() {
-  # v2.0：Debian 12/Ubuntu minimal 常常没有 /var/log/auth.log，使用 systemd backend 更稳。
+  # v2.1：Debian 12/Ubuntu minimal 常常没有 /var/log/auth.log，使用 systemd backend 更稳。
   # 若非 systemd 环境，则回退到传统日志文件，并尽量创建空日志文件避免服务启动失败。
   local logpath
   logpath="$(fail2ban_log_path)"
@@ -560,7 +571,7 @@ fail2ban_write_sshd_jail() {
 # maxretry = 在 findtime 内失败多少次后封禁
 # ignoreip = 白名单 IP，不会被封禁；建议加入你的固定管理 IP
 # port     = 当前 SSH 端口；支持多个端口，例如 22,2222
-# backend  = v2.0 自动选择；systemd 环境优先用 journal，避免 /var/log/auth.log 不存在导致启动失败
+# backend  = v2.1 自动选择；systemd 环境优先用 journal，避免 /var/log/auth.log 不存在导致启动失败
 
 [DEFAULT]
 bantime = $bantime
@@ -721,7 +732,7 @@ change_ssh_port_only() {
   local SSH_CONFIG_FILE="/etc/ssh/sshd_config"
   local new_port
 
-  read -p "请输入新的 SSH 端口 (1-65535，输入 q 取消): " new_port
+  read -r -p "请输入新的 SSH 端口 (1-65535，输入 q 取消): " new_port
   [[ "$new_port" =~ ^[Qq]$ ]] && { echo_warn "已取消。"; return 0; }
 
   if ! [[ "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -lt 1 ] || [ "$new_port" -gt 65535 ]; then
@@ -729,7 +740,7 @@ change_ssh_port_only() {
     return 1
   fi
 
-  if ss -lnt | awk '{print $4}' | grep -Eq "[:.]${new_port}$"; then
+  if port_in_use "$new_port"; then
     echo_error "端口 $new_port 已被占用，请换一个。"
     return 1
   fi
@@ -755,7 +766,7 @@ change_ssh_port_only() {
 
 change_root_password_only() {
   local new_password
-  read -s -p "请输入 root 新密码（直接回车取消）: " new_password
+  read -r -s -p "请输入 root 新密码（直接回车取消）: " new_password
   echo
 
   [ -z "$new_password" ] && { echo_warn "已取消。"; return 0; }
@@ -946,7 +957,7 @@ manage_root_login_user() {
         useradd -m -s /bin/bash "$user"
       fi
 
-      read -s -p "请输入新用户密码: " pass
+      read -r -s -p "请输入新用户密码: " pass
       echo
       [ -z "$pass" ] && { echo_error "密码不能为空。"; return 1; }
       echo "${user}:${pass}" | chpasswd
@@ -993,7 +1004,7 @@ change_ssh_port_and_password_together() {
   local SSH_CONFIG_FILE="/etc/ssh/sshd_config"
   local new_port new_password
 
-  read -p "请输入新的 SSH 端口 (1-65535，输入 q 取消): " new_port
+  read -r -p "请输入新的 SSH 端口 (1-65535，输入 q 取消): " new_port
   [[ "$new_port" =~ ^[Qq]$ ]] && { echo_warn "已取消。"; return 0; }
 
   if ! [[ "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -lt 1 ] || [ "$new_port" -gt 65535 ]; then
@@ -1001,12 +1012,12 @@ change_ssh_port_and_password_together() {
     return 1
   fi
 
-  if ss -lnt | awk '{print $4}' | grep -Eq "[:.]${new_port}$"; then
+  if port_in_use "$new_port"; then
     echo_error "端口 $new_port 已被占用，请换一个。"
     return 1
   fi
 
-  read -s -p "请输入 root 新密码（直接回车取消）: " new_password
+  read -r -s -p "请输入 root 新密码（直接回车取消）: " new_password
   echo
   [ -z "$new_password" ] && { echo_warn "已取消。"; return 0; }
 
@@ -1045,7 +1056,7 @@ change_ssh_port_password() {
     ui_option 6 "关闭 root 登录并新增 sudo 用户 / 恢复 root 登录"
     ui_option 7 "查看当前 SSH 关键配置"
     ui_back
-    read -p "请选择: " mode
+    read -r -p "请选择: " mode
 
     case "$mode" in
       1) change_ssh_port_only ;;
@@ -1196,7 +1207,7 @@ yabs_test() { curl -sL yabs.sh | bash; }
 
 # ========== 10. 设置定时重启 ==========
 setup_cron_reboot() {
-  read -p "请输入每隔多少小时重启一次（例如 12）: " interval
+  read -r -p "请输入每隔多少小时重启一次（例如 12）: " interval
   if ! [[ "$interval" =~ ^[0-9]+$ ]] || [ "$interval" -lt 1 ] || [ "$interval" -gt 720 ]; then
     echo_error "请输入有效的小时数字（1-720）。"
     return
@@ -1249,7 +1260,7 @@ manage_nezha() {
     ui_option 5 "移除 Agent 定期重启任务"
     ui_option 6 "卸载哪吒面板/探针"
     ui_back
-    read -p "请选择: " nezha_opt
+    read -r -p "请选择: " nezha_opt
 
     case "$nezha_opt" in
       1) systemctl restart nezha-agent 2>/dev/null || true; echo_color "已尝试重启 nezha-agent。" ;;
@@ -1323,7 +1334,7 @@ manage_ipv6() {
   ui_option 2 "一键关闭 IPv6"
   ui_option 3 "查看 IPv6 状态"
   ui_back
-  read -p "请选择: " ipv6_opt
+  read -r -p "请选择: " ipv6_opt
 
   case "$ipv6_opt" in
     1)
@@ -1626,8 +1637,11 @@ server_hardening() {
 
 
 # ========== 15. 新服务器初始化 / 源修复 / 更新 ==========
-apt_env_prefix() {
-  echo "DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a APT_LISTCHANGES_FRONTEND=none UCF_FORCE_CONFFOLD=1"
+apt_env_export() {
+  export DEBIAN_FRONTEND=noninteractive
+  export NEEDRESTART_MODE=a
+  export APT_LISTCHANGES_FRONTEND=none
+  export UCF_FORCE_CONFFOLD=1
 }
 
 get_os_id() {
@@ -1638,44 +1652,352 @@ get_os_codename() {
   . /etc/os-release 2>/dev/null && echo "${VERSION_CODENAME:-${UBUNTU_CODENAME:-}}" || true
 }
 
+apt_probe_tool_exists() {
+  command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1
+}
+
 curl_has_release() {
   local base="$1" suite="$2" url1 url2
   url1="${base%/}/dists/${suite}/InRelease"
   url2="${base%/}/dists/${suite}/Release"
 
   if command -v curl >/dev/null 2>&1; then
-    curl -fsIL --max-time 8 "$url1" >/dev/null 2>&1 || curl -fsIL --max-time 8 "$url2" >/dev/null 2>&1
+    curl -fsSL --connect-timeout 5 --max-time 10 -o /dev/null "$url1" >/dev/null 2>&1 || \
+      curl -fsSL --connect-timeout 5 --max-time 10 -o /dev/null "$url2" >/dev/null 2>&1
   elif command -v wget >/dev/null 2>&1; then
-    wget --spider -q --timeout=8 "$url1" >/dev/null 2>&1 || wget --spider -q --timeout=8 "$url2" >/dev/null 2>&1
+    wget --spider -q --timeout=10 "$url1" >/dev/null 2>&1 || \
+      wget --spider -q --timeout=10 "$url2" >/dev/null 2>&1
   else
-    echo_warn "未检测到 curl/wget，无法自动检测源有效性。"
-    return 1
+    return 2
   fi
 }
 
-write_ubuntu_sources() {
-  local base="$1" code="$2"
-  backup_file /etc/apt/sources.list
-  cat > /etc/apt/sources.list <<EOF
-# server-toolkit v1.9 generated Ubuntu sources
+debian_components_by_codename() {
+  local code="$1"
+  case "$code" in
+    wheezy|jessie|stretch|buster|bullseye)
+      echo "main contrib non-free"
+      ;;
+    *)
+      echo "main contrib non-free non-free-firmware"
+      ;;
+  esac
+}
+
+apt_set_archive_mode() {
+  local mode="$1"
+  local conf="/etc/apt/apt.conf.d/99-server-toolkit-archive"
+  mkdir -p /etc/apt/apt.conf.d
+  if [ "$mode" = "archive" ]; then
+    cat > "$conf" <<EOF
+// server-toolkit v2.1: old archive sources often have expired Release metadata.
+Acquire::Check-Valid-Until "false";
+EOF
+    echo_warn "已为归档源写入：$conf"
+  else
+    if [ -f "$conf" ]; then
+      backup_file "$conf"
+      rm -f "$conf"
+      echo_info "已移除旧归档源 Valid-Until 放宽配置。"
+    fi
+  fi
+}
+
+apt_disable_conflicting_distro_sources() {
+  local tag f
+  tag="$(date +%F_%H-%M-%S)"
+  mkdir -p /etc/apt/sources.list.d
+
+  for f in /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do
+    [ -f "$f" ] || continue
+    case "$f" in
+      *.server-toolkit-disabled.*|*.bak.*) continue ;;
+    esac
+    if grep -Eiq '(archive\.ubuntu\.com|security\.ubuntu\.com|old-releases\.ubuntu\.com|deb\.debian\.org|security\.debian\.org|archive\.debian\.org|mirror\.google\.com|mirror\.yandex\.ru|cloudflaremirrors\.com)' "$f"; then
+      cp -a "$f" "${f}.bak.${tag}" 2>/dev/null || true
+      mv "$f" "${f}.server-toolkit-disabled.${tag}" 2>/dev/null || true
+      echo_warn "已暂时停用可能冲突的发行版源文件：$f"
+    fi
+  done
+}
+
+apt_write_header() {
+  local file="$1" os="$2" label="$3" base="$4"
+  cat > "$file" <<EOF
+# server-toolkit v2.1 generated $os sources
+# source: $label
 # base: $base
-deb ${base} ${code} main restricted universe multiverse
-deb ${base} ${code}-updates main restricted universe multiverse
-deb ${base} ${code}-security main restricted universe multiverse
-deb ${base} ${code}-backports main restricted universe multiverse
+# generated_at: $(date '+%F %T %Z')
 EOF
 }
 
+apt_add_deb_line_if_exists() {
+  local file="$1" base="$2" suite="$3" components="$4"
+  if ! apt_probe_tool_exists; then
+    printf 'deb %s %s %s\n' "$base" "$suite" "$components" >> "$file"
+    return 0
+  fi
+  if curl_has_release "$base" "$suite"; then
+    printf 'deb %s %s %s\n' "$base" "$suite" "$components" >> "$file"
+    return 0
+  fi
+  return 1
+}
+
+apt_detect_ubuntu_security_base() {
+  local base="$1" preferred_secbase="$2" code="$3"
+  if ! apt_probe_tool_exists; then
+    echo "${preferred_secbase:-$base}"
+  elif [ -n "$preferred_secbase" ] && curl_has_release "$preferred_secbase" "${code}-security"; then
+    echo "$preferred_secbase"
+  elif curl_has_release "$base" "${code}-security"; then
+    echo "$base"
+  else
+    echo ""
+  fi
+}
+
+apt_detect_debian_security_ref() {
+  local base="$1" preferred_secbase="$2" code="$3" item b s
+  if ! apt_probe_tool_exists; then
+    printf '%s|%s\n' "${preferred_secbase:-$base}" "${code}-security"
+    return 0
+  fi
+  for item in \
+    "${preferred_secbase}|${code}-security" \
+    "https://security.debian.org/debian-security/|${code}-security" \
+    "http://security.debian.org/debian-security/|${code}-security" \
+    "https://deb.debian.org/debian-security/|${code}-security" \
+    "http://deb.debian.org/debian-security/|${code}-security" \
+    "https://archive.debian.org/debian-security/|${code}/updates" \
+    "http://archive.debian.org/debian-security/|${code}/updates" \
+    "https://archive.debian.org/debian-security/|${code}-security" \
+    "http://archive.debian.org/debian-security/|${code}-security" \
+    "${base}|${code}-security"; do
+    b="${item%%|*}"
+    s="${item#*|}"
+    [ -n "$b" ] || continue
+    if curl_has_release "$b" "$s"; then
+      printf '%s|%s\n' "$b" "$s"
+      return 0
+    fi
+  done
+  printf '|\n'
+}
+
+write_ubuntu_sources() {
+  local base="$1" secbase="$2" code="$3" label="$4" archive_mode="$5"
+  local file="/etc/apt/sources.list" final_secbase
+  backup_file "$file"
+  apt_disable_conflicting_distro_sources
+  apt_write_header "$file" "Ubuntu" "$label" "$base"
+
+  if ! apt_add_deb_line_if_exists "$file" "$base" "$code" "main restricted universe multiverse"; then
+    echo_error "源 $base 不包含 Ubuntu ${code}，未写入。"
+    return 1
+  fi
+  apt_add_deb_line_if_exists "$file" "$base" "${code}-updates" "main restricted universe multiverse" || true
+  final_secbase="$(apt_detect_ubuntu_security_base "$base" "$secbase" "$code")"
+  if [ -n "$final_secbase" ]; then
+    apt_add_deb_line_if_exists "$file" "$final_secbase" "${code}-security" "main restricted universe multiverse" || true
+  else
+    echo_warn "未检测到 ${code}-security，已跳过 security 行。"
+  fi
+  apt_add_deb_line_if_exists "$file" "$base" "${code}-backports" "main restricted universe multiverse" || true
+  apt_set_archive_mode "$archive_mode"
+}
+
 write_debian_sources() {
-  local base="$1" secbase="$2" code="$3"
-  backup_file /etc/apt/sources.list
-  cat > /etc/apt/sources.list <<EOF
-# server-toolkit v1.9 generated Debian sources
-# base: $base
-deb ${base} ${code} main contrib non-free non-free-firmware
-deb ${base} ${code}-updates main contrib non-free non-free-firmware
-deb ${secbase} ${code}-security main contrib non-free non-free-firmware
+  local base="$1" secbase="$2" code="$3" label="$4" archive_mode="$5"
+  local file="/etc/apt/sources.list" components sec_ref sec_final sec_suite
+  components="$(debian_components_by_codename "$code")"
+  backup_file "$file"
+  apt_disable_conflicting_distro_sources
+  apt_write_header "$file" "Debian" "$label" "$base"
+
+  if ! apt_add_deb_line_if_exists "$file" "$base" "$code" "$components"; then
+    echo_error "源 $base 不包含 Debian ${code}，未写入。"
+    return 1
+  fi
+  apt_add_deb_line_if_exists "$file" "$base" "${code}-updates" "$components" || true
+  sec_ref="$(apt_detect_debian_security_ref "$base" "$secbase" "$code")"
+  sec_final="${sec_ref%%|*}"
+  sec_suite="${sec_ref#*|}"
+  if [ -n "$sec_final" ] && [ -n "$sec_suite" ]; then
+    printf 'deb %s %s %s\n' "$sec_final" "$sec_suite" "$components" >> "$file"
+  else
+    echo_warn "未检测到 Debian security 源，已跳过 security 行。"
+  fi
+  apt_set_archive_mode "$archive_mode"
+}
+
+apt_source_candidates() {
+  local os="$1"
+  if [ "$os" = "ubuntu" ]; then
+    cat <<'EOF'
+official|官方源 archive.ubuntu.com + security.ubuntu.com|https://archive.ubuntu.com/ubuntu/|https://security.ubuntu.com/ubuntu/|normal
+official-http|官方源 HTTP archive.ubuntu.com|http://archive.ubuntu.com/ubuntu/|http://security.ubuntu.com/ubuntu/|normal
+google|Google 镜像 mirror.google.com|https://mirror.google.com/linux/ubuntu/|https://mirror.google.com/linux/ubuntu/|normal
+cloudflare|Cloudflare Mirrors（检测可用才会写入）|https://cloudflaremirrors.com/ubuntu/|https://cloudflaremirrors.com/ubuntu/|normal
+yandex|Yandex 镜像 mirror.yandex.ru|https://mirror.yandex.ru/ubuntu/|https://mirror.yandex.ru/ubuntu/|normal
+yandex-http|Yandex 镜像 HTTP mirror.yandex.ru|http://mirror.yandex.ru/ubuntu/|http://mirror.yandex.ru/ubuntu/|normal
+old-releases|Ubuntu old-releases 旧发行版兜底|https://old-releases.ubuntu.com/ubuntu/|https://old-releases.ubuntu.com/ubuntu/|archive
+old-releases-http|Ubuntu old-releases HTTP 旧发行版兜底|http://old-releases.ubuntu.com/ubuntu/|http://old-releases.ubuntu.com/ubuntu/|archive
 EOF
+  else
+    cat <<'EOF'
+official|官方源 deb.debian.org + security.debian.org|https://deb.debian.org/debian/|https://security.debian.org/debian-security/|normal
+official-http|官方源 HTTP deb.debian.org|http://deb.debian.org/debian/|http://security.debian.org/debian-security/|normal
+google|Google 镜像 mirror.google.com/debian|https://mirror.google.com/debian/|https://security.debian.org/debian-security/|normal
+cloudflare|Cloudflare Mirrors cloudflaremirrors.com/debian|https://cloudflaremirrors.com/debian/|https://security.debian.org/debian-security/|normal
+yandex|Yandex 镜像 mirror.yandex.ru/debian|https://mirror.yandex.ru/debian/|https://mirror.yandex.ru/debian-security/|normal
+yandex-http|Yandex 镜像 HTTP mirror.yandex.ru/debian|http://mirror.yandex.ru/debian/|http://mirror.yandex.ru/debian-security/|normal
+archive|Debian archive.debian.org 旧发行版兜底|https://archive.debian.org/debian/|https://archive.debian.org/debian-security/|archive
+archive-http|Debian archive HTTP 旧发行版兜底|http://archive.debian.org/debian/|http://archive.debian.org/debian-security/|archive
+EOF
+  fi
+}
+
+apt_apply_candidate() {
+  local os="$1" code="$2" key="$3" label="$4" base="$5" secbase="$6" archive_mode="$7"
+  echo_info "准备写入 APT 源：$label"
+  echo_info "Base: $base"
+  if [ "$os" = "ubuntu" ]; then
+    write_ubuntu_sources "$base" "$secbase" "$code" "$label" "$archive_mode" || return 1
+  else
+    write_debian_sources "$base" "$secbase" "$code" "$label" "$archive_mode" || return 1
+  fi
+
+  apt_env_export
+  apt-get clean >/dev/null 2>&1 || true
+  if apt-get update -y; then
+    echo_color "APT 源已修复/切换成功：$label"
+    return 0
+  fi
+
+  echo_error "apt-get update 失败：$label"
+  echo_warn "已保留 /etc/apt/sources.list 的备份，可根据 .bak 时间戳回滚。"
+  return 1
+}
+
+apt_try_auto_repair_sources() {
+  local os="$1" code="$2" key label base secbase archive_mode
+  local tried=0
+
+  echo_info "开始按候选源自动检测并尝试修复。"
+  while IFS='|' read -r key label base secbase archive_mode; do
+    [ -n "$key" ] || continue
+    tried=$((tried + 1))
+    if apt_probe_tool_exists; then
+      if curl_has_release "$base" "$code"; then
+        echo_color "检测可用：$label"
+      else
+        echo_dim "跳过不可用或不包含当前发行版的源：$label"
+        continue
+      fi
+    else
+      echo_warn "未检测到 curl/wget，无法预检源有效性，将直接尝试：$label"
+    fi
+
+    if apt_apply_candidate "$os" "$code" "$key" "$label" "$base" "$secbase" "$archive_mode"; then
+      return 0
+    fi
+  done <<EOF
+$(apt_source_candidates "$os")
+EOF
+
+  [ "$tried" -gt 0 ] || echo_error "未生成任何 APT 候选源。"
+  return 1
+}
+
+apt_source_interactive_chooser() {
+  if ! is_debian_like; then
+    echo_warn "当前不是 Debian/Ubuntu 系，跳过 APT 源选择。"
+    return 0
+  fi
+
+  local os code tmp idx key label base secbase archive_mode opt line
+  os="$(get_os_id)"
+  code="$(get_os_codename)"
+  [ -z "$code" ] && { echo_error "无法识别系统代号，无法选择 APT 源。"; return 1; }
+  [ "$os" = "ubuntu" ] || os="debian"
+
+  tmp="$(mktemp /tmp/server-toolkit-apt-candidates.XXXXXX)" || { echo_error "创建临时文件失败。"; return 1; }
+  idx=1
+
+  ui_title "APT 源池检测 / 切换"
+  echo_info "系统识别：$os / $code"
+  echo_warn "说明：这里是切换一个可用镜像源，不会同时叠加多个同类发行版源，避免 APT 重复源警告。"
+
+  while IFS='|' read -r key label base secbase archive_mode; do
+    [ -n "$key" ] || continue
+    if apt_probe_tool_exists; then
+      if curl_has_release "$base" "$code"; then
+        printf '%s|%s|%s|%s|%s|%s\n' "$idx" "$key" "$label" "$base" "$secbase" "$archive_mode" >> "$tmp"
+        ui_option "$idx" "$label"
+        idx=$((idx + 1))
+      else
+        echo_dim "  --   不可用/不含当前发行版：$label"
+      fi
+    else
+      printf '%s|%s|%s|%s|%s|%s\n' "$idx" "$key" "$label" "$base" "$secbase" "$archive_mode" >> "$tmp"
+      ui_option "$idx" "$label（未预检，直接尝试）"
+      idx=$((idx + 1))
+    fi
+  done <<EOF
+$(apt_source_candidates "$os")
+EOF
+
+  if [ "$idx" -eq 1 ]; then
+    rm -f "$tmp"
+    echo_error "未检测到可用候选源。"
+    return 1
+  fi
+
+  ui_back
+  read -r -p "请选择要写入的源: " opt
+  if [ "$opt" = "0" ]; then
+    rm -f "$tmp"
+    echo_warn "已取消。"
+    return 0
+  fi
+  if ! [[ "$opt" =~ ^[0-9]+$ ]]; then
+    rm -f "$tmp"
+    echo_error "输入无效。"
+    return 1
+  fi
+
+  line="$(awk -F'|' -v n="$opt" '$1==n{print; exit}' "$tmp")"
+  rm -f "$tmp"
+  [ -n "$line" ] || { echo_error "选项不存在。"; return 1; }
+
+  IFS='|' read -r _ key label base secbase archive_mode <<EOF
+$line
+EOF
+
+  apt_apply_candidate "$os" "$code" "$key" "$label" "$base" "$secbase" "$archive_mode"
+}
+
+show_apt_sources_current() {
+  ui_title "当前 APT 源"
+  if [ -f /etc/apt/sources.list ]; then
+    echo_info "/etc/apt/sources.list"
+    sed -n '1,220p' /etc/apt/sources.list
+  else
+    echo_warn "未找到 /etc/apt/sources.list"
+  fi
+
+  echo
+  echo_info "/etc/apt/sources.list.d/"
+  if ls /etc/apt/sources.list.d/* >/dev/null 2>&1; then
+    for f in /etc/apt/sources.list.d/*; do
+      [ -f "$f" ] || continue
+      echo_dim "----- $f -----"
+      sed -n '1,120p' "$f"
+    done
+  else
+    echo_warn "未发现 sources.list.d 条目。"
+  fi
 }
 
 repair_apt_sources_auto() {
@@ -1684,63 +2006,44 @@ repair_apt_sources_auto() {
     return 0
   fi
 
-  local os code base secbase
+  local os code confirm log_file
   os="$(get_os_id)"
   code="$(get_os_codename)"
   [ -z "$code" ] && { echo_error "无法识别系统代号，无法自动换源。"; return 1; }
+  [ "$os" = "ubuntu" ] || os="debian"
+  log_file="/tmp/server-toolkit-apt-update.log"
 
-  mkdir -p /etc/apt/apt.conf.d
+  ui_title "自动检测并修复 APT 源"
+  echo_info "系统识别：$os / $code"
+  echo_info "先检测当前 APT 源是否可用。"
 
-  if [ "$os" = "ubuntu" ]; then
-    echo_info "检测到 Ubuntu：$code，开始检测可用源..."
-    for base in \
-      "https://mirror.yandex.ru/ubuntu/" \
-      "https://ru.archive.ubuntu.com/ubuntu/" \
-      "https://archive.ubuntu.com/ubuntu/" \
-      "http://archive.ubuntu.com/ubuntu/" \
-      "https://old-releases.ubuntu.com/ubuntu/" \
-      "http://old-releases.ubuntu.com/ubuntu/"; do
-      if curl_has_release "$base" "$code"; then
-        echo_color "找到可用 Ubuntu 源：$base"
-        write_ubuntu_sources "$base" "$code"
-        apt-get clean
-        apt-get update -y && return 0
-      fi
-    done
-    echo_error "未找到可用 Ubuntu 源。"
-    return 1
-  else
-    echo_info "检测到 Debian-like：$code，开始检测可用源..."
-    for base in \
-      "https://deb.debian.org/debian/" \
-      "https://mirror.yandex.ru/debian/" \
-      "http://deb.debian.org/debian/" \
-      "https://archive.debian.org/debian/" \
-      "http://archive.debian.org/debian/"; do
-      if curl_has_release "$base" "$code"; then
-        if echo "$base" | grep -q 'archive.debian.org'; then
-          secbase="$base"
-          cat >/etc/apt/apt.conf.d/99-server-toolkit-archive <<EOF
-Acquire::Check-Valid-Until "false";
-EOF
-        else
-          if curl_has_release "https://security.debian.org/debian-security/" "${code}-security"; then
-            secbase="https://security.debian.org/debian-security/"
-          elif curl_has_release "https://mirror.yandex.ru/debian-security/" "${code}-security"; then
-            secbase="https://mirror.yandex.ru/debian-security/"
-          else
-            secbase="$base"
-          fi
-        fi
-        echo_color "找到可用 Debian 源：$base"
-        write_debian_sources "$base" "$secbase" "$code"
-        apt-get clean
-        apt-get update -y && return 0
-      fi
-    done
-    echo_error "未找到可用 Debian 源。"
-    return 1
+  apt_env_export
+  if apt-get update -y >"$log_file" 2>&1; then
+    echo_color "当前 APT 源可正常 update，未强制改写。"
+    read -r -p "是否继续检测并切换到官方/Google/Cloudflare/Yandex/归档源？[y/N]: " confirm
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+      apt_source_interactive_chooser
+    else
+      echo_warn "已保留当前 APT 源。"
+    fi
+    return 0
   fi
+
+  echo_warn "当前 APT 源 update 失败，最近输出如下："
+  tail -n 25 "$log_file" 2>/dev/null || true
+  echo
+  echo_warn "将自动检测候选源并尝试修复；修改前会备份 sources.list，并停用可能冲突的发行版源文件。"
+
+  if apt_try_auto_repair_sources "$os" "$code"; then
+    read -r -p "是否继续检测并切换到其它可用源？[y/N]: " confirm
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+      apt_source_interactive_chooser
+    fi
+    return 0
+  fi
+
+  echo_error "自动修复 APT 源失败。请检查网络、DNS、系统代号是否仍被上游支持。"
+  return 1
 }
 
 openssh_security_upgrade() {
@@ -1749,7 +2052,7 @@ openssh_security_upgrade() {
     yum makecache -y || true
     yum update -y openssh openssh-server openssh-clients || yum update -y openssh-server || true
   elif is_debian_like; then
-    export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a APT_LISTCHANGES_FRONTEND=none UCF_FORCE_CONFFOLD=1
+    apt_env_export
     apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" openssh-server openssh-client || true
     apt-get install -y --only-upgrade -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" openssh-server openssh-client || true
   fi
@@ -1763,7 +2066,7 @@ new_server_basic_update() {
 
   if is_debian_like; then
     repair_apt_sources_auto || true
-    export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a APT_LISTCHANGES_FRONTEND=none UCF_FORCE_CONFFOLD=1
+    apt_env_export
     apt-get update -y
     apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" wget curl sudo vim git unzip openssh-server openssh-client
     openssh_security_upgrade
@@ -1784,7 +2087,7 @@ new_server_full_update() {
 
   if is_debian_like; then
     repair_apt_sources_auto || true
-    export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a APT_LISTCHANGES_FRONTEND=none UCF_FORCE_CONFFOLD=1
+    apt_env_export
     apt-get update -y
     apt-get -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" upgrade
     apt-get -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" dist-upgrade
@@ -1806,11 +2109,12 @@ new_server_init_menu() {
   while true; do
     echo
     ui_title "新服务器初始化 / 源修复 / 更新"
-    ui_option 1 "自动检测并修复 APT 源（含旧发行版 old-releases/archive 修复）"
+    ui_option 1 "自动检测并修复 APT 源；可选官方/Google/Cloudflare/Yandex/归档源"
     ui_option 2 "保守更新：安装 wget/curl/sudo/vim/git/unzip，并顺带升级 OpenSSH"
     ui_option 3 "全量更新：upgrade/dist-upgrade/full-upgrade/autoremove + 常用工具 + OpenSSH"
     ui_option 4 "仅尝试修复 OpenSSH 高危漏洞（升级 openssh-server/client）"
-    ui_option 5 "查看当前 sources.list"
+    ui_option 5 "查看当前 APT 源（sources.list + sources.list.d）"
+    ui_option 6 "手动检测并切换 APT 源池"
     ui_back
     read -r -p "请选择: " opt
     case "$opt" in
@@ -1818,15 +2122,16 @@ new_server_init_menu() {
       2) new_server_basic_update ;;
       3) new_server_full_update ;;
       4) openssh_security_upgrade ;;
-      5) cat /etc/apt/sources.list 2>/dev/null || echo_warn "未找到 /etc/apt/sources.list" ;;
+      5) show_apt_sources_current ;;
+      6) apt_source_interactive_chooser ;;
       0) return 0 ;;
       *) echo_error "无效选项" ;;
     esac
   done
 }
 
-# ========== 菜单：双竖排（v2.0 统一 UI） ==========
-# 说明：v2.0 继续使用稳定双栏列表，避免不同终端/字体下中文宽度错位。
+# ========== 菜单：双竖排（v2.1 统一 UI） ==========
+# 说明：v2.1 继续使用稳定双栏列表，避免不同终端/字体下中文宽度错位。
 menu_text_width() {
   local text="$1"
   local chars bytes wide
@@ -1881,7 +2186,7 @@ require_root
 
 while true; do
   print_menu
-  read -p "请选择一个操作: " option
+  read -r -p "请选择一个操作: " option
 
   case $option in
     1) time_sync; pause_return ;;

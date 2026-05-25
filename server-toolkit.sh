@@ -8,7 +8,7 @@ SERVER_TOOLKIT_VERSION="v2.2"
 # 适用：Debian 10/11/12/13/testing/sid、Ubuntu 20.04/22.04/24.04/26.04、
 #      CentOS 7/Stream 8/9/10、RHEL 8/9/10、Alma/Rocky/Oracle、
 #      Fedora、Amazon Linux 2/2023。
-# 原则：先备份、先检测、尽量不破坏当前 SSH 会话；危险操作输入 YES。
+# 原则：先备份、先检测、尽量不破坏当前 SSH 会话；危险操作默认取消并使用数字确认。
 # v2.2 摘要：重构 /etc/os-release 发行版识别、包管理抽象、APT/RPM 源检测修复、
 #            Debian 13 timesyncd/chrony 时间同步、Ubuntu 24.04 SSH drop-in 生效逻辑、
 #            firewalld/ufw/iptables/nftables、Fail2Ban jail.d、SELinux ssh_port_t、
@@ -918,8 +918,7 @@ toggle_password_login() {
       set_sshd_kv "ChallengeResponseAuthentication" "yes"
       ;;
     2)
-      read -r -p "确认已经测试密钥登录成功？输入 YES 继续: " confirm
-      [ "$confirm" = "YES" ] || { echo_warn "已取消。"; return 0; }
+      confirm_action "关闭密码登录前，请确认已经另开终端测试密钥登录成功。" "2" || { echo_warn "已取消。"; return 0; }
       backup_file /etc/ssh/sshd_config
       set_sshd_kv "PasswordAuthentication" "no"
       set_sshd_kv "KbdInteractiveAuthentication" "no"
@@ -2192,17 +2191,88 @@ print_menu() {
 
 # ============================================================
 # v2.2 重构覆盖层
-# 说明：以下函数会覆盖 v2.1 同名函数，保留旧函数作为回滚参考，运行时以本区块为准。
+# 说明：以下函数会覆盖前面历史函数。历史函数只作为兼容参考，不由 main() 主循环直接调用。
 # 重点：发行版检测、包管理抽象、源修复、时间同步、SSH drop-in 生效、Fail2Ban、防火墙、SELinux。
+# 维护原则：主循环必须在本覆盖层之后定义并通过 main() 进入，避免 source 脚本时自动执行。
 # ============================================================
 
 # ---------- v2.2 通用确认/环境检测 ----------
-confirm_yes() {
-  local msg="$1"
+confirm_action() {
+  local msg="${1:-确认继续？}"
+  local default="${2:-2}"
   local ans
   echo_warn "$msg"
-  read -r -p "输入 YES 继续: " ans
-  [ "$ans" = "YES" ]
+  ui_option 1 "继续"
+  ui_option 2 "取消（默认）"
+  ui_back
+  read -r -p "请选择 [默认 ${default}]: " ans
+  ans="${ans:-$default}"
+  case "$ans" in
+    1) return 0 ;;
+    2|0) return 1 ;;
+    *) echo_error "无效选项，已取消。"; return 1 ;;
+  esac
+}
+
+# 兼容旧调用名：实际已改为数字确认，默认取消。
+confirm_yes() { confirm_action "${1:-确认继续？}" "2"; }
+
+choice_ssh_port_keep_policy() {
+  local ans
+  ui_option 1 "只保留新端口"
+  ui_option 2 "新旧端口都保留（默认，推荐）"
+  ui_back
+  read -r -p "请选择 [默认 2]: " ans
+  ans="${ans:-2}"
+  case "$ans" in
+    1) echo "new_only" ;;
+    2) echo "keep_both" ;;
+    0) echo "cancel" ;;
+    *) echo_error "无效选项，已取消。"; echo "cancel" ;;
+  esac
+}
+
+choice_private_key_action() {
+  local ans
+  ui_option 1 "显示私钥"
+  ui_option 2 "不显示，仅保留服务器路径（默认，推荐）"
+  ui_option 3 "删除服务器上的私钥文件（确认本地已保存后再用）"
+  ui_back
+  read -r -p "请选择 [默认 2]: " ans
+  ans="${ans:-2}"
+  case "$ans" in
+    1|2|3|0) echo "$ans" ;;
+    *) echo_error "无效选项，按默认不显示处理。"; echo "2" ;;
+  esac
+}
+
+validate_ntp_servers() {
+  local input="${1:-}" item
+  [ -n "$input" ] || return 1
+  for item in $input; do
+    if ! [[ "$item" =~ ^[A-Za-z0-9_.:-]+$ ]]; then
+      echo_error "NTP 源包含不允许的字符：$item"
+      return 1
+    fi
+    case "$item" in
+      -*|*..*|*::*::*) echo_error "NTP 源格式可疑：$item"; return 1 ;;
+    esac
+  done
+  return 0
+}
+
+safe_systemctl() {
+  is_systemd_available || return 1
+  systemctl "$@"
+}
+
+show_timesync_diagnostics() {
+  echo_info "时间同步诊断："
+  timedatectl status 2>/dev/null || true
+  timedatectl show-timesync --all 2>/dev/null || true
+  systemd-analyze cat-config systemd/timesyncd.conf --tldr 2>/dev/null || true
+  chronyc tracking 2>/dev/null || true
+  chronyc sources -v 2>/dev/null || true
 }
 
 is_systemd_available() {
@@ -2547,7 +2617,7 @@ manage_firewall() {
     ui_title "防火墙管理"
     ui_option 1 "查看状态/规则/SSH 端口放行情况"
     ui_option 2 "开启防火墙（先放行当前 SSH 端口）"
-    ui_option 3 "关闭防火墙服务（危险，需输入 YES）"
+    ui_option 3 "关闭防火墙服务（危险，默认取消）"
     ui_option 4 "手动放行一个 TCP 端口"
     ui_back
     local opt port
@@ -2852,13 +2922,20 @@ change_ssh_port_only() {
   old_ports="$(get_current_ssh_ports)"
   echo_warn "当前 SSH 端口：$old_ports"
   echo_warn "为避免断连，默认会临时保留旧端口，并同时监听新端口。"
-  read -r -p "输入 YES 表示只保留新端口；直接回车表示新旧端口都保留: " ans
-  if [ "$ans" = "YES" ]; then
-    final_ports="$new_port"
-  else
-    keep_ports="$old_ports,$new_port"
-    final_ports="$(echo "$keep_ports" | tr ',' '\n' | awk 'NF && !seen[$1]++' | paste -sd, -)"
-  fi
+  ans="$(choice_ssh_port_keep_policy)"
+  case "$ans" in
+    new_only)
+      final_ports="$new_port"
+      ;;
+    keep_both)
+      keep_ports="$old_ports,$new_port"
+      final_ports="$(echo "$keep_ports" | awk -F, '{for(i=1;i<=NF;i++) if($i && !seen[$i]++) out=out (out? ",":"") $i; print out}')"
+      ;;
+    cancel)
+      echo_warn "已取消。"
+      return 0
+      ;;
+  esac
   backup_dir="$(make_backup_dir ssh)"
   backup_ssh_tree "$backup_dir"
   allow_port_firewall "$new_port" || true
@@ -2957,12 +3034,30 @@ generate_key_login_and_output_private() {
   echo_info "公钥内容："
   cat "$pub_path"
   echo_warn "默认不直接输出私钥，避免终端录屏/日志泄漏。"
-  read -r -p "确实要在屏幕输出私钥？输入 YES 输出: " ans
-  if [ "$ans" = "YES" ]; then
-    echo "==================== PRIVATE KEY START ===================="
-    cat "$key_path"
-    echo "===================== PRIVATE KEY END ====================="
-  fi
+  while true; do
+    ans="$(choice_private_key_action)"
+    case "$ans" in
+      1)
+        echo "==================== PRIVATE KEY START ===================="
+        cat "$key_path"
+        echo "===================== PRIVATE KEY END ====================="
+        echo_warn "复制到本地后请执行：chmod 600 私钥文件"
+        ;;
+      2)
+        echo_info "已保留私钥在服务器路径：$key_path"
+        return 0
+        ;;
+      3)
+        confirm_action "删除服务器上的私钥文件前，请确认你已经把私钥安全保存到本地。" "2" || continue
+        rm -f "$key_path"
+        echo_warn "已删除服务器上的私钥文件：$key_path"
+        return 0
+        ;;
+      0)
+        return 0
+        ;;
+    esac
+  done
 }
 
 check_authorized_keys_safe() {
@@ -3216,8 +3311,29 @@ manage_selinux() {
 }
 
 # ---------- v2.2 时间同步 ----------
+time_sync_stop_conflicting_clients() {
+  local target="${1:-}" svc
+  [ "$target" = "timesyncd" ] || return 0
+  for svc in chrony chronyd ntp ntpd; do
+    if is_systemd_available && systemctl is-active "$svc" >/dev/null 2>&1; then
+      echo_warn "检测到 ${svc} 正在运行。多个 NTP 客户端同时运行可能争用时间同步。"
+      if confirm_action "是否安全停用 ${svc}，改用 systemd-timesyncd？" "2"; then
+        systemctl disable --now "$svc" || echo_warn "停用 ${svc} 失败，请稍后手动检查。"
+      fi
+    fi
+  done
+}
+
 time_sync_configure_timesyncd() {
-  local ntp="$1" conf_dir="/etc/systemd/timesyncd.conf.d" conf="$conf_dir/server-toolkit.conf"
+  local ntp="${1:-}"
+  local conf_dir="/etc/systemd/timesyncd.conf.d"
+  local conf="${conf_dir}/server-toolkit.conf"
+
+  validate_ntp_servers "$ntp" || return 1
+  if ! is_systemd_available; then
+    echo_warn "当前环境没有可用 systemd，无法配置 systemd-timesyncd。"
+    return 1
+  fi
   ensure_command timedatectl systemd || true
   if ! command -v timedatectl >/dev/null 2>&1; then
     echo_warn "未检测到 timedatectl，无法使用 systemd-timesyncd。"
@@ -3226,7 +3342,11 @@ time_sync_configure_timesyncd() {
   if ! systemctl list-unit-files 2>/dev/null | grep -q '^systemd-timesyncd\.service'; then
     pkg_install systemd-timesyncd || true
   fi
-  systemctl list-unit-files 2>/dev/null | grep -q '^systemd-timesyncd\.service' || return 1
+  if ! systemctl list-unit-files 2>/dev/null | grep -q '^systemd-timesyncd\.service'; then
+    echo_warn "未检测到 systemd-timesyncd.service。"
+    return 1
+  fi
+
   mkdir -p "$conf_dir"
   backup_file "$conf"
   cat > "$conf" <<EOF
@@ -3235,16 +3355,27 @@ time_sync_configure_timesyncd() {
 NTP=$ntp
 FallbackNTP=time.google.com time.cloudflare.com
 EOF
-  timedatectl set-ntp true || true
-  systemctl enable --now systemd-timesyncd || true
-  systemctl restart systemd-timesyncd || true
+
+  time_sync_stop_conflicting_clients timesyncd
+  timedatectl set-ntp true || echo_warn "timedatectl set-ntp true 失败，继续尝试启动 timesyncd。"
+  systemctl enable --now systemd-timesyncd || { echo_error "启动 systemd-timesyncd 失败。"; return 1; }
+  systemctl restart systemd-timesyncd || { echo_error "重启 systemd-timesyncd 失败。"; return 1; }
   echo_color "已配置 systemd-timesyncd。"
-  timedatectl status || true
+  show_timesync_diagnostics
 }
 
 time_sync_configure_chrony() {
-  local ntp="$1" conf service line tmp
-  if [ -f /etc/chrony/chrony.conf ]; then conf="/etc/chrony/chrony.conf"; service="chrony"; else conf="/etc/chrony.conf"; service="chronyd"; fi
+  local ntp="${1:-}"
+  local conf service line tmp
+
+  validate_ntp_servers "$ntp" || return 1
+  if [ -f /etc/chrony/chrony.conf ]; then
+    conf="/etc/chrony/chrony.conf"
+    service="chrony"
+  else
+    conf="/etc/chrony.conf"
+    service="chronyd"
+  fi
   command -v chronyd >/dev/null 2>&1 || pkg_install chrony || return 1
   mkdir -p "$(dirname "$conf")"
   touch "$conf"
@@ -3262,22 +3393,30 @@ time_sync_configure_chrony() {
     echo "# server-toolkit v2.2 END"
   } > "$conf"
   rm -f "$tmp"
+
+  if is_systemd_available && systemctl is-active systemd-timesyncd >/dev/null 2>&1; then
+    echo_warn "检测到 systemd-timesyncd 正在运行。多个 NTP 客户端同时运行可能争用时间同步。"
+    if confirm_action "是否安全停用 systemd-timesyncd，改用 chrony？" "2"; then
+      systemctl disable --now systemd-timesyncd || echo_warn "停用 systemd-timesyncd 失败，请手动检查。"
+    fi
+  fi
+
   service_enable_now "$service" || service_enable_now chronyd || service_enable_now chrony || true
-  service_restart_safe "$service" || service_restart_safe chronyd || service_restart_safe chrony || true
+  service_restart_safe "$service" || service_restart_safe chronyd || service_restart_safe chrony || { echo_error "chrony 服务启动/重启失败。"; return 1; }
   echo_color "已配置 chrony。"
-  chronyc tracking 2>/dev/null || true
-  chronyc sources -v 2>/dev/null || true
+  show_timesync_diagnostics
 }
 
 time_sync_one_shot_fallback() {
-  local ntp="$1" s first
+  local ntp="${1:-}" s first
+  validate_ntp_servers "$ntp" || return 1
   first="$(echo "$ntp" | awk '{print $1}')"
   if command -v chronyd >/dev/null 2>&1; then
     echo_info "尝试 chronyd -q 一次性校时..."
     chronyd -q "server $first iburst" && return 0
   fi
   if command -v ntpdate >/dev/null 2>&1; then
-    ntpdate -u $ntp && return 0
+    for s in $ntp; do ntpdate -u "$s" && return 0; done
   fi
   if command -v sntp >/dev/null 2>&1; then
     for s in $ntp; do sntp -S "$s" && return 0; done
@@ -3291,8 +3430,15 @@ time_sync() {
   show_os_detected
   local ntp custom method
   ntp="time.google.com time.cloudflare.com"
-  read -r -p "NTP 源，直接回车使用默认 [$ntp]，或输入自定义多个域名: " custom
-  [ -n "$custom" ] && ntp="$custom"
+  read -r -p "NTP 源，直接回车使用默认 [$ntp]，或输入自定义多个域名/IP: " custom
+  if [ -n "$custom" ]; then
+    if validate_ntp_servers "$custom"; then
+      ntp="$custom"
+    else
+      echo_error "自定义 NTP 源无效，已取消。"
+      return 1
+    fi
+  fi
   if is_container_env; then
     echo_warn "检测到容器环境。容器通常没有 CAP_SYS_TIME，时间应由宿主机同步。"
   fi
@@ -3307,15 +3453,15 @@ time_sync() {
   fi
   if is_debian_like; then
     echo_info "Debian/Ubuntu 系：优先 systemd-timesyncd；失败再使用 chrony。Debian 13/Trixie 不再依赖 ntpdate。"
-    if time_sync_configure_timesyncd "$ntp"; then method="systemd-timesyncd"; else time_sync_configure_chrony "$ntp" && method="chrony"; fi
+    if time_sync_configure_timesyncd "$ntp"; then
+      method="systemd-timesyncd"
+    elif time_sync_configure_chrony "$ntp"; then
+      method="chrony"
+    fi
   else
     echo_info "RedHat/Fedora/Amazon 系：优先 chrony/chronyd。"
     time_sync_configure_chrony "$ntp" && method="chrony"
   fi
-  echo_info "当前检查："
-  timedatectl status 2>/dev/null || true
-  chronyc tracking 2>/dev/null || true
-  chronyc sources -v 2>/dev/null || true
   [ -n "${method:-}" ] && echo_color "时间同步配置完成：$method" || echo_warn "时间同步配置未完全成功，请查看上方错误。"
 }
 
@@ -3453,6 +3599,19 @@ EOF
   fi
 }
 
+apt_update_with_log() {
+  local log
+  log="$(mktemp /tmp/server-toolkit-apt-update.XXXXXX.log)" || return 1
+  echo_info "APT 更新日志：$log"
+  if DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold update >"$log" 2>&1; then
+    echo_color "apt-get update 验证通过。日志：$log"
+    return 0
+  fi
+  echo_error "apt-get update 失败，日志保存在：$log"
+  tail -n 60 "$log" 2>/dev/null || true
+  return 1
+}
+
 apt_apply_source_profile() {
   local profile="$1" backup codename mirror security components archive_mode="no"
   parse_os_release
@@ -3484,13 +3643,13 @@ apt_apply_source_profile() {
     apt_write_debian_deb822 "$codename" "$mirror" "$security" "$components" "$archive_mode"
   fi
   echo_info "正在执行 apt-get update 验证新源..."
-  if pkg_makecache; then
+  if apt_update_with_log; then
     echo_color "APT 源修复成功。备份目录：$backup"
     return 0
   fi
   echo_error "apt-get update 失败，开始回滚。"
   apt_restore_sources_dir "$backup"
-  pkg_makecache || true
+  apt_update_with_log || true
   return 1
 }
 
@@ -3502,7 +3661,7 @@ apt_check_sources() {
   echo
   grep -RInE '^[[:space:]]*(deb|Types:|URIs:|Suites:|Components:)' /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null || true
   echo
-  pkg_makecache
+  apt_update_with_log
 }
 
 apt_repair_menu() {
@@ -3724,10 +3883,23 @@ loglevel = $level
 EOF
 }
 
+validate_fail2ban_ignoreip() {
+  local input="${1:-}" item
+  [ -z "$input" ] && return 0
+  for item in $input; do
+    if ! [[ "$item" =~ ^[0-9A-Fa-f:.\/]+$ ]]; then
+      echo_error "ignoreip 包含不允许的字符：$item"
+      return 1
+    fi
+  done
+  return 0
+}
+
 fail2ban_write_sshd_jail_v22() {
-  local ssh_ports="$1" bantime="$2" findtime="$3" maxretry="$4" ignoreip="$5" file="/etc/fail2ban/jail.d/server-toolkit-sshd.conf" backup_dir="$6"
+  local ssh_ports="${1:-}" bantime="${2:-3600}" findtime="${3:-600}" maxretry="${4:-3}" ignoreip="${5:-}" file="/etc/fail2ban/jail.d/server-toolkit-sshd.conf" backup_dir="${6:-}"
+  validate_fail2ban_ignoreip "$ignoreip" || return 1
   mkdir -p /etc/fail2ban/jail.d
-  backup_path_to_dir "$file" "$backup_dir"
+  [ -n "$backup_dir" ] && backup_path_to_dir "$file" "$backup_dir"
   cat > "$file" <<EOF
 # server-toolkit v2.2: sshd jail，不覆盖用户 jail.local
 [sshd]
@@ -4024,7 +4196,13 @@ run_remote_script_confirm() {
     ui_prompt opt
     case "$opt" in
       1) sed -n '1,120p' "$tmp"; pause_return ;;
-      2) confirm_yes "确认执行 $name？" || continue; bash "$tmp"; rm -f "$tmp"; return $? ;;
+      2)
+        confirm_action "确认执行 $name？远程脚本可能修改系统配置。" "2" || continue
+        bash "$tmp"
+        local rc=$?
+        rm -f "$tmp"
+        return "$rc"
+        ;;
       3) echo_info "已保留临时脚本：$tmp"; return 0 ;;
       0) rm -f "$tmp"; return 0 ;;
       *) echo_error "无效选项" ;;
@@ -4270,31 +4448,37 @@ print_menu() {
   printf "\e[2m──────────────────────────────────────────────────────────────────────────────\e[0m\n"
 }
 
-parse_os_release
+main() {
+  parse_os_release
+  require_root
 
-require_root
+  while true; do
+    print_menu
+    local option
+    read -r -p "请选择一个操作: " option
 
-while true; do
-  print_menu
-  read -r -p "请选择一个操作: " option
+    case "$option" in
+      1) time_sync; pause_return ;;
+      2) manage_firewall ;;
+      3) manage_selinux ;;
+      4) secure_ssh ;;
+      5) manage_fail2ban ;;
+      6) change_ssh_port_password ;;
+      7) check_media_unlock ;;
+      8) show_system_info; pause_return ;;
+      9) yabs_test ;;
+      10) setup_cron_reboot; pause_return ;;
+      11) manage_nezha ;;
+      12) check_ip_quality ;;
+      13) manage_ipv6 ;;
+      14) server_hardening ;;
+      15) new_server_init_menu ;;
+      0) echo_color "退出"; exit 0 ;;
+      *) echo_error "无效的选项，请重新输入"; pause_return ;;
+    esac
+  done
+}
 
-  case $option in
-    1) time_sync; pause_return ;;
-    2) manage_firewall ;;
-    3) manage_selinux ;;
-    4) secure_ssh ;;
-    5) manage_fail2ban ;;
-    6) change_ssh_port_password ;;
-    7) check_media_unlock ;;
-    8) show_system_info; pause_return ;;
-    9) yabs_test ;;
-    10) setup_cron_reboot; pause_return ;;
-    11) manage_nezha ;;
-    12) check_ip_quality ;;
-    13) manage_ipv6 ;;
-    14) server_hardening ;;
-    15) new_server_init_menu ;;
-    0) echo_color "退出"; exit 0 ;;
-    *) echo_error "无效的选项，请重新输入"; pause_return ;;
-  esac
-done
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

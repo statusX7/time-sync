@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# lxd-nat-manager-v1.0.sh
+# lxd-nat-manager-v1.1.sh
 # 中文 LXD NAT 小鸡管理脚本
 # 适用：Debian/Ubuntu 母鸡，LXD/LXC NAT 容器，小型隔离环境。
-# 原则：先检测、少破坏、危险操作二次确认。
+# 原则：先检测、少破坏、危险操作编号确认。
 
 set -o pipefail
 
-SCRIPT_VERSION="v1.0"
+SCRIPT_VERSION="v1.1"
 SCRIPT_NAME="lxd-nat-manager"
 INSTALL_PATH="/usr/local/bin/lxdnat"
 STATE_DIR="/etc/lxd-nat-manager"
@@ -50,11 +50,15 @@ safe_mkdir() {
   chmod 600 "$STATE_FILE" 2>/dev/null || true
 }
 
-confirm() {
+confirm_action() {
   local prompt="$1"
-  local answer
-  read -r -p "$prompt 输入 YES 确认：" answer
-  [ "$answer" = "YES" ]
+  local choice
+  echo
+  warn "$prompt"
+  echo "  1) 确认执行"
+  echo "  0) 取消返回"
+  read -r -p "请选择 [0-1]：" choice
+  [ "$choice" = "1" ]
 }
 
 valid_name() {
@@ -192,11 +196,7 @@ quick_init_lxd() {
   warn "本步骤会在未初始化时执行 lxd init --auto，创建默认 NAT 网桥 lxdbr0 和默认存储池。"
   warn "如果你已有复杂 LXD 生产环境，请先退出并手动确认配置。"
   echo
-  read -r -p "是否继续快速初始化？[y/N] " ans
-  case "$ans" in
-    y|Y|yes|YES) ;;
-    *) warn "已取消。"; pause; return ;;
-  esac
+  confirm_action "确认继续快速初始化 LXD？" || { warn "已取消。"; pause; return; }
 
   install_lxd_if_needed || { pause; return; }
 
@@ -412,15 +412,29 @@ EOFV6
   fi
 }
 
+proxy_port_expr() {
+  local startport="$1" endport="$2"
+  if [ "$startport" = "$endport" ]; then
+    echo "$startport"
+  else
+    echo "${startport}-${endport}"
+  fi
+}
+
 add_proxy_devices() {
-  local name="$1" sshport="$2" startport="$3" endport="$4"
+  local name="$1" sshport="$2" startport="$3" endport="$4" port_expr
   info "添加 SSH 端口映射：宿主机 ${sshport} -> 容器 22/TCP"
   lxc config device add "$name" lmgr_ssh proxy listen="tcp:0.0.0.0:${sshport}" connect="tcp:127.0.0.1:22" || return 1
 
   if [ "$startport" != "0" ] && [ "$endport" != "0" ]; then
-    info "添加业务端口映射：${startport}-${endport}/TCP + UDP，同端口转发。"
-    lxc config device add "$name" lmgr_tcp proxy listen="tcp:0.0.0.0:${startport}-${endport}" connect="tcp:127.0.0.1:${startport}-${endport}" || return 1
-    lxc config device add "$name" lmgr_udp proxy listen="udp:0.0.0.0:${startport}-${endport}" connect="udp:127.0.0.1:${startport}-${endport}" || warn "UDP 端口映射失败，TCP 已保留。"
+    port_expr="$(proxy_port_expr "$startport" "$endport")"
+    if [ "$startport" = "$endport" ]; then
+      info "添加业务端口映射：${startport}/TCP + UDP，单端口转发。"
+    else
+      info "添加业务端口映射：${startport}-${endport}/TCP + UDP，同端口转发。"
+    fi
+    lxc config device add "$name" lmgr_tcp proxy listen="tcp:0.0.0.0:${port_expr}" connect="tcp:127.0.0.1:${port_expr}" || return 1
+    lxc config device add "$name" lmgr_udp proxy listen="udp:0.0.0.0:${port_expr}" connect="udp:127.0.0.1:${port_expr}" || warn "UDP 端口映射失败，TCP 已保留。"
   fi
 }
 
@@ -436,7 +450,7 @@ remove_managed_proxy_devices() {
 record_container() {
   local name="$1" cpu="$2" mem="$3" disk="$4" sshport="$5" startport="$6" endport="$7" down="$8" up="$9" ipv6="${10}" image="${11}"
   safe_mkdir
-  grep -v "^${name}|" "$STATE_FILE" 2>/dev/null >"${STATE_FILE}.tmp" || true
+  awk -F"|" -v n="$name" '$1 != n' "$STATE_FILE" 2>/dev/null >"${STATE_FILE}.tmp" || true
   mv -f "${STATE_FILE}.tmp" "$STATE_FILE"
   echo "${name}|cpu=${cpu}|mem=${mem}MB|disk=${disk}GB|ssh=${sshport}|ports=${startport}-${endport}|down=${down}Mbps|up=${up}Mbps|ipv6=${ipv6}|image=${image}|created=$(date '+%F %T')" >>"$STATE_FILE"
 }
@@ -451,7 +465,7 @@ create_container() {
     return
   fi
 
-  local name cpu mem disk sshport startport endport down up ipv6 sys image rootpass
+  local name cpu mem disk sshport startport endport down up ipv6 sys image rootpass ssh_ok=1 port_ok=1
   read -r -p "容器名称：" name
   read -r -p "CPU核数 [1]：" cpu; cpu="${cpu:-1}"
   read -r -p "内存大小MB [256]：" mem; mem="${mem:-256}"
@@ -483,7 +497,7 @@ create_container() {
   echo "  限速：下载 ${down}Mbps / 上传 ${up}Mbps"
   echo "  IPv6：$ipv6"
   echo
-  confirm "确认创建容器 ${name}？" || { warn "已取消。"; pause; return; }
+  confirm_action "确认创建容器 ${name}？" || { warn "已取消。"; pause; return; }
 
   info "拉取镜像并创建容器，首次可能较慢。"
   lxc launch "$image" "$name" || {
@@ -497,12 +511,16 @@ create_container() {
   fi
 
   apply_resources "$name" "$cpu" "$mem" "$disk" "$down" "$up" "$ipv6"
-  install_ssh_in_container "$name" "$rootpass" || warn "SSH 自动安装失败，你仍可使用 lxc exec ${name} -- bash 进入手动修复。"
-  add_proxy_devices "$name" "$sshport" "$startport" "$endport" || warn "端口映射添加失败，请查看容器设备配置。"
+  install_ssh_in_container "$name" "$rootpass" || { ssh_ok=0; warn "SSH 自动安装失败，你仍可使用 lxc exec ${name} -- bash 进入手动修复。"; }
+  add_proxy_devices "$name" "$sshport" "$startport" "$endport" || { port_ok=0; warn "端口映射添加失败，请查看容器设备配置。"; }
   record_container "$name" "$cpu" "$mem" "$disk" "$sshport" "$startport" "$endport" "$down" "$up" "$ipv6" "$image"
 
   echo
-  ok "创建完成。"
+  if [ "$ssh_ok" = "1" ] && [ "$port_ok" = "1" ]; then
+    ok "创建完成。"
+  else
+    warn "容器已创建，但存在未完成项目：SSH=${ssh_ok} 端口映射=${port_ok}。请根据上方 WARN 排查。"
+  fi
   echo "SSH 登录：ssh root@宿主机IP -p ${sshport}"
   echo "root 密码：${rootpass}"
   echo
@@ -527,25 +545,56 @@ list_containers() {
   pause
 }
 
-select_container() {
-  local prompt="${1:-请输入容器名称：}" name
-  read -r -p "$prompt" name
-  if [ -z "$name" ]; then
-    err "容器名称不能为空。"
+SELECTED_CONTAINER=""
+
+select_container_menu() {
+  local prompt="${1:-请选择容器}"
+  local names=() name status ipv4 choice i
+  SELECTED_CONTAINER=""
+
+  if ! cmd_exists lxc; then
+    err "未安装 lxc。"
     return 1
   fi
-  if ! lxc list --format csv -c n 2>/dev/null | grep -Fxq "$name"; then
-    err "容器不存在：$name"
+
+  mapfile -t names < <(lxc list --format csv -c n 2>/dev/null | sed '/^$/d')
+  if [ "${#names[@]}" -eq 0 ]; then
+    warn "当前没有任何 LXD 容器。"
     return 1
   fi
-  echo "$name"
+
+  echo "---------------------${prompt}---------------------"
+  for i in "${!names[@]}"; do
+    name="${names[$i]}"
+    status="$(lxc list "$name" --format csv -c s 2>/dev/null | head -n1)"
+    ipv4="$(lxc list "$name" --format csv -c 4 2>/dev/null | head -n1 | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+    [ -z "$status" ] && status="unknown"
+    [ -z "$ipv4" ] && ipv4="-"
+    printf "  %2d) %-28s %-10s %s\n" "$((i+1))" "$name" "$status" "$ipv4"
+  done
+  echo "   0) 取消返回"
+  echo "--------------------------------------------------------"
+  read -r -p "请输入编号 [0-${#names[@]}]：" choice
+
+  if [ "$choice" = "0" ]; then
+    warn "已取消。"
+    return 1
+  fi
+  valid_num "$choice" && [ "$choice" -ge 1 ] && [ "$choice" -le "${#names[@]}" ] || {
+    err "编号不合法。"
+    return 1
+  }
+
+  SELECTED_CONTAINER="${names[$((choice-1))]}"
+  return 0
 }
 
 show_container_info() {
   show_header
   echo "---------------------查看小鸡信息---------------------"
   local name
-  name="$(select_container)" || { pause; return; }
+  select_container_menu "查看小鸡详细信息" || { pause; return; }
+  name="$SELECTED_CONTAINER"
   echo
   lxc info "$name" || true
   echo
@@ -563,7 +612,8 @@ show_container_info() {
 start_container() {
   show_header
   local name
-  name="$(select_container "要启动的容器名称：")" || { pause; return; }
+  select_container_menu "选择要启动的小鸡" || { pause; return; }
+  name="$SELECTED_CONTAINER"
   lxc start "$name" && ok "已启动：$name" || err "启动失败：$name"
   pause
 }
@@ -571,9 +621,10 @@ start_container() {
 stop_container() {
   show_header
   local name
-  name="$(select_container "要停止的容器名称：")" || { pause; return; }
+  select_container_menu "选择要停止的小鸡" || { pause; return; }
+  name="$SELECTED_CONTAINER"
   warn "停止容器会中断该小鸡内的服务。"
-  confirm "确认停止 ${name}？" || { warn "已取消。"; pause; return; }
+  confirm_action "确认停止 ${name}？" || { warn "已取消。"; pause; return; }
   lxc stop "$name" --timeout 30 || lxc stop "$name" --force
   ok "已停止：$name"
   pause
@@ -582,9 +633,10 @@ stop_container() {
 restart_container() {
   show_header
   local name
-  name="$(select_container "要重启的容器名称：")" || { pause; return; }
+  select_container_menu "选择要重启的小鸡" || { pause; return; }
+  name="$SELECTED_CONTAINER"
   warn "重启容器会短暂中断该小鸡内的服务。"
-  confirm "确认重启 ${name}？" || { warn "已取消。"; pause; return; }
+  confirm_action "确认重启 ${name}？" || { warn "已取消。"; pause; return; }
   lxc restart "$name" && ok "已重启：$name" || err "重启失败：$name"
   pause
 }
@@ -592,13 +644,14 @@ restart_container() {
 delete_container() {
   show_header
   local name
-  name="$(select_container "要销毁的容器名称：")" || { pause; return; }
+  select_container_menu "选择要销毁的小鸡" || { pause; return; }
+  name="$SELECTED_CONTAINER"
   warn "危险操作：销毁容器会删除该小鸡系统和数据。"
   warn "建议先确认无重要数据，或先手动快照/备份。"
-  confirm "确认永久销毁 ${name}？" || { warn "已取消。"; pause; return; }
+  confirm_action "确认永久销毁 ${name}？" || { warn "已取消。"; pause; return; }
   lxc delete "$name" --force && {
     safe_mkdir
-    grep -v "^${name}|" "$STATE_FILE" 2>/dev/null >"${STATE_FILE}.tmp" || true
+    awk -F"|" -v n="$name" '$1 != n' "$STATE_FILE" 2>/dev/null >"${STATE_FILE}.tmp" || true
     mv -f "${STATE_FILE}.tmp" "$STATE_FILE"
     ok "已销毁：$name"
   } || err "销毁失败：$name"
@@ -608,7 +661,8 @@ delete_container() {
 enter_container() {
   show_header
   local name
-  name="$(select_container "要进入的容器名称：")" || { pause; return; }
+  select_container_menu "选择要进入 Shell 的小鸡" || { pause; return; }
+  name="$SELECTED_CONTAINER"
   info "退出容器请输入 exit。"
   lxc exec "$name" -- bash || lxc exec "$name" -- sh
   pause
@@ -618,19 +672,30 @@ reconfigure_ports() {
   show_header
   echo "---------------------重配端口映射---------------------"
   local name sshport startport endport
-  name="$(select_container "要重配端口的容器名称：")" || { pause; return; }
+  select_container_menu "选择要重配端口的小鸡" || { pause; return; }
+  name="$SELECTED_CONTAINER"
   read -r -p "新的 SSH 宿主机端口：" sshport
   read -r -p "新的外网起端口，0表示不映射业务端口 [0]：" startport; startport="${startport:-0}"
   read -r -p "新的外网止端口，0表示不映射业务端口 [0]：" endport; endport="${endport:-0}"
 
   valid_num "$sshport" && [ "$sshport" -ge 1 ] && [ "$sshport" -le 65535 ] || { err "SSH端口不合法。"; pause; return; }
   valid_num "$startport" && valid_num "$endport" || { err "业务端口必须是数字。"; pause; return; }
+  if { [ "$startport" = "0" ] && [ "$endport" != "0" ]; } || { [ "$startport" != "0" ] && [ "$endport" = "0" ]; }; then
+    err "业务端口区间要么都填 0，要么都填有效端口。"
+    pause
+    return
+  fi
   if [ "$startport" != "0" ]; then
     [ "$startport" -ge 1 ] && [ "$endport" -le 65535 ] && [ "$startport" -le "$endport" ] || { err "业务端口区间不合法。"; pause; return; }
+    if [ "$sshport" -ge "$startport" ] && [ "$sshport" -le "$endport" ]; then
+      err "SSH 端口不能落在业务端口区间内。"
+      pause
+      return
+    fi
   fi
 
   warn "会删除脚本管理的旧端口映射 lmgr_ssh/lmgr_tcp/lmgr_udp，然后添加新映射。"
-  confirm "确认重配 ${name} 的端口？" || { warn "已取消。"; pause; return; }
+  confirm_action "确认重配 ${name} 的端口？" || { warn "已取消。"; pause; return; }
   remove_managed_proxy_devices "$name"
   add_proxy_devices "$name" "$sshport" "$startport" "$endport" && ok "端口映射已更新。" || err "端口映射更新失败。"
   pause
@@ -640,7 +705,8 @@ modify_resources() {
   show_header
   echo "---------------------修改资源限制---------------------"
   local name cpu mem disk down up ipv6
-  name="$(select_container "要修改资源的容器名称：")" || { pause; return; }
+  select_container_menu "选择要修改资源的小鸡" || { pause; return; }
+  name="$SELECTED_CONTAINER"
   read -r -p "CPU核数，留空不改：" cpu
   read -r -p "内存MB，留空不改：" mem
   read -r -p "硬盘GB，留空不改：" disk
@@ -666,7 +732,8 @@ modify_resources() {
 snapshot_container() {
   show_header
   local name snap
-  name="$(select_container "要快照的容器名称：")" || { pause; return; }
+  select_container_menu "选择要创建快照的小鸡" || { pause; return; }
+  name="$SELECTED_CONTAINER"
   snap="snap-$(date +%Y%m%d-%H%M%S)"
   lxc snapshot "$name" "$snap" && ok "已创建快照：${name}/${snap}" || err "快照失败。"
   pause
@@ -695,7 +762,8 @@ show_logs_and_diag() {
 print_ssh_info() {
   show_header
   local name
-  name="$(select_container "要查看 SSH 信息的容器名称：")" || { pause; return; }
+  select_container_menu "选择要查看 SSH 信息的小鸡" || { pause; return; }
+  name="$SELECTED_CONTAINER"
   echo "---------------------SSH 信息---------------------"
   lxc config device show "$name" | awk '
     /^lmgr_ssh:/ {inssh=1; next}
@@ -713,7 +781,8 @@ print_ssh_info() {
 reset_root_password() {
   show_header
   local name pass
-  name="$(select_container "要重置 root 密码的容器名称：")" || { pause; return; }
+  select_container_menu "选择要重置 root 密码的小鸡" || { pause; return; }
+  name="$SELECTED_CONTAINER"
   read -r -s -p "新 root 密码，留空自动生成：" pass
   echo
   [ -z "$pass" ] && pass="$(random_password)"
@@ -727,7 +796,7 @@ reset_root_password() {
 remove_alias() {
   show_header
   warn "这里只删除管理命令 ${INSTALL_PATH}，不会删除 LXD，也不会删除任何容器。"
-  confirm "确认删除管理命令？" || { warn "已取消。"; pause; return; }
+  confirm_action "确认删除管理命令？" || { warn "已取消。"; pause; return; }
   rm -f "$INSTALL_PATH" && ok "已删除 ${INSTALL_PATH}" || err "删除失败。"
   pause
 }

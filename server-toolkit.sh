@@ -1,11 +1,12 @@
 #!/bin/bash
 set -u
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
 
-SERVER_TOOLKIT_VERSION="v2.1"
+SERVER_TOOLKIT_VERSION="v2.2"
 
 # ============================================================
-# server-toolkit.sh v2.1
-# 适用：Debian / Ubuntu / CentOS / RHEL-like
+# server-toolkit.sh v2.2
+# 适用：Debian / Ubuntu / CentOS 7 / RHEL-like
 # 原则：先备份、先检测、尽量不破坏当前 SSH 会话。
 # ============================================================
 
@@ -23,7 +24,7 @@ pause_return() {
   read -r -p "按 Enter 返回菜单..."
 }
 
-# ========== UI 辅助函数（v2.1 统一风格） ==========
+# ========== UI 辅助函数（v2.2 统一风格） ==========
 UI_LINE="────────────────────────────────────────────────────────────"
 
 ui_hr() {
@@ -62,6 +63,16 @@ require_root() {
 
 is_redhat() { [ -f /etc/redhat-release ]; }
 is_debian_like() { [ -f /etc/debian_version ]; }
+is_centos7() {
+  [ -f /etc/os-release ] || return 1
+  # shellcheck disable=SC1091
+  . /etc/os-release 2>/dev/null || return 1
+  [ "${ID:-}" = "centos" ] && [[ "${VERSION_ID:-}" == 7* ]]
+}
+
+has_systemd() {
+  command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]
+}
 
 backup_file() {
   local file="$1"
@@ -71,29 +82,46 @@ backup_file() {
 }
 
 ssh_service_name() {
-  if systemctl list-unit-files | grep -q '^ssh\.service'; then
+  if has_systemd && systemctl list-unit-files 2>/dev/null | grep -q '^ssh\.service'; then
     echo "ssh"
   else
     echo "sshd"
   fi
 }
 
+ensure_sshd_runtime_dir() {
+  mkdir -p /run/sshd /var/run/sshd 2>/dev/null || true
+  chmod 755 /run/sshd /var/run/sshd 2>/dev/null || true
+}
+
 restart_ssh_service() {
   local svc
   svc="$(ssh_service_name)"
   echo_color "正在重启 SSH 服务：$svc ..."
-  systemctl restart "$svc" 2>/dev/null || {
+  ensure_sshd_runtime_dir
+  if has_systemd; then
+    systemctl restart "$svc" 2>/dev/null || {
+      echo_error "重启 $svc 失败，请手动检查：systemctl status $svc"
+      return 1
+    }
+    systemctl is-active "$svc" >/dev/null 2>&1 || {
+      echo_error "SSH 服务未处于 active 状态，请检查配置是否错误。"
+      return 1
+    }
+  elif command -v service >/dev/null 2>&1; then
+    service "$svc" restart 2>/dev/null || service ssh restart 2>/dev/null || {
+      echo_error "重启 SSH 服务失败，请手动检查。"
+      return 1
+    }
+  else
     echo_error "重启 $svc 失败，请手动检查：systemctl status $svc"
     return 1
-  }
-  systemctl is-active "$svc" >/dev/null 2>&1 || {
-    echo_error "SSH 服务未处于 active 状态，请检查配置是否错误。"
-    return 1
-  }
+  fi
   return 0
 }
 
 test_sshd_config() {
+  ensure_sshd_runtime_dir
   if command -v sshd >/dev/null 2>&1; then
     sshd -t 2>/dev/null
     return $?
@@ -105,22 +133,83 @@ set_sshd_kv() {
   local key="$1"
   local val="$2"
   local file="/etc/ssh/sshd_config"
+  local tmp
 
-  if grep -Eq "^[#[:space:]]*$key[[:space:]]+" "$file"; then
-    sed -i -E "s|^[#[:space:]]*$key[[:space:]].*|$key $val|g" "$file"
+  [ -f "$file" ] || touch "$file"
+  tmp="$(mktemp /tmp/server-toolkit-sshd.XXXXXX)" || return 1
+
+  if awk -v key="$key" -v val="$val" '
+    BEGIN { done=0; in_match=0; pat="^[#[:space:]]*" key "[[:space:]]+" }
+    /^[[:space:]]*Match[[:space:]]/ {
+      if (!done) { print key " " val; done=1 }
+      in_match=1
+      print
+      next
+    }
+    !in_match && $0 ~ pat {
+      if (!done) { print key " " val; done=1 }
+      next
+    }
+    { print }
+    END {
+      if (!done) print key " " val
+    }
+  ' "$file" > "$tmp"; then
+    cat "$tmp" > "$file" || { rm -f "$tmp"; return 1; }
   else
-    echo "$key $val" >> "$file"
+    rm -f "$tmp"
+    return 1
   fi
+  rm -f "$tmp"
+}
+
+delete_sshd_kv() {
+  local key="$1"
+  local file="/etc/ssh/sshd_config"
+  local tmp
+
+  [ -f "$file" ] || return 0
+  tmp="$(mktemp /tmp/server-toolkit-sshd.XXXXXX)" || return 1
+
+  if awk -v key="$key" '
+    BEGIN { in_match=0; pat="^[#[:space:]]*" key "[[:space:]]+" }
+    /^[[:space:]]*Match[[:space:]]/ { in_match=1; print; next }
+    !in_match && $0 ~ pat { next }
+    { print }
+  ' "$file" > "$tmp"; then
+    cat "$tmp" > "$file" || { rm -f "$tmp"; return 1; }
+  else
+    rm -f "$tmp"
+    return 1
+  fi
+  rm -f "$tmp"
 }
 
 get_current_ssh_ports() {
   local ports
+  ensure_sshd_runtime_dir
   ports="$(sshd -T 2>/dev/null | awk '$1=="port"{print $2}' | sort -n | paste -sd, - 2>/dev/null || true)"
-  # v2.1：如果 sshd -T 不可用，回退到数字 22，避免防火墙放行时因 "ssh" 字符串被跳过。
+  if [ -z "$ports" ] && [ -f /etc/ssh/sshd_config ]; then
+    ports="$(awk '
+      /^[[:space:]]*Match[[:space:]]/ { exit }
+      /^[[:space:]]*Port[[:space:]]+[0-9]+/ { print $2 }
+    ' /etc/ssh/sshd_config | sort -n | paste -sd, - 2>/dev/null || true)"
+  fi
+  # 如果 sshd -T 不可用，回退到数字 22，避免防火墙放行时因 "ssh" 字符串被跳过。
   if [ -z "$ports" ]; then
     ports="22"
   fi
   echo "$ports"
+}
+
+port_is_current_ssh_port() {
+  local port="$1"
+  local ports p
+  ports="$(get_current_ssh_ports)"
+  for p in ${ports//,/ }; do
+    [ "$p" = "$port" ] && return 0
+  done
+  return 1
 }
 
 port_in_use() {
@@ -134,115 +223,312 @@ port_in_use() {
   fi
 }
 
-# ========== 1. 时间同步 ==========
-time_sync() {
-  ui_title "时间同步 · ntpdate + cron"
-  echo_color "正在配置 ntpdate 时间同步（每30分钟自动同步）..."
+repair_centos7_yum_repos() {
+  is_centos7 || { echo_warn "当前不是 CentOS 7，跳过 Vault 源修复。"; return 0; }
 
-  # v2.1：继续只保留 Google 与 Cloudflare 两个 NTP 源。
-  # 同时继续清理 v1.8 遗留的 HTTP 时间同步脚本和 cron 任务，避免两套同步逻辑并存。
+  local tag repo
+  tag="$(date +%F_%H-%M-%S)"
+  mkdir -p /etc/yum.repos.d
 
-  if ! command -v ntpdate >/dev/null 2>&1; then
-    echo_warn "未检测到 ntpdate，正在安装..."
-    if is_redhat; then
-      yum install -y ntpdate || yum install -y ntp || true
-    else
-      apt-get update -y && (apt-get install -y ntpdate || apt-get install -y ntpsec-ntpdate || true)
-    fi
+  for repo in /etc/yum.repos.d/CentOS-*.repo; do
+    [ -f "$repo" ] || continue
+    cp -a "$repo" "${repo}.bak.${tag}" 2>/dev/null || true
+  done
+
+  cat > /etc/yum.repos.d/CentOS-Base.repo <<'EOF'
+# server-toolkit v2.2: CentOS 7 EOL Vault source
+[base]
+name=CentOS-7.9.2009 - Base - vault.centos.org
+baseurl=http://vault.centos.org/7.9.2009/os/$basearch/
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-7
+enabled=1
+
+[updates]
+name=CentOS-7.9.2009 - Updates - vault.centos.org
+baseurl=http://vault.centos.org/7.9.2009/updates/$basearch/
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-7
+enabled=1
+
+[extras]
+name=CentOS-7.9.2009 - Extras - vault.centos.org
+baseurl=http://vault.centos.org/7.9.2009/extras/$basearch/
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-7
+enabled=1
+
+[centosplus]
+name=CentOS-7.9.2009 - Plus - vault.centos.org
+baseurl=http://vault.centos.org/7.9.2009/centosplus/$basearch/
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-7
+enabled=0
+EOF
+
+  yum clean all >/dev/null 2>&1 || true
+  if yum makecache -y; then
+    echo_color "CentOS 7 Vault 源已修复。"
+    return 0
   fi
 
+  echo_error "CentOS 7 Vault 源修复后 yum makecache 仍失败，请检查网络/DNS。"
+  return 1
+}
+
+repair_epel7_yum_repo() {
+  is_centos7 || { echo_warn "当前不是 CentOS 7，跳过 EPEL 7 源修复。"; return 0; }
+
+  local gpgcheck
+  if ! rpm -q epel-release >/dev/null 2>&1; then
+    yum_install_auto epel-release >/dev/null 2>&1 || true
+  fi
+
+  gpgcheck=1
+  [ -f /etc/pki/rpm-gpg/RPM-GPG-KEY-EPEL-7 ] || gpgcheck=0
+
+  cat > /etc/yum.repos.d/epel.repo <<EOF
+# server-toolkit v2.2: EPEL 7 archive source
+[epel]
+name=Extra Packages for Enterprise Linux 7 - archive
+baseurl=https://archives.fedoraproject.org/pub/archive/epel/7/\$basearch
+enabled=1
+gpgcheck=${gpgcheck}
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-EPEL-7
+
+[epel-debuginfo]
+name=Extra Packages for Enterprise Linux 7 - archive - Debug
+baseurl=https://archives.fedoraproject.org/pub/archive/epel/7/\$basearch/debug
+enabled=0
+gpgcheck=${gpgcheck}
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-EPEL-7
+
+[epel-source]
+name=Extra Packages for Enterprise Linux 7 - archive - Source
+baseurl=https://archives.fedoraproject.org/pub/archive/epel/7/SRPMS
+enabled=0
+gpgcheck=${gpgcheck}
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-EPEL-7
+EOF
+
+  yum clean metadata >/dev/null 2>&1 || true
+  yum --enablerepo=epel makecache -y >/dev/null 2>&1 || true
+  echo_color "EPEL 7 archive 源已写入。"
+}
+
+yum_makecache_auto() {
+  yum makecache -y || { is_centos7 && repair_centos7_yum_repos && yum makecache -y; }
+}
+
+yum_install_auto() {
+  yum install -y "$@" || { is_centos7 && repair_centos7_yum_repos && yum install -y "$@"; }
+}
+
+yum_update_auto() {
+  yum update -y "$@" || { is_centos7 && repair_centos7_yum_repos && yum update -y "$@"; }
+}
+
+pkg_install() {
+  if is_redhat; then
+    yum_install_auto "$@"
+  elif is_debian_like; then
+    apt_env_export 2>/dev/null || true
+    apt-get update -y && apt-get install -y "$@"
+  else
+    echo_error "暂不支持当前系统的软件安装。"
+    return 1
+  fi
+}
+
+ensure_cron_service() {
   if ! command -v crontab >/dev/null 2>&1; then
     echo_warn "未检测到 crontab，正在安装 cron 服务..."
     if is_redhat; then
-      yum install -y cronie || true
+      yum_install_auto cronie || return 1
     else
-      apt-get update -y && apt-get install -y cron || true
+      apt_env_export 2>/dev/null || true
+      apt-get update -y && apt-get install -y cron || return 1
     fi
   fi
 
-  if ! command -v ntpdate >/dev/null 2>&1; then
-    echo_error "ntpdate 仍不可用，无法配置时间同步。请先修复软件源后再试。"
-    return 1
+  if has_systemd; then
+    if systemctl list-unit-files 2>/dev/null | grep -q '^cron\.service'; then
+      systemctl enable --now cron >/dev/null 2>&1 || true
+    elif systemctl list-unit-files 2>/dev/null | grep -q '^crond\.service'; then
+      systemctl enable --now crond >/dev/null 2>&1 || true
+    fi
   fi
 
-  if ! command -v crontab >/dev/null 2>&1; then
-    echo_error "crontab 仍不可用，无法写入定时任务。请先安装 cron/cronie。"
-    return 1
-  fi
-
-  local sync_bin="/usr/local/sbin/server-toolkit-ntpdate-sync"
-  local log_file="/var/log/server-toolkit-ntpdate-sync.log"
-
-  cat > "$sync_bin" <<'EOF'
-#!/bin/sh
-# server-toolkit: ntpdate time sync v2.1
-# 仅保留 Google 与 Cloudflare 两个 NTP 源；成功一个即退出。
-# -u 使用非特权源端口，能绕过部分网络环境下的 NTP 端口限制。
-
-LOG_FILE="/var/log/server-toolkit-ntpdate-sync.log"
-NTP_BIN="$(command -v ntpdate 2>/dev/null || echo /usr/sbin/ntpdate)"
-SERVERS="time.google.com time.cloudflare.com"
-
-log_msg() {
-  printf '%s %s\n' "$(date '+%F %T %Z' 2>/dev/null)" "$*" >> "$LOG_FILE" 2>/dev/null || true
+  command -v crontab >/dev/null 2>&1
 }
 
-if [ ! -x "$NTP_BIN" ]; then
-  log_msg "FAIL ntpdate_not_found path=$NTP_BIN"
-  exit 1
-fi
-
-for server in $SERVERS; do
-  if "$NTP_BIN" -u "$server" >> "$LOG_FILE" 2>&1; then
-    command -v hwclock >/dev/null 2>&1 && hwclock -w >/dev/null 2>&1 || true
-    log_msg "OK server=$server"
-    exit 0
-  else
-    log_msg "TRY_FAILED server=$server"
-  fi
-done
-
-log_msg "FAIL all_ntp_servers_failed"
-exit 1
-EOF
-  chmod +x "$sync_bin"
-
-  if systemctl list-unit-files 2>/dev/null | grep -q '^cron\.service'; then
-    systemctl enable --now cron >/dev/null 2>&1 || true
-  elif systemctl list-unit-files 2>/dev/null | grep -q '^crond\.service'; then
-    systemctl enable --now crond >/dev/null 2>&1 || true
-  fi
-
-  rm -f /usr/local/sbin/server-toolkit-http-time-sync 2>/dev/null || true
-
-  local marker_ntp="# server-toolkit: time_sync"
-  local marker_http="# server-toolkit: http_time_sync"
+remove_cron_lines_by_marker() {
+  local marker="$1"
   local tmpcron
-  tmpcron="$(mktemp /tmp/server-toolkit-cron.XXXXXX)" || {
-    echo_error "创建临时 crontab 文件失败。"
-    return 1
+  command -v crontab >/dev/null 2>&1 || return 0
+  tmpcron="$(mktemp /tmp/server-toolkit-cron.XXXXXX)" || return 1
+  crontab -l 2>/dev/null | grep -v "$marker" > "$tmpcron" || true
+  crontab "$tmpcron" >/dev/null 2>&1 || true
+  rm -f "$tmpcron"
+}
+
+run_remote_bash() {
+  local name="$1"
+  local url="$2"
+  local confirm
+
+  command -v curl >/dev/null 2>&1 || {
+    echo_warn "未检测到 curl，正在尝试安装..."
+    pkg_install curl || return 1
   }
 
-  crontab -l 2>/dev/null | grep -v "$marker_ntp" | grep -v "$marker_http" > "$tmpcron" || true
-  echo "*/30 * * * * $sync_bin >/dev/null 2>&1 $marker_ntp" >> "$tmpcron"
+  echo_warn "即将从以下地址下载并执行：$url"
+  read -r -p "确认执行 ${name}？[y/N]: " confirm
+  [[ "$confirm" =~ ^[Yy]$ ]] || { echo_warn "已取消。"; return 0; }
 
-  if crontab "$tmpcron"; then
-    rm -f "$tmpcron"
+  curl -fsSL --connect-timeout 10 --max-time 120 "$url" | bash
+}
+
+# ========== 1. 时间同步 ==========
+chrony_service_name() {
+  if has_systemd && systemctl list-unit-files 2>/dev/null | grep -q '^chrony\.service'; then
+    echo "chrony"
+  elif has_systemd && systemctl list-unit-files 2>/dev/null | grep -q '^chronyd\.service'; then
+    echo "chronyd"
+  elif is_redhat; then
+    echo "chronyd"
   else
-    rm -f "$tmpcron"
-    echo_error "写入 crontab 失败。"
+    echo "chrony"
+  fi
+}
+
+chrony_config_file() {
+  if [ -f /etc/chrony/chrony.conf ]; then
+    echo "/etc/chrony/chrony.conf"
+  elif [ -f /etc/chrony.conf ]; then
+    echo "/etc/chrony.conf"
+  elif is_redhat; then
+    echo "/etc/chrony.conf"
+  else
+    echo "/etc/chrony/chrony.conf"
+  fi
+}
+
+install_chrony_if_needed() {
+  if command -v chronyd >/dev/null 2>&1 && command -v chronyc >/dev/null 2>&1; then
+    return 0
+  fi
+
+  echo_warn "未检测到 chrony，正在安装..."
+  if is_redhat; then
+    yum_install_auto chrony || return 1
+  else
+    apt_env_export
+    apt-get update -y && apt-get install -y chrony || return 1
+  fi
+}
+
+configure_chrony_sources() {
+  local conf marker_begin marker_end tmp
+  conf="$(chrony_config_file)"
+  marker_begin="# server-toolkit: chrony sources begin"
+  marker_end="# server-toolkit: chrony sources end"
+
+  mkdir -p "$(dirname "$conf")"
+  [ -f "$conf" ] || touch "$conf"
+  backup_file "$conf"
+
+  tmp="$(mktemp /tmp/server-toolkit-chrony.XXXXXX)" || return 1
+  sed "/${marker_begin}/,/${marker_end}/d" "$conf" > "$tmp"
+  cat >> "$tmp" <<EOF
+
+${marker_begin}
+server time.cloudflare.com iburst
+server time.google.com iburst
+pool pool.ntp.org iburst
+${marker_end}
+EOF
+
+  if ! grep -Eq '^[[:space:]]*makestep[[:space:]]+' "$tmp"; then
+    echo "makestep 1.0 3" >> "$tmp"
+  fi
+  if ! grep -Eq '^[[:space:]]*rtcsync([[:space:]]+|$)' "$tmp"; then
+    echo "rtcsync" >> "$tmp"
+  fi
+
+  cat "$tmp" > "$conf"
+  rm -f "$tmp"
+}
+
+disable_conflicting_time_daemons() {
+  has_systemd || return 0
+  systemctl disable --now systemd-timesyncd >/dev/null 2>&1 || true
+  systemctl disable --now ntp >/dev/null 2>&1 || true
+  systemctl disable --now ntpd >/dev/null 2>&1 || true
+}
+
+cleanup_legacy_ntpdate_cron() {
+  remove_cron_lines_by_marker "# server-toolkit: time_sync"
+  remove_cron_lines_by_marker "# server-toolkit: http_time_sync"
+  rm -f /usr/local/sbin/server-toolkit-ntpdate-sync 2>/dev/null || true
+  rm -f /usr/local/sbin/server-toolkit-http-time-sync 2>/dev/null || true
+}
+
+time_sync_ntpdate_fallback() {
+  echo_warn "chrony 配置失败，尝试 ntpdate 一次性兜底同步。"
+  if ! command -v ntpdate >/dev/null 2>&1; then
+    if is_redhat; then
+      yum_install_auto ntpdate || yum_install_auto ntp || true
+    else
+      apt_env_export
+      apt-get update -y && (apt-get install -y ntpsec-ntpdate || apt-get install -y ntpdate || true)
+    fi
+  fi
+
+  if command -v ntpdate >/dev/null 2>&1; then
+    ntpdate -u time.cloudflare.com || ntpdate -u time.google.com
+  else
     return 1
   fi
+}
 
-  if "$sync_bin"; then
-    echo_color "ntpdate 时间同步成功：$(date '+%F %T %Z')"
-    echo_color "时间同步配置完成：每30分钟执行一次 ntpdate（cron）。"
-  else
-    echo_warn "ntpdate 本次立即同步失败；已写入每30分钟自动同步任务。"
-    echo_warn "可能原因：NTP 出口被限制、Google/Cloudflare 时间源不可达、系统不允许修改时间，或容器/虚拟化限制 CAP_SYS_TIME。"
-    echo_info "最近日志：$log_file"
-    tail -n 10 "$log_file" 2>/dev/null || true
+time_sync() {
+  local svc
+
+  ui_title "时间同步 · chrony"
+  echo_color "正在配置 chrony 时间同步（Debian/Ubuntu/CentOS 7 通用）..."
+
+  cleanup_legacy_ntpdate_cron
+
+  if ! install_chrony_if_needed; then
+    time_sync_ntpdate_fallback || {
+      echo_error "chrony/ntpdate 均不可用，无法配置时间同步。请先修复软件源或网络后再试。"
+      return 1
+    }
+    return 0
   fi
+
+  configure_chrony_sources || return 1
+  disable_conflicting_time_daemons
+
+  svc="$(chrony_service_name)"
+  if has_systemd; then
+    systemctl enable --now "$svc" >/dev/null 2>&1 || systemctl restart "$svc" || {
+      echo_error "启动 chrony 服务失败，请检查：systemctl status $svc"
+      return 1
+    }
+  elif command -v service >/dev/null 2>&1; then
+    service "$svc" restart 2>/dev/null || service chronyd restart 2>/dev/null || true
+  fi
+
+  chronyc -a makestep >/dev/null 2>&1 || true
+  command -v hwclock >/dev/null 2>&1 && hwclock -w >/dev/null 2>&1 || true
+
+  echo_color "chrony 时间同步已配置完成。"
+  echo_info "chrony 服务：$svc"
+  echo_info "配置文件：$(chrony_config_file)"
+  echo_info "当前同步状态："
+  chronyc tracking 2>/dev/null || timedatectl status 2>/dev/null || echo_warn "无法读取同步状态，可能是容器限制或 chrony 尚未完成首次同步。"
 }
 
 # ========== 2. 防火墙管理 ==========
@@ -262,7 +548,11 @@ allow_ssh_ports_before_firewall_enable() {
 
 firewall_status() {
   echo_info "firewalld 状态："
-  systemctl is-active firewalld 2>/dev/null || true
+  if has_systemd; then
+    systemctl is-active firewalld 2>/dev/null || true
+  else
+    echo_warn "当前环境未检测到 systemd。"
+  fi
   echo_info "ufw 状态："
   ufw status 2>/dev/null || echo_warn "ufw 未安装或不可用"
 }
@@ -285,8 +575,8 @@ manage_firewall() {
         read -r -p "确认开启？[y/N]: " confirm
         [[ "$confirm" =~ ^[Yy]$ ]] || { echo_warn "已取消。"; continue; }
         allow_ssh_ports_before_firewall_enable
-        if command -v firewall-cmd >/dev/null 2>&1 || systemctl list-unit-files | grep -q '^firewalld\.service'; then
-          systemctl enable --now firewalld 2>/dev/null || true
+        if command -v firewall-cmd >/dev/null 2>&1 || { has_systemd && systemctl list-unit-files 2>/dev/null | grep -q '^firewalld\.service'; }; then
+          has_systemd && systemctl enable --now firewalld 2>/dev/null || true
           allow_ssh_ports_before_firewall_enable
           firewall-cmd --reload >/dev/null 2>&1 || true
           echo_color "firewalld 已尝试开启，并已放行当前 SSH 端口。"
@@ -301,17 +591,74 @@ manage_firewall() {
         echo_warn "此操作只关闭系统内 firewalld / ufw，不影响云厂商安全组。"
         read -r -p "确认关闭防火墙服务？[y/N]: " confirm
         [[ "$confirm" =~ ^[Yy]$ ]] || { echo_warn "已取消。"; continue; }
-        systemctl stop firewalld 2>/dev/null || true
-        systemctl disable firewalld 2>/dev/null || true
+        has_systemd && systemctl stop firewalld 2>/dev/null || true
+        has_systemd && systemctl disable firewalld 2>/dev/null || true
         ufw disable >/dev/null 2>&1 || true
-        systemctl stop ufw 2>/dev/null || true
-        systemctl disable ufw 2>/dev/null || true
+        has_systemd && systemctl stop ufw 2>/dev/null || true
+        has_systemd && systemctl disable ufw 2>/dev/null || true
         echo_color "防火墙服务已尝试关闭。"
         ;;
       0) return 0 ;;
       *) echo_error "无效选项" ;;
     esac
   done
+}
+
+allow_tcp_port() {
+  local port="$1"
+  [[ "$port" =~ ^[0-9]+$ ]] || return 1
+
+  if command -v firewall-offline-cmd >/dev/null 2>&1; then
+    firewall-offline-cmd --add-port="${port}/tcp" >/dev/null 2>&1 || true
+  fi
+  if command -v firewall-cmd >/dev/null 2>&1; then
+    firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null 2>&1 || true
+    firewall-cmd --reload >/dev/null 2>&1 || true
+  fi
+  if command -v ufw >/dev/null 2>&1; then
+    ufw allow "${port}/tcp" >/dev/null 2>&1 || true
+  fi
+}
+
+configure_selinux_ssh_port() {
+  local port="$1"
+  is_redhat || return 0
+  [[ "$port" =~ ^[0-9]+$ ]] || return 1
+  command -v getenforce >/dev/null 2>&1 || return 0
+  [ "$(getenforce 2>/dev/null || echo Disabled)" = "Disabled" ] && return 0
+
+  if ! command -v semanage >/dev/null 2>&1; then
+    echo_warn "SELinux 已启用但缺少 semanage，正在尝试安装策略工具..."
+    yum_install_auto policycoreutils-python >/dev/null 2>&1 || yum_install_auto policycoreutils-python-utils >/dev/null 2>&1 || true
+  fi
+
+  if ! command -v semanage >/dev/null 2>&1; then
+    echo_warn "无法安装 semanage；若 SSH 新端口启动失败，请手动执行：semanage port -a -t ssh_port_t -p tcp ${port}"
+    return 0
+  fi
+
+  if semanage port -l 2>/dev/null | awk '$1=="ssh_port_t" && $2=="tcp"{print $0}' | tr ',' ' ' | grep -qw "$port"; then
+    return 0
+  fi
+
+  semanage port -a -t ssh_port_t -p tcp "$port" >/dev/null 2>&1 || \
+    semanage port -m -t ssh_port_t -p tcp "$port" >/dev/null 2>&1 || {
+      echo_warn "SELinux 放行 SSH 端口 ${port} 失败；如重启 SSH 失败，请检查 semanage port -l。"
+      return 0
+    }
+  echo_color "SELinux 已允许 sshd 监听 TCP ${port}。"
+}
+
+prepare_ssh_port_change() {
+  local port="$1"
+  configure_selinux_ssh_port "$port"
+  allow_tcp_port "$port"
+}
+
+refresh_fail2ban_ssh_port_if_present() {
+  if command -v fail2ban-client >/dev/null 2>&1 || { has_systemd && systemctl list-unit-files 2>/dev/null | grep -q '^fail2ban\.service'; }; then
+    fail2ban_refresh_ssh_port >/dev/null 2>&1 || true
+  fi
 }
 
 # ========== 3. SELinux 管理 ==========
@@ -381,7 +728,8 @@ ssh_security_recommended() {
   backup_file "$f"
 
   echo_info "应用保守推荐配置：不禁用 root、不禁用密码、不改端口。"
-  set_sshd_kv "Protocol" "2"
+  # OpenSSH 7.6+ 已移除 Protocol 选项；保留它会导致新系统 sshd -t 失败。
+  delete_sshd_kv "Protocol"
   set_sshd_kv "LoginGraceTime" "30"
   set_sshd_kv "MaxAuthTries" "3"
   set_sshd_kv "PermitEmptyPasswords" "no"
@@ -505,7 +853,7 @@ fail2ban_log_path() {
 }
 
 fail2ban_detect_backend_lines() {
-  # v2.1：Debian 12/Ubuntu minimal 常常没有 /var/log/auth.log，使用 systemd backend 更稳。
+  # v2.2：Debian 12/Ubuntu minimal 常常没有 /var/log/auth.log，使用 systemd backend 更稳。
   # 若非 systemd 环境，则回退到传统日志文件，并尽量创建空日志文件避免服务启动失败。
   local logpath
   logpath="$(fail2ban_log_path)"
@@ -533,16 +881,16 @@ EOF
 }
 
 fail2ban_validate_and_restart() {
-  if command -v fail2ban-server >/dev/null 2>&1; then
-    if ! fail2ban-server -t >/tmp/server-toolkit-fail2ban-test.log 2>&1; then
+  if command -v fail2ban-client >/dev/null 2>&1; then
+    if ! fail2ban-client -t >/tmp/server-toolkit-fail2ban-test.log 2>&1; then
       echo_error "Fail2Ban 配置检测失败，未重启服务。检测输出如下："
       cat /tmp/server-toolkit-fail2ban-test.log 2>/dev/null || true
       return 1
     fi
   fi
 
-  systemctl enable fail2ban >/dev/null 2>&1 || true
-  if systemctl restart fail2ban; then
+  has_systemd && systemctl enable fail2ban >/dev/null 2>&1 || true
+  if { has_systemd && systemctl restart fail2ban; } || { command -v service >/dev/null 2>&1 && service fail2ban restart; }; then
     echo_color "Fail2Ban 服务已成功启动/重启。"
     return 0
   else
@@ -571,7 +919,7 @@ fail2ban_write_sshd_jail() {
 # maxretry = 在 findtime 内失败多少次后封禁
 # ignoreip = 白名单 IP，不会被封禁；建议加入你的固定管理 IP
 # port     = 当前 SSH 端口；支持多个端口，例如 22,2222
-# backend  = v2.1 自动选择；systemd 环境优先用 journal，避免 /var/log/auth.log 不存在导致启动失败
+# backend  = v2.2 自动选择；systemd 环境优先用 journal，避免 /var/log/auth.log 不存在导致启动失败
 
 [DEFAULT]
 bantime = $bantime
@@ -589,8 +937,9 @@ EOF
 setup_fail2ban_default() {
   echo_color "正在安装并配置 Fail2Ban..."
   if is_redhat; then
-    yum install -y epel-release || true
-    yum install -y fail2ban python3-systemd || yum install -y fail2ban || return 1
+    yum_install_auto epel-release || true
+    is_centos7 && repair_epel7_yum_repo
+    yum_install_auto fail2ban python3-systemd || yum_install_auto fail2ban || return 1
   else
     apt-get update -y || return 1
     apt-get install -y fail2ban python3-systemd || apt-get install -y fail2ban || return 1
@@ -627,7 +976,11 @@ fail2ban_refresh_ssh_port() {
 
 fail2ban_status() {
   echo_info "Fail2Ban 服务状态："
-  systemctl status fail2ban --no-pager -l || true
+  if has_systemd; then
+    systemctl status fail2ban --no-pager -l || true
+  else
+    service fail2ban status 2>/dev/null || echo_warn "当前环境未检测到 systemd。"
+  fi
   echo
   echo_info "Fail2Ban jail 列表："
   fail2ban-client status 2>/dev/null || echo_warn "fail2ban-client 不可用或服务未运行。"
@@ -740,28 +1093,26 @@ change_ssh_port_only() {
     return 1
   fi
 
-  if port_in_use "$new_port"; then
+  if port_in_use "$new_port" && ! port_is_current_ssh_port "$new_port"; then
     echo_error "端口 $new_port 已被占用，请换一个。"
     return 1
   fi
 
   backup_file "$SSH_CONFIG_FILE"
-
-  if grep -Eq "^[#[:space:]]*Port[[:space:]]+" "$SSH_CONFIG_FILE"; then
-    sed -i -E "s|^[#[:space:]]*Port[[:space:]]+.*|Port ${new_port}|g" "$SSH_CONFIG_FILE"
-  else
-    echo "Port ${new_port}" >> "$SSH_CONFIG_FILE"
-  fi
+  set_sshd_kv "Port" "$new_port"
 
   if ! test_sshd_config; then
     echo_error "sshd 配置检测失败，未重启。"
     return 1
   fi
 
+  prepare_ssh_port_change "$new_port"
   restart_ssh_service || return 1
+  refresh_fail2ban_ssh_port_if_present
   echo_color "SSH 端口已更新为：$new_port"
+  echo_info "已尝试自动放行防火墙端口；云厂商安全组仍需你在控制台确认放行。"
   echo_warn "请另开终端测试：ssh -p ${new_port} root@你的服务器IP"
-  echo_warn "如已启用 Fail2Ban，请进入第 5 项刷新 SSH 端口。"
+  echo_warn "如已启用 Fail2Ban，脚本已尝试自动刷新 sshd jail 端口。"
 }
 
 change_root_password_only() {
@@ -771,7 +1122,7 @@ change_root_password_only() {
 
   [ -z "$new_password" ] && { echo_warn "已取消。"; return 0; }
 
-  echo "root:${new_password}" | chpasswd || { echo_error "修改密码失败。"; return 1; }
+  printf 'root:%s\n' "$new_password" | chpasswd || { echo_error "修改密码失败。"; return 1; }
   echo_color "root 密码已更新。"
 }
 
@@ -780,6 +1131,7 @@ configure_key_login_existing() {
   read -r -p "请输入要配置密钥的用户名（默认 root，输入 q 取消）: " user
   user="${user:-root}"
   [[ "$user" =~ ^[Qq]$ ]] && { echo_warn "已取消。"; return 0; }
+  [[ "$user" =~ ^[a-z_][a-z0-9_-]*[$]?$ || "$user" = "root" ]] || { echo_error "用户名格式无效。"; return 1; }
 
   if ! id "$user" >/dev/null 2>&1; then
     echo_error "用户不存在：$user"
@@ -825,6 +1177,7 @@ generate_key_login_and_output_private() {
   read -r -p "请输入要生成密钥的用户名（默认 root，输入 q 取消）: " user
   user="${user:-root}"
   [[ "$user" =~ ^[Qq]$ ]] && { echo_warn "已取消。"; return 0; }
+  [[ "$user" =~ ^[a-z_][a-z0-9_-]*[$]?$ || "$user" = "root" ]] || { echo_error "用户名格式无效。"; return 1; }
 
   if ! id "$user" >/dev/null 2>&1; then
     echo_error "用户不存在：$user"
@@ -950,6 +1303,7 @@ manage_root_login_user() {
       local user pass group
       read -r -p "请输入新用户名（输入 q 取消）: " user
       [[ "$user" =~ ^[Qq]$ || -z "$user" ]] && { echo_warn "已取消。"; return 0; }
+      [[ "$user" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]] || { echo_error "用户名格式无效。"; return 1; }
 
       if id "$user" >/dev/null 2>&1; then
         echo_warn "用户已存在：$user"
@@ -960,7 +1314,7 @@ manage_root_login_user() {
       read -r -s -p "请输入新用户密码: " pass
       echo
       [ -z "$pass" ] && { echo_error "密码不能为空。"; return 1; }
-      echo "${user}:${pass}" | chpasswd
+      printf '%s:%s\n' "$user" "$pass" | chpasswd
 
       if getent group sudo >/dev/null 2>&1; then
         group="sudo"
@@ -1012,7 +1366,7 @@ change_ssh_port_and_password_together() {
     return 1
   fi
 
-  if port_in_use "$new_port"; then
+  if port_in_use "$new_port" && ! port_is_current_ssh_port "$new_port"; then
     echo_error "端口 $new_port 已被占用，请换一个。"
     return 1
   fi
@@ -1022,23 +1376,21 @@ change_ssh_port_and_password_together() {
   [ -z "$new_password" ] && { echo_warn "已取消。"; return 0; }
 
   backup_file "$SSH_CONFIG_FILE"
-
-  if grep -Eq "^[#[:space:]]*Port[[:space:]]+" "$SSH_CONFIG_FILE"; then
-    sed -i -E "s|^[#[:space:]]*Port[[:space:]]+.*|Port ${new_port}|g" "$SSH_CONFIG_FILE"
-  else
-    echo "Port ${new_port}" >> "$SSH_CONFIG_FILE"
-  fi
+  set_sshd_kv "Port" "$new_port"
 
   if ! test_sshd_config; then
     echo_error "sshd 配置检测失败，未重启，也未修改密码。"
     return 1
   fi
 
-  echo "root:${new_password}" | chpasswd || { echo_error "修改密码失败。"; return 1; }
+  prepare_ssh_port_change "$new_port"
+  printf 'root:%s\n' "$new_password" | chpasswd || { echo_error "修改密码失败。"; return 1; }
   restart_ssh_service || return 1
+  refresh_fail2ban_ssh_port_if_present
   echo_color "SSH 端口已更新为：$new_port，root 密码已更新。"
+  echo_info "已尝试自动放行防火墙端口；云厂商安全组仍需你在控制台确认放行。"
   echo_warn "请另开终端测试：ssh -p ${new_port} root@你的服务器IP"
-  echo_warn "如已启用 Fail2Ban，请进入第 5 项刷新 SSH 端口。"
+  echo_warn "如已启用 Fail2Ban，脚本已尝试自动刷新 sshd jail 端口。"
 }
 
 change_ssh_port_password() {
@@ -1073,7 +1425,7 @@ change_ssh_port_password() {
 }
 
 # ========== 7. 流媒体解锁检测 ==========
-check_media_unlock() { bash <(curl -L -s check.unlock.media); }
+check_media_unlock() { run_remote_bash "流媒体解锁检测" "https://check.unlock.media"; }
 
 # ========== 8. 显示服务器基本信息 ==========
 format_bytes() {
@@ -1123,13 +1475,29 @@ show_system_info() {
 
   mem_total="$(awk '/MemTotal/ {print $2}' /proc/meminfo)"
   mem_avail="$(awk '/MemAvailable/ {print $2}' /proc/meminfo)"
+  [ -z "$mem_total" ] && mem_total=0
+  if [ -z "$mem_avail" ]; then
+    mem_avail="$(awk '
+      /MemFree/ {free=$2}
+      /Buffers/ {buf=$2}
+      /^Cached:/ {cache=$2}
+      END {print free + buf + cache}
+    ' /proc/meminfo)"
+  fi
+  [ -z "$mem_avail" ] && mem_avail=0
   mem_used=$((mem_total-mem_avail))
-  mem_pct="$(awk -v u="$mem_used" -v t="$mem_total" 'BEGIN{printf "%.2f", u/t*100}')"
+  if [ "$mem_total" -gt 0 ]; then
+    mem_pct="$(awk -v u="$mem_used" -v t="$mem_total" 'BEGIN{printf "%.2f", u/t*100}')"
+  else
+    mem_pct="0.00"
+  fi
   mem_used="$(awk -v k="$mem_used" 'BEGIN{printf "%.2fM", k/1024}')"
   mem_total="$(awk -v k="$mem_total" 'BEGIN{printf "%.2fM", k/1024}')"
 
   swap_total="$(awk '/SwapTotal/ {print $2}' /proc/meminfo)"
   swap_free="$(awk '/SwapFree/ {print $2}' /proc/meminfo)"
+  [ -z "$swap_total" ] && swap_total=0
+  [ -z "$swap_free" ] && swap_free=0
   swap_used=$((swap_total-swap_free))
   if [ "$swap_total" -gt 0 ]; then
     swap_pct="$(awk -v u="$swap_used" -v t="$swap_total" 'BEGIN{printf "%.0f", u/t*100}')"
@@ -1203,7 +1571,7 @@ show_system_info() {
 }
 
 # ========== 9. YABS 测试 ==========
-yabs_test() { curl -sL yabs.sh | bash; }
+yabs_test() { run_remote_bash "YABS 测试" "https://yabs.sh"; }
 
 # ========== 10. 设置定时重启 ==========
 setup_cron_reboot() {
@@ -1213,14 +1581,46 @@ setup_cron_reboot() {
     return
   fi
 
+  ensure_cron_service || { echo_error "cron/crontab 不可用，无法设置定时重启。"; return 1; }
+
   local marker="# server-toolkit: reboot"
   local tmpcron
+  local runner="/usr/local/sbin/server-toolkit-reboot-if-due"
+
+  cat > "$runner" <<'EOF'
+#!/bin/sh
+STATE_FILE="/var/lib/server-toolkit/reboot-last"
+INTERVAL_HOURS="${1:-0}"
+
+case "$INTERVAL_HOURS" in
+  ''|*[!0-9]*) exit 1 ;;
+esac
+
+mkdir -p /var/lib/server-toolkit
+now="$(date +%s)"
+last="0"
+[ -f "$STATE_FILE" ] && last="$(cat "$STATE_FILE" 2>/dev/null || echo 0)"
+case "$last" in
+  ''|*[!0-9]*) last=0 ;;
+esac
+
+need=$((INTERVAL_HOURS * 3600))
+if [ $((now - last)) -ge "$need" ]; then
+  echo "$now" > "$STATE_FILE"
+  /sbin/reboot
+fi
+EOF
+  chmod +x "$runner"
+  mkdir -p /var/lib/server-toolkit
+  date +%s > /var/lib/server-toolkit/reboot-last 2>/dev/null || true
+
   tmpcron="$(mktemp /tmp/server-toolkit-cron.XXXXXX)" || { echo_error "创建临时 crontab 文件失败。"; return 1; }
   crontab -l 2>/dev/null | grep -v "$marker" > "$tmpcron" || true
-  echo "0 */$interval * * * /sbin/reboot $marker" >> "$tmpcron"
+  echo "0 * * * * $runner $interval >/dev/null 2>&1 $marker" >> "$tmpcron"
   crontab "$tmpcron" && rm -f "$tmpcron" || { rm -f "$tmpcron"; echo_error "写入 crontab 失败。"; return 1; }
 
   echo_color "已设置每隔 $interval 小时自动重启系统。"
+  echo_info "说明：v2.2 使用每小时检查器，因此 24-720 小时也能按间隔生效。"
 }
 
 # ========== 11. 哪吒面板管理 ==========
@@ -1232,12 +1632,45 @@ setup_nezha_agent_restart_cron() {
     echo_error "请输入 1-720 的有效小时数。"
     return 1
   fi
+  ensure_cron_service || { echo_error "cron/crontab 不可用，无法设置定时任务。"; return 1; }
   marker="# server-toolkit: nezha-agent-restart"
+  local runner="/usr/local/sbin/server-toolkit-nezha-restart-if-due"
+  cat > "$runner" <<'EOF'
+#!/bin/sh
+STATE_FILE="/var/lib/server-toolkit/nezha-agent-restart-last"
+INTERVAL_HOURS="${1:-0}"
+
+case "$INTERVAL_HOURS" in
+  ''|*[!0-9]*) exit 1 ;;
+esac
+
+mkdir -p /var/lib/server-toolkit
+now="$(date +%s)"
+last="0"
+[ -f "$STATE_FILE" ] && last="$(cat "$STATE_FILE" 2>/dev/null || echo 0)"
+case "$last" in
+  ''|*[!0-9]*) last=0 ;;
+esac
+
+need=$((INTERVAL_HOURS * 3600))
+if [ $((now - last)) -ge "$need" ]; then
+  echo "$now" > "$STATE_FILE"
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl restart nezha-agent >/dev/null 2>&1 || true
+  else
+    service nezha-agent restart >/dev/null 2>&1 || true
+  fi
+fi
+EOF
+  chmod +x "$runner"
+  mkdir -p /var/lib/server-toolkit
+  date +%s > /var/lib/server-toolkit/nezha-agent-restart-last 2>/dev/null || true
   tmpcron="$(mktemp /tmp/server-toolkit-cron.XXXXXX)" || { echo_error "创建临时 crontab 文件失败。"; return 1; }
   crontab -l 2>/dev/null | grep -v "$marker" > "$tmpcron" || true
-  echo "0 */$interval * * * systemctl restart nezha-agent >/dev/null 2>&1 $marker" >> "$tmpcron"
+  echo "0 * * * * $runner $interval >/dev/null 2>&1 $marker" >> "$tmpcron"
   crontab "$tmpcron" && rm -f "$tmpcron" || { rm -f "$tmpcron"; echo_error "写入 crontab 失败。"; return 1; }
   echo_color "已设置每隔 $interval 小时自动重启 nezha-agent。"
+  echo_info "说明：v2.2 使用每小时检查器，因此 24-720 小时也能按间隔生效。"
 }
 
 remove_nezha_agent_restart_cron() {
@@ -1246,6 +1679,7 @@ remove_nezha_agent_restart_cron() {
   tmpcron="$(mktemp /tmp/server-toolkit-cron.XXXXXX)" || { echo_error "创建临时 crontab 文件失败。"; return 1; }
   crontab -l 2>/dev/null | grep -v "$marker" > "$tmpcron" || true
   crontab "$tmpcron" && rm -f "$tmpcron" || { rm -f "$tmpcron"; echo_error "写入 crontab 失败。"; return 1; }
+  rm -f /usr/local/sbin/server-toolkit-nezha-restart-if-due /var/lib/server-toolkit/nezha-agent-restart-last 2>/dev/null || true
   echo_color "已移除 nezha-agent 定期重启任务。"
 }
 
@@ -1263,23 +1697,25 @@ manage_nezha() {
     read -r -p "请选择: " nezha_opt
 
     case "$nezha_opt" in
-      1) systemctl restart nezha-agent 2>/dev/null || true; echo_color "已尝试重启 nezha-agent。" ;;
-      2) systemctl restart nezha-dashboard 2>/dev/null || true; echo_color "已尝试重启 nezha-dashboard。" ;;
-      3) systemctl restart nezha-agent 2>/dev/null || true; systemctl restart nezha-dashboard 2>/dev/null || true; echo_color "已尝试重启哪吒相关服务。" ;;
+      1) if has_systemd; then systemctl restart nezha-agent 2>/dev/null || true; else service nezha-agent restart 2>/dev/null || true; fi; echo_color "已尝试重启 nezha-agent。" ;;
+      2) if has_systemd; then systemctl restart nezha-dashboard 2>/dev/null || true; else service nezha-dashboard restart 2>/dev/null || true; fi; echo_color "已尝试重启 nezha-dashboard。" ;;
+      3) if has_systemd; then systemctl restart nezha-agent 2>/dev/null || true; systemctl restart nezha-dashboard 2>/dev/null || true; else service nezha-agent restart 2>/dev/null || true; service nezha-dashboard restart 2>/dev/null || true; fi; echo_color "已尝试重启哪吒相关服务。" ;;
       4) setup_nezha_agent_restart_cron ;;
       5) remove_nezha_agent_restart_cron ;;
       6)
         echo_warn "此操作会删除 /opt/nezha /etc/nezha /var/log/nezha。"
         read -r -p "确认卸载？[y/N]: " confirm
         [[ "$confirm" =~ ^[Yy]$ ]] || { echo_warn "已取消。"; continue; }
-        systemctl stop nezha-agent 2>/dev/null || true
-        systemctl stop nezha-dashboard 2>/dev/null || true
-        systemctl disable nezha-agent 2>/dev/null || true
-        systemctl disable nezha-dashboard 2>/dev/null || true
+        if has_systemd; then
+          systemctl stop nezha-agent 2>/dev/null || true
+          systemctl stop nezha-dashboard 2>/dev/null || true
+          systemctl disable nezha-agent 2>/dev/null || true
+          systemctl disable nezha-dashboard 2>/dev/null || true
+        fi
         rm -f /etc/systemd/system/nezha-agent.service
         rm -f /etc/systemd/system/nezha-dashboard.service
         rm -rf /opt/nezha /etc/nezha /var/log/nezha
-        systemctl daemon-reload
+        has_systemd && systemctl daemon-reload
         echo_color "哪吒面板/探针已移除。"
         ;;
       0) return 0 ;;
@@ -1289,29 +1725,44 @@ manage_nezha() {
 }
 
 # ========== 12. IP 质量检测 ==========
-check_ip_quality() { bash <(curl -Ls IP.Check.Place); }
+check_ip_quality() { run_remote_bash "IP 质量检测" "https://IP.Check.Place"; }
 
 # ========== 13. IPv6 一键开启/关闭 ==========
 update_grub_ipv6_param() {
   local mode="$1"
   local grub_file="/etc/default/grub"
+  local tmp
 
   [ -f "$grub_file" ] || return 0
   backup_file "$grub_file"
 
-  if [[ "$mode" == "disable" ]]; then
-    if grep -q '^GRUB_CMDLINE_LINUX=' "$grub_file"; then
-      if ! grep -q 'ipv6.disable=1' "$grub_file"; then
-        sed -i 's/^GRUB_CMDLINE_LINUX="/GRUB_CMDLINE_LINUX="ipv6.disable=1 /' "$grub_file"
-      fi
-    else
-      echo 'GRUB_CMDLINE_LINUX="ipv6.disable=1"' >> "$grub_file"
-    fi
-  else
-    sed -i 's/ipv6.disable=1//g' "$grub_file"
-    sed -i 's/  */ /g' "$grub_file"
-    sed -i 's/=" /="/g' "$grub_file"
-  fi
+  tmp="$(mktemp /tmp/server-toolkit-grub.XXXXXX)" || return 1
+  awk -v mode="$mode" '
+    BEGIN { done=0 }
+    /^GRUB_CMDLINE_LINUX=/ {
+      done=1
+      val=$0
+      sub(/^GRUB_CMDLINE_LINUX=/, "", val)
+      gsub(/^"/, "", val)
+      gsub(/"$/, "", val)
+      gsub(/(^|[[:space:]])ipv6\.disable=1([[:space:]]|$)/, " ", val)
+      gsub(/[[:space:]]+/, " ", val)
+      gsub(/^ /, "", val)
+      gsub(/ $/, "", val)
+      if (mode == "disable") {
+        val = (val == "" ? "ipv6.disable=1" : "ipv6.disable=1 " val)
+      }
+      print "GRUB_CMDLINE_LINUX=\"" val "\""
+      next
+    }
+    { print }
+    END {
+      if (!done && mode == "disable") {
+        print "GRUB_CMDLINE_LINUX=\"ipv6.disable=1\""
+      }
+    }
+  ' "$grub_file" > "$tmp" && cat "$tmp" > "$grub_file"
+  rm -f "$tmp"
 
   if command -v update-grub >/dev/null 2>&1; then
     update-grub >/dev/null 2>&1 || true
@@ -1532,8 +1983,8 @@ security_update_core_packages() {
   [[ "$confirm" =~ ^[Yy]$ ]] || { echo_warn "已取消。"; return 0; }
 
   if is_redhat; then
-    yum makecache -y || true
-    yum update -y kernel sudo openssh-server openssh-clients glibc || yum update -y
+    yum_makecache_auto || true
+    yum_update_auto kernel sudo openssh-server openssh-clients glibc || yum_update_auto
   else
     export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a APT_LISTCHANGES_FRONTEND=none UCF_FORCE_CONFFOLD=1
     apt-get update -y
@@ -1596,7 +2047,7 @@ one_click_safe_hardening() {
   apply_conservative_sysctl_hardening
   apply_copy_fail_mitigation
 
-  if command -v fail2ban-client >/dev/null 2>&1 || systemctl list-unit-files | grep -q '^fail2ban\.service'; then
+  if command -v fail2ban-client >/dev/null 2>&1 || { has_systemd && systemctl list-unit-files 2>/dev/null | grep -q '^fail2ban\.service'; }; then
     fail2ban_refresh_ssh_port || true
   else
     echo_warn "未检测到 Fail2Ban，跳过 Fail2Ban 配置。可在第 5 项安装。"
@@ -1690,7 +2141,7 @@ apt_set_archive_mode() {
   mkdir -p /etc/apt/apt.conf.d
   if [ "$mode" = "archive" ]; then
     cat > "$conf" <<EOF
-// server-toolkit v2.1: old archive sources often have expired Release metadata.
+// server-toolkit v2.2: old archive sources often have expired Release metadata.
 Acquire::Check-Valid-Until "false";
 EOF
     echo_warn "已为归档源写入：$conf"
@@ -1724,7 +2175,7 @@ apt_disable_conflicting_distro_sources() {
 apt_write_header() {
   local file="$1" os="$2" label="$3" base="$4"
   cat > "$file" <<EOF
-# server-toolkit v2.1 generated $os sources
+# server-toolkit v2.2 generated $os sources
 # source: $label
 # base: $base
 # generated_at: $(date '+%F %T %Z')
@@ -2049,8 +2500,8 @@ repair_apt_sources_auto() {
 openssh_security_upgrade() {
   echo_info "正在尝试升级/安装 OpenSSH 安全更新..."
   if is_redhat; then
-    yum makecache -y || true
-    yum update -y openssh openssh-server openssh-clients || yum update -y openssh-server || true
+    yum_makecache_auto || true
+    yum_update_auto openssh openssh-server openssh-clients || yum_update_auto openssh-server || true
   elif is_debian_like; then
     apt_env_export
     apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" openssh-server openssh-client || true
@@ -2071,8 +2522,8 @@ new_server_basic_update() {
     apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" wget curl sudo vim git unzip openssh-server openssh-client
     openssh_security_upgrade
   elif is_redhat; then
-    yum makecache -y || true
-    yum install -y wget curl sudo vim git unzip openssh-server openssh-clients
+    yum_makecache_auto || true
+    yum_install_auto wget curl sudo vim git unzip openssh-server openssh-clients
     openssh_security_upgrade
   else
     echo_error "暂不支持当前系统。"
@@ -2096,9 +2547,9 @@ new_server_full_update() {
     apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" unzip vim git curl screen htop vnstat net-tools dnsutils sudo wget openssh-server openssh-client
     openssh_security_upgrade
   elif is_redhat; then
-    yum makecache -y || true
-    yum update -y
-    yum install -y unzip vim git curl screen htop vnstat net-tools bind-utils sudo wget openssh-server openssh-clients
+    yum_makecache_auto || true
+    yum_update_auto
+    yum_install_auto unzip vim git curl screen htop vnstat net-tools bind-utils sudo wget openssh-server openssh-clients
     openssh_security_upgrade
   else
     echo_error "暂不支持当前系统。"
@@ -2115,6 +2566,8 @@ new_server_init_menu() {
     ui_option 4 "仅尝试修复 OpenSSH 高危漏洞（升级 openssh-server/client）"
     ui_option 5 "查看当前 APT 源（sources.list + sources.list.d）"
     ui_option 6 "手动检测并切换 APT 源池"
+    ui_option 7 "修复 CentOS 7 Vault YUM 源（CentOS 7 EOL 专用）"
+    ui_option 8 "修复 CentOS 7 EPEL archive 源（Fail2Ban 等依赖）"
     ui_back
     read -r -p "请选择: " opt
     case "$opt" in
@@ -2124,14 +2577,16 @@ new_server_init_menu() {
       4) openssh_security_upgrade ;;
       5) show_apt_sources_current ;;
       6) apt_source_interactive_chooser ;;
+      7) repair_centos7_yum_repos ;;
+      8) repair_epel7_yum_repo ;;
       0) return 0 ;;
       *) echo_error "无效选项" ;;
     esac
   done
 }
 
-# ========== 菜单：双竖排（v2.1 统一 UI） ==========
-# 说明：v2.1 继续使用稳定双栏列表，避免不同终端/字体下中文宽度错位。
+# ========== 菜单：双竖排（v2.2 统一 UI） ==========
+# 说明：v2.2 继续使用稳定双栏列表，避免不同终端/字体下中文宽度错位。
 menu_text_width() {
   local text="$1"
   local chars bytes wide
@@ -2171,7 +2626,7 @@ print_menu() {
   printf "\e[1;36m└──────────────────────────────────────────────────────────────────────────────┘\e[0m\n"
   printf "\e[1;36m功能菜单\e[0m\n"
   printf "\e[2m──────────────────────────────────────────────────────────────────────────────\e[0m\n"
-  menu_row "1)  时间同步（ntpdate+cron）"      "9)  YABS 测试"
+  menu_row "1)  时间同步（chrony）"            "9)  YABS 测试"
   menu_row "2)  防火墙开启/关闭"              "10) 设置定时重启"
   menu_row "3)  SELinux 开启/关闭"             "11) 哪吒面板管理"
   menu_row "4)  SSH 安全性增强向导"            "12) IP 质量检测"

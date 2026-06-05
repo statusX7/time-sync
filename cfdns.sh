@@ -1,6 +1,8 @@
-cat > /root/install_cfdns_v1_9.sh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+
+# cfdns v2.0 installer
+# Cloudflare DNS multi-group A-record incremental sync tool
 
 APP_NAME="cf-dns-sync"
 BASE_DIR="/etc/${APP_NAME}"
@@ -26,7 +28,6 @@ mkdir -p "${BASE_DIR}" "${VAR_DIR}"
 
 need_install_pkgs() {
   local missing=()
-
   command -v curl >/dev/null 2>&1 || missing+=("curl")
   command -v jq >/dev/null 2>&1 || missing+=("jq")
 
@@ -45,6 +46,10 @@ need_install_pkgs() {
 }
 
 install_missing_deps() {
+  if [[ "${CFDNS_SKIP_DEPS:-0}" == "1" ]]; then
+    echo "已跳过依赖安装检查（CFDNS_SKIP_DEPS=1）"
+    return
+  fi
   local pkgs
   pkgs="$(need_install_pkgs || true)"
 
@@ -59,10 +64,13 @@ install_missing_deps() {
   if command -v apt-get >/dev/null 2>&1; then
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
+    # shellcheck disable=SC2086
     apt-get install -y ${pkgs}
   elif command -v dnf >/dev/null 2>&1; then
+    # shellcheck disable=SC2086
     dnf install -y ${pkgs}
   elif command -v yum >/dev/null 2>&1; then
+    # shellcheck disable=SC2086
     yum install -y ${pkgs}
   else
     echo "不支持的包管理器，请手动安装：${pkgs}"
@@ -145,8 +153,8 @@ log() {
   if [[ "${want}" -le "${cur}" ]]; then
     touch "${LOG_FILE}"
     chmod 600 "${LOG_FILE}"
-    echo "[$(timestamp)] [$level] $msg" >> "${LOG_FILE}"
-    echo "[$(timestamp)] [$level] $msg" | systemd-cat -t cf-dns-sync
+    echo "[$(timestamp)] [${level}] ${msg}" >> "${LOG_FILE}"
+    echo "[$(timestamp)] [${level}] ${msg}" | systemd-cat -t cf-dns-sync
   fi
 }
 
@@ -157,7 +165,7 @@ need_cmd() {
   }
 }
 
-for cmd in curl jq dig awk sed grep sort comm mktemp flock paste cut tr date; do
+for cmd in curl jq dig awk sed grep sort comm mktemp flock paste cut tr date wc; do
   need_cmd "$cmd"
 done
 
@@ -321,7 +329,7 @@ create_cf_record() {
   local ttl="$4"
   local proxied="$5"
   local ip="$6"
-  local payload
+  local payload resp
 
   payload="$(jq -nc \
     --arg type "A" \
@@ -331,14 +339,23 @@ create_cf_record() {
     --argjson proxied "${proxied}" \
     '{type:$type,name:$name,content:$content,ttl:$ttl,proxied:$proxied}')"
 
-  cf_api POST "${token}" "/zones/${zone_id}/dns_records" "${payload}" >/dev/null
+  resp="$(cf_api POST "${token}" "/zones/${zone_id}/dns_records" "${payload}")"
+  if [[ "$(echo "${resp}" | jq -r '.success')" != "true" ]]; then
+    log ERROR "创建 A 记录失败: ${target_fqdn} -> ${ip}: $(echo "${resp}" | jq -c '.')"
+    return 1
+  fi
 }
 
 delete_cf_record() {
   local token="$1"
   local zone_id="$2"
   local record_id="$3"
-  cf_api DELETE "${token}" "/zones/${zone_id}/dns_records/${record_id}" >/dev/null
+  local resp
+  resp="$(cf_api DELETE "${token}" "/zones/${zone_id}/dns_records/${record_id}")"
+  if [[ "$(echo "${resp}" | jq -r '.success')" != "true" ]]; then
+    log ERROR "删除 A 记录失败: record_id=${record_id}: $(echo "${resp}" | jq -c '.')"
+    return 1
+  fi
 }
 
 sync_one_group() {
@@ -448,7 +465,7 @@ sync_one_group() {
 
       echo "${current_json}" | jq -r --arg ip "${old_ip}" '.result[] | select(.content==$ip) | .id' | while IFS= read -r rid; do
         [[ -n "${rid}" ]] || continue
-        delete_cf_record "${api_token}" "${zone_id}" "${rid}"
+        delete_cf_record "${api_token}" "${zone_id}" "${rid}" || true
       done
     done < "${tmp_to_del}"
   fi
@@ -459,8 +476,9 @@ sync_one_group() {
       new_domains="$(awk -F '\t' -v ip="${new_ip}" '$2==ip{print $1}' "${map_file}" | paste -sd ',' -)"
       [[ -z "${new_domains}" ]] && new_domains="unknown"
       log INFO "组 ${group_name}: 新增 IP ${new_ip} 来源 ${new_domains}"
-      create_cf_record "${api_token}" "${zone_id}" "${target_fqdn}" "${ttl}" "${proxied}" "${new_ip}"
-      write_history "${group_name}" "ADD" "${new_ip}" "${new_domains}" "${mode}" "${target_fqdn}" "added_to_cloudflare"
+      if create_cf_record "${api_token}" "${zone_id}" "${target_fqdn}" "${ttl}" "${proxied}" "${new_ip}"; then
+        write_history "${group_name}" "ADD" "${new_ip}" "${new_domains}" "${mode}" "${target_fqdn}" "added_to_cloudflare"
+      fi
     done < "${tmp_to_add}"
   fi
 
@@ -529,7 +547,6 @@ SETTINGS_FILE="${BASE_DIR}/settings.conf"
 GROUPS_FILE="${BASE_DIR}/groups.tsv"
 SERVICE_NAME="${APP_NAME}.service"
 TIMER_NAME="${APP_NAME}.timer"
-LOGROTATE_FILE="/etc/logrotate.d/${APP_NAME}"
 LOG_FILE="/var/log/${APP_NAME}.log"
 HISTORY_FILE="/var/log/${APP_NAME}-history.tsv"
 RUNSTATE_FILE="${VAR_DIR}/runstate.tsv"
@@ -562,17 +579,17 @@ line() {
 }
 
 title() {
-  clear
+  clear 2>/dev/null || true
   line
-  color "1;36" "                          cfdns 管理菜单 v1.9"
+  color "1;36" "                          🚀 cfdns 管理菜单 v2.0"
   echo
-  color "0;37" "  初始化向导已修复 / 空组不报错 / 多组目标域名 / 独立周期 / 解析测试 / 单组日志"
+  color "0;37" "  多组目标域名 / 独立周期 / 历史二级菜单 / 当前解析IP / 批量导入导出"
   line
 }
 
 pause_wait() {
   echo
-  read -n 1 -s -r -p "按任意键继续..."
+  read -n 1 -s -r -p "按任意键继续..." || true
 }
 
 save_settings() {
@@ -699,20 +716,25 @@ activate_after_init() {
 
 init_wizard_needed() {
   [[ -f "${INIT_FLAG}" ]] && return 1
+  if [[ "$(get_group_count)" -gt 0 ]]; then
+    touch "${INIT_FLAG}"
+    chmod 600 "${INIT_FLAG}"
+    return 1
+  fi
   return 0
 }
 
 run_init_wizard() {
   init_wizard_needed || return 0
 
-  clear
+  clear 2>/dev/null || true
   line
-  color "1;33" "首次运行快速初始化向导"
+  color "1;33" "🧭 首次运行快速初始化向导"
   echo
   color "0;37" "这次向导结束后，会直接把脚本切到可用状态。"
   line
-  echo "1. 开始初始化"
-  echo "2. 跳过，稍后在菜单中手动配置"
+  echo "1. 🚀 开始初始化"
+  echo "2. ⏭️  跳过，稍后在菜单中手动配置"
   line
   read -rp "请选择 [1-2]: " wizard_choice
 
@@ -728,7 +750,7 @@ run_init_wizard() {
 
 quick_add_first_group() {
   echo
-  color "1;33" "创建第一个组"
+  color "1;33" "🧱 创建第一个组"
   echo
   read -rp "组名（例如 group-a）: " group_name
   [[ -n "${group_name}" ]] || { echo "组名不能为空"; return; }
@@ -828,7 +850,7 @@ move_group_down() {
 
 add_group() {
   echo
-  color "1;33" "新增组（公开脚本模式）"
+  color "1;33" "➕ 新增组（公开脚本模式）"
   echo
   read -rp "请输入组名（例如 group-a）: " group_name
   [[ -n "${group_name}" ]] || { echo "组名不能为空"; return; }
@@ -839,8 +861,8 @@ add_group() {
   fi
 
   echo "是否启用该组："
-  echo "1. true（启用）"
-  echo "2. false（禁用）"
+  echo "1. ✅ true（启用）"
+  echo "2. ⛔ false（禁用）"
   read -rp "请选择 [1-2]: " enabled_choice
   case "${enabled_choice}" in
     1|"") enabled="true" ;;
@@ -959,9 +981,9 @@ manage_group_sources() {
   parse_sources_to_array "${GROUP_SOURCES_CSV}"
 
   while true; do
-    clear
+    clear 2>/dev/null || true
     line
-    color "1;36" "源域名管理 - ${GROUP_NAME}"
+    color "1;36" "🌐 源域名管理 - ${GROUP_NAME}"
     echo
     line
     local i=0
@@ -971,13 +993,15 @@ manage_group_sources() {
     done
     [[ "${#SOURCES_ARRAY[@]}" -eq 0 ]] && echo "当前无源域名"
     line
-    echo "1. 添加单个源域名"
-    echo "2. 删除单个源域名"
-    echo "3. 批量导入源域名（英文逗号分隔）"
-    echo "4. 导出当前源域名（英文逗号分隔）"
-    echo "0. 返回上级"
+    echo "1. ➕ 添加单个源域名"
+    echo "2. 🗑️  删除单个源域名"
+    echo "3. 📥 批量导入源域名（英文逗号分隔）"
+    echo "4. 📤 导出当前源域名（英文逗号分隔）"
+    echo "0. ↩️  返回上级"
     line
-    read -rp "请选择: " choice
+    if ! read -rp "请选择: " choice; then
+      exit 0
+    fi
 
     case "${choice}" in
       1)
@@ -1083,10 +1107,10 @@ edit_group_basic() {
 set_log_level() {
   echo
   echo "请选择日志等级："
-  echo "1. NONE（空日志）"
-  echo "2. ERROR（仅错误）"
-  echo "3. INFO（普通信息）"
-  echo "4. DEBUG（调试详情）"
+  echo "1. 🔇 NONE（空日志）"
+  echo "2. ❌ ERROR（仅错误）"
+  echo "3. ℹ️  INFO（普通信息）"
+  echo "4. 🐞 DEBUG（调试详情）"
   read -rp "请输入序号 [1-4]: " choice
 
   case "${choice}" in
@@ -1145,6 +1169,62 @@ test_group_sources_dns() {
       printf '%-4s %-45s %-8s %-6s %-40s\n' "${i}" "${domain}" "失败" "0" "-"
     fi
   done
+}
+
+view_group_current_ips() {
+  echo
+  select_group || { echo "序号无效"; return; }
+  split_line_to_vars "${CHOSEN_LINE}"
+  parse_sources_to_array "${GROUP_SOURCES_CSV}"
+
+  local tmp_all
+  tmp_all="$(mktemp)"
+  : > "${tmp_all}"
+
+  echo "📡 当前组别解析 IP：${GROUP_NAME}"
+  echo "目标域名: ${GROUP_TARGET_FQDN}"
+  echo "解析模式: ${GROUP_MODE}"
+  echo
+  printf '%-4s %-45s %-6s %-60s\n' "序号" "源域名" "数量" "IPv4结果"
+  printf '%-4s %-45s %-6s %-60s\n' "----" "---------------------------------------------" "------" "------------------------------------------------------------"
+
+  local i=0 domain ips selected count joined
+  for domain in "${SOURCES_ARRAY[@]}"; do
+    i=$((i+1))
+    ips="$(dig +short A "${domain}" | sed '/^$/d' | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | sort -u || true)"
+    if [[ "${GROUP_MODE}" == "SINGLE_IP" ]]; then
+      selected="$(echo "${ips}" | sed '/^$/d' | head -n1)"
+      [[ -n "${selected}" ]] && echo "${selected}" >> "${tmp_all}"
+      count="$(echo "${selected}" | sed '/^$/d' | wc -l | awk '{print $1}')"
+      joined="${selected:-}"
+    else
+      echo "${ips}" | sed '/^$/d' >> "${tmp_all}"
+      count="$(echo "${ips}" | sed '/^$/d' | wc -l | awk '{print $1}')"
+      joined="$(echo "${ips}" | paste -sd ',' -)"
+    fi
+    [[ -z "${joined}" ]] && joined="-"
+    printf '%-4s %-45s %-6s %-60s\n' "${i}" "${domain}" "${count}" "${joined:0:60}"
+  done
+
+  echo
+  echo "去重后将用于同步的 IPv4："
+  sort -u "${tmp_all}" | sed '/^$/d' | nl -w2 -s'. '
+  echo "总数: $(sort -u "${tmp_all}" | sed '/^$/d' | wc -l | awk '{print $1}')"
+
+  echo
+  echo "Cloudflare 当前目标 A 记录："
+  local resp
+  resp="$(curl -sS -X GET "https://api.cloudflare.com/client/v4/zones/${GROUP_ZONE_ID}/dns_records?type=A&name=${GROUP_TARGET_FQDN}&per_page=100" \
+    -H "Authorization: Bearer ${GROUP_API_TOKEN}" \
+    -H "Content-Type: application/json" || true)"
+  if [[ "$(echo "${resp}" | jq -r '.success // false' 2>/dev/null)" == "true" ]]; then
+    echo "${resp}" | jq -r '.result[].content' | sed '/^$/d' | sort -u | nl -w2 -s'. '
+    echo "总数: $(echo "${resp}" | jq -r '.result[].content' | sed '/^$/d' | sort -u | wc -l | awk '{print $1}')"
+  else
+    echo "无法读取 Cloudflare 当前记录，请检查 API Token / Zone ID。"
+  fi
+
+  rm -f "${tmp_all}"
 }
 
 start_sync() {
@@ -1225,7 +1305,7 @@ show_status() {
 show_dep_status() {
   printf '%-18s %-10s\n' "Command" "Status"
   printf '%-18s %-10s\n' "------------------" "----------"
-  for cmd in curl jq dig flock logrotate zcat awk sed grep comm mktemp paste cut tr date; do
+  for cmd in curl jq dig flock logrotate zcat awk sed grep comm mktemp paste cut tr date wc; do
     if command -v "${cmd}" >/dev/null 2>&1; then
       printf '%-18s %-10s\n' "${cmd}" "OK"
     else
@@ -1245,14 +1325,19 @@ show_runstate() {
 }
 
 render_history_table() {
-  local mode="$1"
-  local target_group="${2:-}"
-  local cutoff now files
+  local days="$1"
+  local record_mode="$2"
+  local target_group="${3:-}"
+  local cutoff now
+  local existing_files=()
+  local f
   now="$(date +%s)"
-  cutoff=$((now - 180*24*3600))
-  files=(/var/log/cf-dns-sync-history.tsv /var/log/cf-dns-sync-history.tsv.*)
+  cutoff=$((now - days*24*3600))
+  for f in /var/log/cf-dns-sync-history.tsv /var/log/cf-dns-sync-history.tsv.*; do
+    [[ -e "${f}" ]] && existing_files+=("${f}")
+  done
 
-  if [[ "${mode}" == "all" ]]; then
+  if [[ "${record_mode}" == "all" ]]; then
     printf '%-20s %-14s %-8s %-16s %-28s %-10s %-30s\n' "Time" "Group" "Action" "IP" "SourceDomain" "Mode" "Target"
     printf '%-20s %-14s %-8s %-16s %-28s %-10s %-30s\n' "--------------------" "--------------" "--------" "----------------" "----------------------------" "----------" "------------------------------"
   else
@@ -1260,7 +1345,12 @@ render_history_table() {
     printf '%-20s %-14s %-16s %-28s %-10s %-30s\n' "--------------------" "--------------" "----------------" "----------------------------" "----------" "------------------------------"
   fi
 
-  zcat -f "${files[@]}" 2>/dev/null | awk -F '\t' -v cutoff="${cutoff}" -v mode="${mode}" -v grp="${target_group}" '
+  if [[ "${#existing_files[@]}" -eq 0 ]]; then
+    echo "暂无历史记录文件"
+    return
+  fi
+
+  zcat -f "${existing_files[@]}" 2>/dev/null | awk -F '\t' -v cutoff="${cutoff}" -v rmode="${record_mode}" -v grp="${target_group}" '
     {
       cmd="date -d \"" $1 "\" +%s"
       cmd | getline ts
@@ -1269,9 +1359,9 @@ render_history_table() {
       if (grp != "" && $2 != grp) next
       split($7, arr, "|")
       target=arr[1]
-      if (mode == "deleted" && $3 != "DELETE") next
+      if (rmode == "deleted" && $3 != "DELETE") next
 
-      if (mode == "all") {
+      if (rmode == "all") {
         printf "%-20s %-14s %-8s %-16s %-28s %-10s %-30s\n", $1, $2, $3, $4, substr($5,1,28), $6, substr(target,1,30)
       } else {
         printf "%-20s %-14s %-16s %-28s %-10s %-30s\n", $1, $2, $4, substr($5,1,28), $6, substr(target,1,30)
@@ -1279,31 +1369,79 @@ render_history_table() {
     }' | sort
 }
 
-show_history_all() {
-  render_history_table "all"
-}
+history_menu() {
+  local days record_mode scope group=""
 
-show_deleted_all() {
-  render_history_table "deleted"
-}
+  while true; do
+    clear 2>/dev/null || true
+    line
+    color "1;36" "📜 查看域名 IP 历史记录"
+    echo
+    line
+    echo "1. 🕒 查看最近三天的历史"
+    echo "2. 📅 查看最近一周的历史"
+    echo "3. 🗓️  查看最近一个月的历史"
+    echo "4. ✍️  自定义时间：查看多少天前到今天的历史"
+    echo "5. 🧾 查看最近半年的历史"
+    echo "0. ↩️  返回主菜单"
+    line
+    if ! read -rp "请选择时间范围: " time_choice; then
+      return
+    fi
 
-show_history_one_group() {
-  echo
-  select_group || { echo "序号无效"; return; }
-  render_history_table "all" "${CHOSEN_GROUP_NAME}"
-}
+    case "${time_choice}" in
+      1) days=3 ;;
+      2) days=7 ;;
+      3) days=30 ;;
+      4)
+        read -rp "请输入天数，例如 10 表示最近10天: " days
+        [[ "${days}" =~ ^[0-9]+$ && "${days}" -ge 1 ]] || { echo "天数无效"; pause_wait; continue; }
+        ;;
+      5) days=180 ;;
+      0) return ;;
+      *) echo "无效选择"; pause_wait; continue ;;
+    esac
 
-show_deleted_one_group() {
-  echo
-  select_group || { echo "序号无效"; return; }
-  render_history_table "deleted" "${CHOSEN_GROUP_NAME}"
+    echo
+    echo "请选择记录类型："
+    echo "1. 🔁 全部变更记录（新增 + 删除）"
+    echo "2. 🗑️  仅删除旧 IP 记录"
+    read -rp "请选择 [1-2]: " mode_choice
+    case "${mode_choice}" in
+      1) record_mode="all" ;;
+      2) record_mode="deleted" ;;
+      *) echo "无效选择"; pause_wait; continue ;;
+    esac
+
+    echo
+    echo "请选择查看范围："
+    echo "1. 🌍 全部组"
+    echo "2. 📦 单个组"
+    read -rp "请选择 [1-2]: " scope_choice
+    case "${scope_choice}" in
+      1) scope="all"; group="" ;;
+      2)
+        echo
+        select_group || { echo "序号无效"; pause_wait; continue; }
+        scope="one"
+        group="${CHOSEN_GROUP_NAME}"
+        ;;
+      *) echo "无效选择"; pause_wait; continue ;;
+    esac
+
+    echo
+    echo "历史范围：最近 ${days} 天；记录类型：${record_mode}；查看范围：${scope}${group:+ / ${group}}"
+    echo
+    render_history_table "${days}" "${record_mode}" "${group}"
+    pause_wait
+  done
 }
 
 edit_raw_files() {
   echo
-  echo "1. 编辑 settings.conf（全局日志等级）"
-  echo "2. 编辑 groups.tsv（所有组配置）"
-  echo "0. 返回"
+  echo "1. 📝 编辑 settings.conf（全局日志等级）"
+  echo "2. 🧩 编辑 groups.tsv（所有组配置）"
+  echo "0. ↩️  返回"
   read -rp "请选择: " choice
   case "${choice}" in
     1) ${EDITOR:-vi} "${SETTINGS_FILE}" ;;
@@ -1345,38 +1483,38 @@ menu() {
 
   while true; do
     title
-    echo "  1.  查看全部组（List Groups / 查看组）"
-    echo "  2.  新增组（Add Group / 新增组）"
-    echo "  3.  删除组（Delete Group / 删除组）"
-    echo "  4.  编辑组基础信息（Edit Group / 编辑组）"
-    echo "  5.  管理组内源域名（Manage Sources / 源域名管理）"
-    echo "  6.  切换组启用状态（Enable/Disable / 启用禁用）"
-    echo "  7.  设置组同步周期（Set Interval / 同步周期）"
-    echo "  8.  测试组 API Token（Test Token / 测试令牌）"
-    echo "  9.  测试组源域名解析（Test Sources DNS / 解析测试）"
-    echo " 10.  组上移（Move Up / 上移）"
-    echo " 11.  组下移（Move Down / 下移）"
-    echo " 12.  设置日志等级（Log Level / 日志等级）"
-    echo " 13.  启动（Start / 启动）"
-    echo " 14.  停止（Stop / 停止）"
-    echo " 15.  重启（Restart / 重启）"
-    echo " 16.  手动同步全部组（Sync All / 全部同步）"
-    echo " 17.  手动同步单个组（Sync One / 单组同步）"
-    echo " 18.  查看最近日志（Logs / 最近日志）"
-    echo " 19.  实时查看日志（Follow Logs / 实时日志）"
-    echo " 20.  查看单组运行日志（One Group Logs / 单组日志）"
-    echo " 21.  查看 service/timer 状态（Status / 状态）"
-    echo " 22.  查看依赖状态（Dependencies / 依赖）"
-    echo " 23.  查看各组上次执行时间（Run State / 执行状态）"
-    echo " 24.  查看半年内全部历史（History All / 全部历史）"
-    echo " 25.  查看半年内全部删除记录（Deleted All / 全部删除）"
-    echo " 26.  查看某一组历史（History One Group / 单组历史）"
-    echo " 27.  查看某一组删除记录（Deleted One Group / 单组删除）"
-    echo " 28.  编辑原始配置文件（Edit Raw Files / 原始配置）"
-    echo " 29.  彻底卸载（Uninstall / 卸载）"
-    echo "  0.  退出（Exit / 退出）"
+    echo "  1.  📦 查看全部组（List Groups / 查看组）"
+    echo "  2.  ➕ 新增组（Add Group / 新增组）"
+    echo "  3.  🗑️  删除组（Delete Group / 删除组）"
+    echo "  4.  📝 编辑组基础信息（Edit Group / 编辑组）"
+    echo "  5.  🌐 管理组内源域名（Manage Sources / 源域名管理）"
+    echo "  6.  🔘 切换组启用状态（Enable/Disable / 启用禁用）"
+    echo "  7.  ⏱️  设置组同步周期（Set Interval / 同步周期）"
+    echo "  8.  🔑 测试组 API Token（Test Token / 测试令牌）"
+    echo "  9.  🧪 测试组源域名解析（Test Sources DNS / 解析测试）"
+    echo " 10.  📡 查看组别当前解析 IP（Current IPs / 当前IP）"
+    echo " 11.  ⬆️  组上移（Move Up / 上移）"
+    echo " 12.  ⬇️  组下移（Move Down / 下移）"
+    echo " 13.  🔊 设置日志等级（Log Level / 日志等级）"
+    echo " 14.  ▶️  启动（Start / 启动）"
+    echo " 15.  ⏹️  停止（Stop / 停止）"
+    echo " 16.  🔄 重启（Restart / 重启）"
+    echo " 17.  🚀 手动同步全部组（Sync All / 全部同步）"
+    echo " 18.  🎯 手动同步单个组（Sync One / 单组同步）"
+    echo " 19.  📄 查看最近日志（Logs / 最近日志）"
+    echo " 20.  👀 实时查看日志（Follow Logs / 实时日志）"
+    echo " 21.  📌 查看单组运行日志（One Group Logs / 单组日志）"
+    echo " 22.  🩺 查看 service/timer 状态（Status / 状态）"
+    echo " 23.  🧰 查看依赖状态（Dependencies / 依赖）"
+    echo " 24.  🕓 查看各组上次执行时间（Run State / 执行状态）"
+    echo " 25.  📜 查看域名 IP 历史记录（History / 历史记录）"
+    echo " 26.  🛠️  编辑原始配置文件（Edit Raw Files / 原始配置）"
+    echo " 27.  💣 彻底卸载（Uninstall / 卸载）"
+    echo "  0.  🚪 退出（Exit / 退出）"
     line
-    read -rp "请选择: " choice
+    if ! read -rp "请选择: " choice; then
+      exit 0
+    fi
 
     case "${choice}" in
       1) list_groups_table; pause_wait ;;
@@ -1388,26 +1526,24 @@ menu() {
       7) set_group_interval; pause_wait ;;
       8) test_group_token; pause_wait ;;
       9) test_group_sources_dns; pause_wait ;;
-      10) move_group_up; pause_wait ;;
-      11) move_group_down; pause_wait ;;
-      12) set_log_level; pause_wait ;;
-      13) start_sync; pause_wait ;;
-      14) stop_sync; pause_wait ;;
-      15) restart_sync; pause_wait ;;
-      16) manual_run_all; pause_wait ;;
-      17) manual_run_one; pause_wait ;;
-      18) show_logs; pause_wait ;;
-      19) follow_logs ;;
-      20) show_group_runtime_logs; pause_wait ;;
-      21) show_status; pause_wait ;;
-      22) show_dep_status; pause_wait ;;
-      23) show_runstate; pause_wait ;;
-      24) show_history_all; pause_wait ;;
-      25) show_deleted_all; pause_wait ;;
-      26) show_history_one_group; pause_wait ;;
-      27) show_deleted_one_group; pause_wait ;;
-      28) edit_raw_files ;;
-      29) uninstall_all ;;
+      10) view_group_current_ips; pause_wait ;;
+      11) move_group_up; pause_wait ;;
+      12) move_group_down; pause_wait ;;
+      13) set_log_level; pause_wait ;;
+      14) start_sync; pause_wait ;;
+      15) stop_sync; pause_wait ;;
+      16) restart_sync; pause_wait ;;
+      17) manual_run_all; pause_wait ;;
+      18) manual_run_one; pause_wait ;;
+      19) show_logs; pause_wait ;;
+      20) follow_logs ;;
+      21) show_group_runtime_logs; pause_wait ;;
+      22) show_status; pause_wait ;;
+      23) show_dep_status; pause_wait ;;
+      24) show_runstate; pause_wait ;;
+      25) history_menu ;;
+      26) edit_raw_files ;;
+      27) uninstall_all ;;
       0) exit 0 ;;
       *) echo "无效选择"; sleep 1 ;;
     esac
@@ -1479,12 +1615,15 @@ main() {
   touch "${HISTORY_FILE}" "${RUNSTATE_FILE}"
   chmod 600 "${HISTORY_FILE}" "${RUNSTATE_FILE}"
 
-  systemctl daemon-reload
-  systemctl enable --now "${APP_NAME}.timer"
-  systemctl start "${APP_NAME}.service" || true
+  systemctl daemon-reload || true
+
+  if [[ "${CFDNS_NO_START:-0}" != "1" ]]; then
+    systemctl enable --now "${APP_NAME}.timer" || true
+    systemctl start "${APP_NAME}.service" || true
+  fi
 
   echo
-  echo "安装/升级完成: v1.9"
+  echo "安装/升级完成: v2.0"
   echo "管理命令: cfdns"
   echo "组配置文件: ${GROUPS_FILE}"
   echo "全局设置文件: ${SETTINGS_FILE}"
@@ -1493,11 +1632,9 @@ main() {
   echo "历史文件: ${HISTORY_FILE}"
   echo "日志轮转: ${LOGROTATE_FILE}"
   echo
-  systemctl status "${APP_NAME}.timer" --no-pager -l || true
+  if [[ "${CFDNS_NO_START:-0}" != "1" ]]; then
+    systemctl status "${APP_NAME}.timer" --no-pager -l || true
+  fi
 }
 
 main
-EOF
-
-chmod +x /root/install_cfdns_v1_9.sh
-bash /root/install_cfdns_v1_9.sh

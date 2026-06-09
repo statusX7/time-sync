@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# hinet-gfw-changeip-v1.5.sh
+# hinet-gfw-changeip-v1.6.sh
 # HiNet 被墙检测 + Globalping 中国节点 ping 弱检测 + 双 API 自动换 IP
 # 适合上传 GitHub：脚本本身不包含任何敏感信息，敏感 API 写入 /etc 配置文件
 # ============================================================
@@ -8,7 +8,7 @@
 set -Eeuo pipefail
 
 APP_NAME="hinet-gfw-changeip"
-APP_VERSION="hinet-gfw-changeip-v1.5"
+APP_VERSION="hinet-gfw-changeip-v1.6"
 INSTALL_PATH="/usr/local/bin/${APP_NAME}"
 CONF_DIR="/etc/${APP_NAME}"
 CONF_FILE="${CONF_DIR}/config.env"
@@ -96,6 +96,9 @@ install_packages() {
         has_cmd "$c" || { err "依赖 $c 不可用，请手动安装后重试。"; exit 1; }
     done
 }
+
+# 兼容旧版本/误调用：v1.5 曾经把 install_packages 写成 install_dependencies。
+install_dependencies() { install_packages; }
 
 mask_url() {
     local s="${1:-}"
@@ -812,7 +815,7 @@ install_self() {
 
 quick_init() {
     require_root
-    install_dependencies
+    install_packages
     install_self
     mkdirs
 
@@ -1113,6 +1116,43 @@ uninstall_app() {
     info "历史保留：${HISTORY_FILE}"
 }
 
+self_check() {
+    require_root
+    cecho "🩺 ${APP_VERSION} 自检"
+    cecho "----------------------------------------"
+    mkdirs
+    if /usr/bin/env bash -n "${BASH_SOURCE[0]}"; then
+        ok "脚本语法检查通过。"
+    else
+        err "脚本语法检查失败。"
+        return 1
+    fi
+    for fn in install_packages quick_init install_self write_service globalping_measurement_create change_ip test_show_ip_api test_vendor_api; do
+        if declare -F "$fn" >/dev/null 2>&1; then
+            ok "函数存在：$fn"
+        else
+            err "函数缺失：$fn"
+            return 1
+        fi
+    done
+    for c in curl jq flock systemctl; do
+        if has_cmd "$c"; then
+            ok "命令可用：$c"
+        else
+            warn "命令缺失：$c"
+        fi
+    done
+    if [[ -f "$CONF_FILE" ]]; then
+        load_config
+        ok "配置文件存在：$CONF_FILE"
+        cecho "  获取 IP API：$(mask_url "${SHOW_IP_API_URL:-}")"
+        cecho "  更换 IP API：$(mask_url "${CHANGE_IP_API_URL:-}")"
+        cecho "  检测目标：${CHECK_TARGET:-未配置}"
+    else
+        warn "配置文件不存在，首次使用请执行快速初始化。"
+    fi
+}
+
 print_usage() {
     cat <<EOF_USAGE
 ${APP_VERSION}
@@ -1135,6 +1175,7 @@ ${APP_VERSION}
   ${APP_NAME} history30               最近一个月 IP 更换记录
   ${APP_NAME} logs                    实时日志
   ${APP_NAME} config                  查看脱敏配置
+  ${APP_NAME} doctor                  自检脚本/依赖/配置
   ${APP_NAME} uninstall               卸载
 EOF_USAGE
 }
@@ -1161,9 +1202,10 @@ menu() {
         cecho " 14. 🔎 手动测试获取当前 IP API（安全）"
         cecho " 15. 🧪 手动测试更换 IP API（不写正式记录）"
         cecho " 16. 🗑️  卸载脚本"
+        cecho " 17. 🩺 脚本自检"
         cecho "  0. 🚪 退出"
         cecho "========================================"
-        read -r -p "请输入选项 [0-16]：" choice
+        read -r -p "请输入选项 [0-17]：" choice
         choice="$(normalize_choice "$choice")"
         case "$choice" in
             1|init|install) quick_init ;;
@@ -1182,8 +1224,9 @@ menu() {
             14|test-show-api|showapi|show-api) test_show_ip_api ;;
             15|test-api|test-change-api|apitest|vendor-test) test_vendor_api ;;
             16|uninstall|remove) uninstall_app ;;
+            17|doctor|check-script|self-check) self_check ;;
             0|q|quit|exit) exit 0 ;;
-            *) warn "无效选项：${choice:-空输入}，请输入 0-16；手动换 IP 可输入 8 或 change。" ;;
+            *) warn "无效选项：${choice:-空输入}，请输入 0-17；手动换 IP 可输入 8 或 change。" ;;
         esac
     done
 }
@@ -1207,6 +1250,7 @@ main() {
         history30) history_days 30 ;;
         logs|log) view_logs ;;
         config) show_config_masked ;;
+        doctor|check-script|self-check|17) self_check ;;
         uninstall|remove) uninstall_app ;;
         help|-h|--help) print_usage ;;
         menu|*) menu ;;

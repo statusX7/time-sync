@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # ============================================================
-# hinet-gfw-changeip-v1.7.sh
+# hinet-gfw-changeip-v1.8.sh
 # HiNet 被墙检测 + Globalping 中国节点 ping 弱检测 + 双 API 自动换 IP
-# v1.7 修复：后台 daemon 遇到 Globalping 返回失败码时不会被 set -e 直接退出
+# v1.8 修复：增强 daemon 心跳/日志链路，新增 GitHub Raw 自动升级
 # 适合上传 GitHub：脚本本身不包含任何敏感信息，敏感 API 写入 /etc 配置文件
 # ============================================================
 
 set -Eeuo pipefail
 
 APP_NAME="hinet-gfw-changeip"
-APP_VERSION="hinet-gfw-changeip-v1.7"
+APP_VERSION="hinet-gfw-changeip-v1.8"
 INSTALL_PATH="/usr/local/bin/${APP_NAME}"
 CONF_DIR="/etc/${APP_NAME}"
 CONF_FILE="${CONF_DIR}/config.env"
@@ -34,6 +34,9 @@ DEFAULT_CURL_TIMEOUT="35"
 DEFAULT_POST_CHANGE_WAIT_SECONDS="180"
 DEFAULT_MIN_API_INTERVAL="60"
 DEFAULT_RESOLVER="1.1.1.1"
+DEFAULT_AUTO_UPDATE="0"
+DEFAULT_UPDATE_URL=""
+DEFAULT_UPDATE_CHECK_INTERVAL="3600"
 
 # -----------------------------
 # 基础输出
@@ -48,7 +51,11 @@ now_epoch() { date '+%s'; }
 
 log() {
     mkdir -p "$LOG_DIR"
-    printf '[%s] %s\n' "$(now_human)" "$*" | tee -a "$LOG_FILE" >/dev/null
+    local line
+    line="[$(now_human)] $*"
+    printf '%s\n' "$line" >> "$LOG_FILE"
+    # 同时输出到 stdout：systemd 会收进 journalctl，便于排查“文件日志为空/不刷新”的问题。
+    printf '%s\n' "$line"
 }
 
 require_root() {
@@ -101,6 +108,110 @@ install_packages() {
 # 兼容旧版本/误调用：v1.5 曾经把 install_packages 写成 install_dependencies。
 install_dependencies() { install_packages; }
 
+# -----------------------------
+# GitHub Raw 自动升级
+# -----------------------------
+extract_version_from_file() {
+    local f="$1" v=""
+    v="$(grep -E '^APP_VERSION=' "$f" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d '"' || true)"
+    printf '%s
+' "$v"
+}
+
+version_number() {
+    printf '%s' "${1:-}" | sed -E 's/^.*-v//; s/[^0-9.].*$//'
+}
+
+version_gt() {
+    local a b top
+    a="$(version_number "$1")"
+    b="$(version_number "$2")"
+    [[ -n "$a" && -n "$b" ]] || return 1
+    [[ "$a" == "$b" ]] && return 1
+    top="$(printf '%s
+%s
+' "$a" "$b" | sort -V | tail -n1)"
+    [[ "$top" == "$a" ]]
+}
+
+self_update() {
+    # 用法：self_update auto|manual
+    local mode="${1:-manual}" url="" tmp="" remote_ver="" current_ver="" backup=""
+    load_config
+    url="${UPDATE_URL:-}"
+    if [[ -z "$url" ]]; then
+        [[ "$mode" == "manual" ]] && warn "未配置 UPDATE_URL。请在快速初始化/修改配置中填写 GitHub Raw 脚本地址。"
+        return 0
+    fi
+    if ! has_cmd curl; then
+        [[ "$mode" == "manual" ]] && warn "curl 不可用，无法自动更新。"
+        return 0
+    fi
+
+    mkdirs
+    tmp="$(mktemp /tmp/${APP_NAME}.update.XXXXXX)"
+    if ! curl -fsSL --connect-timeout 10 --max-time 40 -A "${APP_NAME}/${APP_VERSION}" "$url" -o "$tmp"; then
+        rm -f "$tmp"
+        [[ "$mode" == "manual" ]] && err "下载更新失败：$(mask_url "$url")"
+        log "⚠️ 自动更新下载失败：url=$(mask_url "$url")"
+        return 1
+    fi
+
+    if ! grep -q "APP_NAME=\"${APP_NAME}\"" "$tmp" || ! /usr/bin/env bash -n "$tmp"; then
+        rm -f "$tmp"
+        err "更新文件校验失败：不是有效的 ${APP_NAME} 脚本，或 bash -n 不通过。"
+        log "❌ 更新文件校验失败。"
+        return 1
+    fi
+
+    remote_ver="$(extract_version_from_file "$tmp")"
+    current_ver="${APP_VERSION}"
+    if [[ -z "$remote_ver" ]]; then
+        rm -f "$tmp"
+        err "更新文件缺少 APP_VERSION，已取消。"
+        return 1
+    fi
+
+    if ! version_gt "$remote_ver" "$current_ver"; then
+        [[ "$mode" == "manual" ]] && ok "当前已是最新或远端版本不高于当前：本地=${current_ver}，远端=${remote_ver}。"
+        log "ℹ️ 自动更新检查：无需升级，本地=${current_ver}，远端=${remote_ver}。"
+        rm -f "$tmp"
+        SELF_UPDATE_CHANGED=0
+        return 0
+    fi
+
+    backup="${INSTALL_PATH}.bak.$(date +%Y%m%d%H%M%S)"
+    if [[ -f "$INSTALL_PATH" ]]; then
+        cp -f "$INSTALL_PATH" "$backup" || true
+    fi
+    install -m 755 "$tmp" "$INSTALL_PATH"
+    rm -f "$tmp"
+    SELF_UPDATE_CHANGED=1
+    ok "已自动升级：${current_ver} -> ${remote_ver}"
+    [[ -n "$backup" && -f "$backup" ]] && info "旧版本备份：${backup}"
+    log "✅ 自动升级完成：${current_ver} -> ${remote_ver}。"
+    if has_cmd systemctl && [[ -f "$SERVICE_FILE" ]]; then
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+    return 0
+}
+
+maybe_auto_update() {
+    local cmd="${1:-menu}"; shift || true
+    [[ "${HINET_GFW_SKIP_AUTO_UPDATE:-0}" == "1" ]] && return 0
+    case "$cmd" in
+        daemon|daemon-preflight|update|self-update|uninstall|remove) return 0 ;;
+    esac
+    load_config
+    [[ "${AUTO_UPDATE:-$DEFAULT_AUTO_UPDATE}" == "1" ]] || return 0
+    [[ -n "${UPDATE_URL:-}" ]] || return 0
+    SELF_UPDATE_CHANGED=0
+    if self_update auto && [[ "${SELF_UPDATE_CHANGED:-0}" == "1" ]]; then
+        export HINET_GFW_SKIP_AUTO_UPDATE=1
+        exec /usr/bin/env bash "$INSTALL_PATH" "$cmd" "$@"
+    fi
+}
+
 mask_url() {
     local s="${1:-}"
     [[ -z "$s" ]] && { printf '未配置'; return 0; }
@@ -131,6 +242,9 @@ load_config() {
     POST_CHANGE_WAIT_SECONDS="${POST_CHANGE_WAIT_SECONDS:-$DEFAULT_POST_CHANGE_WAIT_SECONDS}"
     DNS_RESOLVER="${DNS_RESOLVER:-$DEFAULT_RESOLVER}"
     MIN_API_INTERVAL="${MIN_API_INTERVAL:-$DEFAULT_MIN_API_INTERVAL}"
+    AUTO_UPDATE="${AUTO_UPDATE:-$DEFAULT_AUTO_UPDATE}"
+    UPDATE_URL="${UPDATE_URL:-$DEFAULT_UPDATE_URL}"
+    UPDATE_CHECK_INTERVAL="${UPDATE_CHECK_INTERVAL:-$DEFAULT_UPDATE_CHECK_INTERVAL}"
 }
 
 save_config() {
@@ -154,6 +268,9 @@ CURL_TIMEOUT=$(quote_env "$CURL_TIMEOUT")
 POST_CHANGE_WAIT_SECONDS=$(quote_env "$POST_CHANGE_WAIT_SECONDS")
 DNS_RESOLVER=$(quote_env "$DNS_RESOLVER")
 MIN_API_INTERVAL=$(quote_env "$MIN_API_INTERVAL")
+AUTO_UPDATE=$(quote_env "$AUTO_UPDATE")
+UPDATE_URL=$(quote_env "$UPDATE_URL")
+UPDATE_CHECK_INTERVAL=$(quote_env "$UPDATE_CHECK_INTERVAL")
 EOF_CONF
     chmod 600 "$CONF_FILE"
 }
@@ -201,6 +318,7 @@ validate_config_or_exit() {
     validate_number "$CURL_TIMEOUT" 5 120 "curl 超时秒数"
     validate_number "$POST_CHANGE_WAIT_SECONDS" 180 1800 "换 IP 后等待 DDNS 秒数"
     validate_number "$MIN_API_INTERVAL" 0 3600 "商家 API 最小调用间隔秒数"
+    validate_number "${UPDATE_CHECK_INTERVAL:-$DEFAULT_UPDATE_CHECK_INTERVAL}" 300 86400 "自动更新检查间隔秒数"
 }
 
 # -----------------------------
@@ -700,7 +818,16 @@ EOF_STATUS
 daemon_loop() {
     require_root
     mkdirs
-    install_packages
+    log "🧭 daemon entry：开始启动后台守护进程。"
+
+    # daemon 内不再自动 apt/yum 安装依赖，避免服务启动时卡在包管理器导致日志静默。
+    for c in curl jq flock; do
+        if ! has_cmd "$c"; then
+            log "❌ daemon 缺少依赖：$c。请执行 ${INSTALL_PATH} doctor 或重新 init。"
+            exit 1
+        fi
+    done
+
     validate_config_or_exit
 
     exec 9>"$LOCK_FILE"
@@ -710,11 +837,27 @@ daemon_loop() {
     fi
 
     load_status
-    log "🚀 ${APP_VERSION} 守护进程启动。target=${CHECK_TARGET}, interval=${CHECK_INTERVAL}s, cn_probes=${CN_PROBES}, threshold=${FAIL_THRESHOLD}, cooldown=${COOLDOWN_SECONDS}s"
+    log "🚀 ${APP_VERSION} 守护进程启动。target=${CHECK_TARGET}, interval=${CHECK_INTERVAL}s, cn_probes=${CN_PROBES}, threshold=${FAIL_THRESHOLD}, cooldown=${COOLDOWN_SECONDS}s, auto_update=${AUTO_UPDATE:-0}"
+    local LAST_UPDATE_CHECK_EPOCH=0
 
     while true; do
         load_config
         load_status
+
+        if [[ "${AUTO_UPDATE:-0}" == "1" && -n "${UPDATE_URL:-}" ]]; then
+            local update_now update_delta
+            update_now="$(now_epoch)"
+            update_delta=$(( update_now - LAST_UPDATE_CHECK_EPOCH ))
+            if (( update_delta >= UPDATE_CHECK_INTERVAL )); then
+                LAST_UPDATE_CHECK_EPOCH="$update_now"
+                SELF_UPDATE_CHANGED=0
+                if self_update auto && [[ "${SELF_UPDATE_CHANGED:-0}" == "1" ]]; then
+                    log "🔄 daemon 检测到新版本，重启服务以加载新脚本。"
+                    systemctl restart "$APP_NAME" >/dev/null 2>&1 || exit 0
+                    exit 0
+                fi
+            fi
+        fi
 
         local rc=2 now last_delta resolved_ip=""
         now="$(now_epoch)"
@@ -788,6 +931,8 @@ RestartSec=15
 WorkingDirectory=/
 Environment=LANG=C.UTF-8
 Environment=LC_ALL=C.UTF-8
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
@@ -817,6 +962,7 @@ install_self() {
     fi
 
     write_service
+    log "✅ 安装/覆盖完成：${INSTALL_PATH}，版本=${APP_VERSION}。"
     ok "安装完成：${INSTALL_PATH}"
     ok "服务文件：${SERVICE_FILE}"
 }
@@ -833,7 +979,7 @@ quick_init() {
     warn "v1.5 使用双 API：获取当前 IP API 不应换 IP；更换 IP API 只在手动/自动触发时调用。"
     cecho ""
 
-    local show_api change_api target interval probes threshold packets wait cooldown timeout post_wait min_api resolver start_now
+    local show_api change_api target interval probes threshold packets wait cooldown timeout post_wait min_api resolver auto_update update_url update_interval start_now
 
     read -r -p "🔎 请输入【获取当前 IP API】地址：" show_api
     while [[ -z "$show_api" ]]; do
@@ -882,6 +1028,21 @@ quick_init() {
     read -r -p "🧭 解析 DDNS 使用的 DNS 服务器 [默认 ${DEFAULT_RESOLVER}]：" resolver
     resolver="${resolver:-$DEFAULT_RESOLVER}"
 
+    read -r -p "🔄 是否启用 GitHub Raw 自动更新？[y/N]：" auto_update
+    if [[ "$auto_update" =~ ^[Yy]$ ]]; then
+        AUTO_UPDATE="1"
+        read -r -p "🔗 请输入 GitHub Raw 脚本地址（例如 raw.githubusercontent.com/.../hinet-gfw-changeip.sh）：" update_url
+        while [[ -z "$update_url" ]]; do
+            read -r -p "🔗 自动更新已启用，GitHub Raw 地址不能为空，请重新输入：" update_url
+        done
+        read -r -p "⏲️ daemon 自动检查更新间隔秒 [默认 ${DEFAULT_UPDATE_CHECK_INTERVAL}]：" update_interval
+        update_interval="${update_interval:-$DEFAULT_UPDATE_CHECK_INTERVAL}"
+    else
+        AUTO_UPDATE="0"
+        update_url=""
+        update_interval="$DEFAULT_UPDATE_CHECK_INTERVAL"
+    fi
+
     SHOW_IP_API_URL="$show_api"
     CHANGE_IP_API_URL="$change_api"
     CHECK_TARGET="$target"
@@ -895,6 +1056,8 @@ quick_init() {
     POST_CHANGE_WAIT_SECONDS="$post_wait"
     MIN_API_INTERVAL="$min_api"
     DNS_RESOLVER="$resolver"
+    UPDATE_URL="$update_url"
+    UPDATE_CHECK_INTERVAL="$update_interval"
 
     validate_number "$CHECK_INTERVAL" 30 3600 "检测间隔秒"
     validate_number "$CN_PROBES" 1 2 "中国节点数量"
@@ -905,6 +1068,7 @@ quick_init() {
     validate_number "$CURL_TIMEOUT" 5 120 "curl 超时秒数"
     validate_number "$POST_CHANGE_WAIT_SECONDS" 180 1800 "换 IP 后等待秒数"
     validate_number "$MIN_API_INTERVAL" 0 3600 "更换 IP API 最小调用间隔秒数"
+    validate_number "$UPDATE_CHECK_INTERVAL" 300 86400 "自动更新检查间隔秒数"
 
     save_config
     ok "配置已保存：${CONF_FILE}（权限 600）"
@@ -950,7 +1114,7 @@ edit_config() {
     cecho "----------------------------------------"
     cecho "回车表示保留当前值。API 会脱敏显示。"
 
-    local input_show="" input_change="" show_api="$SHOW_IP_API_URL" change_api="$CHANGE_IP_API_URL" target="$CHECK_TARGET" interval="$CHECK_INTERVAL" probes="$CN_PROBES" threshold="$FAIL_THRESHOLD" packets="$GP_PACKETS" wait="$GP_RESULT_WAIT_SECONDS" cooldown="$COOLDOWN_SECONDS" timeout="$CURL_TIMEOUT" post_wait="$POST_CHANGE_WAIT_SECONDS" min_api="$MIN_API_INTERVAL" resolver="$DNS_RESOLVER" restart_now=""
+    local input_show="" input_change="" show_api="$SHOW_IP_API_URL" change_api="$CHANGE_IP_API_URL" target="$CHECK_TARGET" interval="$CHECK_INTERVAL" probes="$CN_PROBES" threshold="$FAIL_THRESHOLD" packets="$GP_PACKETS" wait="$GP_RESULT_WAIT_SECONDS" cooldown="$COOLDOWN_SECONDS" timeout="$CURL_TIMEOUT" post_wait="$POST_CHANGE_WAIT_SECONDS" min_api="$MIN_API_INTERVAL" resolver="$DNS_RESOLVER" auto_update="$AUTO_UPDATE" update_url="$UPDATE_URL" update_interval="$UPDATE_CHECK_INTERVAL" restart_now=""
 
     read -r -p "🔎 获取当前 IP API [当前：$(mask_url "$show_api")]，回车保留：" input_show
     [[ -n "${input_show:-}" ]] && show_api="$input_show"
@@ -974,6 +1138,14 @@ edit_config() {
     prompt_keep "⏳ 换 IP 后等待秒数，最小 180" "$post_wait" post_wait
     prompt_keep "🧯 更换 IP API 最小调用间隔秒数" "$min_api" min_api
     prompt_keep "🧭 DDNS 解析 DNS 服务器" "$resolver" resolver
+    prompt_keep "🔄 是否启用自动更新：1=启用，0=关闭" "$auto_update" auto_update
+    if [[ "$auto_update" == "1" ]]; then
+        prompt_keep "🔗 GitHub Raw 更新地址" "$update_url" update_url
+        prompt_keep "⏲️ 自动更新检查间隔秒" "$update_interval" update_interval
+    else
+        update_url="$update_url"
+        update_interval="${update_interval:-$DEFAULT_UPDATE_CHECK_INTERVAL}"
+    fi
 
     SHOW_IP_API_URL="$show_api"
     CHANGE_IP_API_URL="$change_api"
@@ -988,6 +1160,9 @@ edit_config() {
     POST_CHANGE_WAIT_SECONDS="$post_wait"
     MIN_API_INTERVAL="$min_api"
     DNS_RESOLVER="$resolver"
+    AUTO_UPDATE="$auto_update"
+    UPDATE_URL="$update_url"
+    UPDATE_CHECK_INTERVAL="$update_interval"
 
     [[ -n "$SHOW_IP_API_URL" ]] || { err "获取当前 IP API 地址不能为空。"; return 1; }
     [[ -n "$CHANGE_IP_API_URL" ]] || { err "更换 IP API 地址不能为空。"; return 1; }
@@ -1001,6 +1176,9 @@ edit_config() {
     validate_number "$CURL_TIMEOUT" 5 120 "curl 超时秒数"
     validate_number "$POST_CHANGE_WAIT_SECONDS" 180 1800 "换 IP 后等待秒数"
     validate_number "$MIN_API_INTERVAL" 0 3600 "更换 IP API 最小调用间隔秒数"
+    [[ "$AUTO_UPDATE" =~ ^[01]$ ]] || { err "AUTO_UPDATE 必须是 0 或 1。"; return 1; }
+    if [[ "$AUTO_UPDATE" == "1" && -z "$UPDATE_URL" ]]; then err "启用自动更新时 UPDATE_URL 不能为空。"; return 1; fi
+    validate_number "$UPDATE_CHECK_INTERVAL" 300 86400 "自动更新检查间隔秒数"
     save_config
     ok "配置已更新：${CONF_FILE}"
     show_config_masked
@@ -1056,6 +1234,9 @@ service_status() {
     cecho "  API 最小间隔：${MIN_API_INTERVAL:-未配置}s"
     cecho "  获取 IP API：$(mask_url "${SHOW_IP_API_URL:-}")"
     cecho "  更换 IP API：$(mask_url "${CHANGE_IP_API_URL:-}")"
+    cecho "  自动更新：${AUTO_UPDATE:-0}"
+    cecho "  更新地址：$(mask_url "${UPDATE_URL:-}")"
+    cecho "  更新检查间隔：${UPDATE_CHECK_INTERVAL:-$DEFAULT_UPDATE_CHECK_INTERVAL}s"
     cecho ""
     cecho "📊 最近状态："
     cecho "  LAST_TARGET=${LAST_TARGET:-unknown}"
@@ -1070,8 +1251,16 @@ service_status() {
 view_logs() {
     require_root
     mkdirs
-    info "按 Ctrl+C 退出日志。"
-    tail -n 80 -f "$LOG_FILE"
+    cecho "🧾 日志文件：${LOG_FILE}"
+    cecho "🧾 systemd journal：journalctl -u ${APP_NAME} -f"
+    cecho "----------------------------------------"
+    if has_cmd systemctl && systemctl list-unit-files "${APP_NAME}.service" >/dev/null 2>&1; then
+        info "优先显示 systemd journal。按 Ctrl+C 退出。"
+        journalctl -u "$APP_NAME" -n 120 -f -o cat || true
+    else
+        info "未检测到 systemd 服务，显示文件日志。按 Ctrl+C 退出。"
+        tail -n 120 -F "$LOG_FILE"
+    fi
 }
 
 show_config_masked() {
@@ -1092,6 +1281,9 @@ show_config_masked() {
     cecho "POST_CHANGE_WAIT_SECONDS=${POST_CHANGE_WAIT_SECONDS:-$DEFAULT_POST_CHANGE_WAIT_SECONDS}"
     cecho "DNS_RESOLVER=${DNS_RESOLVER:-$DEFAULT_RESOLVER}"
     cecho "MIN_API_INTERVAL=${MIN_API_INTERVAL:-$DEFAULT_MIN_API_INTERVAL}"
+    cecho "AUTO_UPDATE=${AUTO_UPDATE:-$DEFAULT_AUTO_UPDATE}"
+    cecho "UPDATE_URL=$(mask_url "${UPDATE_URL:-}")"
+    cecho "UPDATE_CHECK_INTERVAL=${UPDATE_CHECK_INTERVAL:-$DEFAULT_UPDATE_CHECK_INTERVAL}"
 }
 
 history_days() {
@@ -1135,7 +1327,7 @@ self_check() {
         err "脚本语法检查失败。"
         return 1
     fi
-    for fn in install_packages quick_init install_self write_service globalping_measurement_create change_ip test_show_ip_api test_vendor_api; do
+    for fn in install_packages quick_init install_self write_service globalping_measurement_create change_ip test_show_ip_api test_vendor_api self_update maybe_auto_update daemon_loop; do
         if declare -F "$fn" >/dev/null 2>&1; then
             ok "函数存在：$fn"
         else
@@ -1156,6 +1348,8 @@ self_check() {
         cecho "  获取 IP API：$(mask_url "${SHOW_IP_API_URL:-}")"
         cecho "  更换 IP API：$(mask_url "${CHANGE_IP_API_URL:-}")"
         cecho "  检测目标：${CHECK_TARGET:-未配置}"
+        cecho "  自动更新：${AUTO_UPDATE:-0}"
+        cecho "  更新地址：$(mask_url "${UPDATE_URL:-}")"
     else
         warn "配置文件不存在，首次使用请执行快速初始化。"
     fi
@@ -1184,6 +1378,7 @@ ${APP_VERSION}
   ${APP_NAME} logs                    实时日志
   ${APP_NAME} config                  查看脱敏配置
   ${APP_NAME} doctor                  自检脚本/依赖/配置
+  ${APP_NAME} update                  立即从 GitHub Raw 检查并升级
   ${APP_NAME} uninstall               卸载
 EOF_USAGE
 }
@@ -1211,9 +1406,10 @@ menu() {
         cecho " 15. 🧪 手动测试更换 IP API（不写正式记录）"
         cecho " 16. 🗑️  卸载脚本"
         cecho " 17. 🩺 脚本自检"
+        cecho " 18. ⬆️  立即检查 GitHub 更新"
         cecho "  0. 🚪 退出"
         cecho "========================================"
-        read -r -p "请输入选项 [0-17]：" choice
+        read -r -p "请输入选项 [0-18]：" choice
         choice="$(normalize_choice "$choice")"
         case "$choice" in
             1|init|install) quick_init ;;
@@ -1233,14 +1429,16 @@ menu() {
             15|test-api|test-change-api|apitest|vendor-test) test_vendor_api ;;
             16|uninstall|remove) uninstall_app ;;
             17|doctor|check-script|self-check) self_check ;;
+            18|update|self-update|upgrade) self_update manual ;;
             0|q|quit|exit) exit 0 ;;
-            *) warn "无效选项：${choice:-空输入}，请输入 0-17；手动换 IP 可输入 8 或 change。" ;;
+            *) warn "无效选项：${choice:-空输入}，请输入 0-18；手动换 IP 可输入 8 或 change。" ;;
         esac
     done
 }
 
 main() {
     local cmd="${1:-menu}"
+    maybe_auto_update "$@"
     case "$cmd" in
         init|install) quick_init ;;
         start) service_start ;;
@@ -1259,6 +1457,7 @@ main() {
         logs|log) view_logs ;;
         config) show_config_masked ;;
         doctor|check-script|self-check|17) self_check ;;
+        update|self-update|upgrade|18) self_update manual ;;
         uninstall|remove) uninstall_app ;;
         help|-h|--help) print_usage ;;
         menu|*) menu ;;

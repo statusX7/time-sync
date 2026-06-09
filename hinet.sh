@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # ============================================================
-# hinet-gfw-changeip-v1.8.sh
+# hinet-gfw-changeip-v1.9.sh
 # HiNet 被墙检测 + Globalping 中国节点 ping 弱检测 + 双 API 自动换 IP
-# v1.8 修复：增强 daemon 心跳/日志链路，新增 GitHub Raw 自动升级
+# v1.9 修复：菜单 11 恢复文件中文实时日志，增强日志自检与 journal 备用入口
 # 适合上传 GitHub：脚本本身不包含任何敏感信息，敏感 API 写入 /etc 配置文件
 # ============================================================
 
 set -Eeuo pipefail
 
 APP_NAME="hinet-gfw-changeip"
-APP_VERSION="hinet-gfw-changeip-v1.8"
+APP_VERSION="hinet-gfw-changeip-v1.9"
 INSTALL_PATH="/usr/local/bin/${APP_NAME}"
 CONF_DIR="/etc/${APP_NAME}"
 CONF_FILE="${CONF_DIR}/config.env"
@@ -50,11 +50,14 @@ now_human() { date '+%Y-%m-%d %H:%M:%S%z'; }
 now_epoch() { date '+%s'; }
 
 log() {
-    mkdir -p "$LOG_DIR"
+    mkdir -p "$LOG_DIR" 2>/dev/null || true
     local line
     line="[$(now_human)] $*"
-    printf '%s\n' "$line" >> "$LOG_FILE"
-    # 同时输出到 stdout：systemd 会收进 journalctl，便于排查“文件日志为空/不刷新”的问题。
+    # 文件日志是菜单 11 的主要来源；写文件失败不能让 daemon 因 set -e 退出。
+    if ! printf '%s\n' "$line" >> "$LOG_FILE" 2>/dev/null; then
+        printf '%s\n' "[$(now_human)] ⚠️ 文件日志写入失败：${LOG_FILE}" >&2 || true
+    fi
+    # 同时输出到 stdout：systemd 会收进 journalctl，作为备用排查通道。
     printf '%s\n' "$line"
 }
 
@@ -1251,15 +1254,29 @@ service_status() {
 view_logs() {
     require_root
     mkdirs
-    cecho "🧾 日志文件：${LOG_FILE}"
-    cecho "🧾 systemd journal：journalctl -u ${APP_NAME} -f"
+    cecho "🧾 中文日志文件：${LOG_FILE}"
     cecho "----------------------------------------"
-    if has_cmd systemctl && systemctl list-unit-files "${APP_NAME}.service" >/dev/null 2>&1; then
-        info "优先显示 systemd journal。按 Ctrl+C 退出。"
+    info "显示原来的中文文件日志。按 Ctrl+C 退出。"
+    if [[ ! -s "$LOG_FILE" ]]; then
+        warn "当前文件日志为空。下面先给出服务状态，方便判断后台是否真正运行。"
+        if has_cmd systemctl && systemctl list-unit-files "${APP_NAME}.service" >/dev/null 2>&1; then
+            systemctl --no-pager --full status "$APP_NAME" || true
+            cecho ""
+            warn "如果服务状态正常但文件日志仍为空，可执行：${APP_NAME} journal 查看 systemd journal 原始输出。"
+        fi
+    fi
+    tail -n 120 -F "$LOG_FILE"
+}
+
+view_journal_logs() {
+    require_root
+    cecho "🧾 systemd journal：journalctl -u ${APP_NAME} -f -o cat"
+    cecho "----------------------------------------"
+    if has_cmd journalctl; then
         journalctl -u "$APP_NAME" -n 120 -f -o cat || true
     else
-        info "未检测到 systemd 服务，显示文件日志。按 Ctrl+C 退出。"
-        tail -n 120 -F "$LOG_FILE"
+        err "当前系统未检测到 journalctl。"
+        return 1
     fi
 }
 
@@ -1327,7 +1344,7 @@ self_check() {
         err "脚本语法检查失败。"
         return 1
     fi
-    for fn in install_packages quick_init install_self write_service globalping_measurement_create change_ip test_show_ip_api test_vendor_api self_update maybe_auto_update daemon_loop; do
+    for fn in install_packages quick_init install_self write_service globalping_measurement_create change_ip test_show_ip_api test_vendor_api self_update maybe_auto_update daemon_loop view_logs view_journal_logs; do
         if declare -F "$fn" >/dev/null 2>&1; then
             ok "函数存在：$fn"
         else
@@ -1342,6 +1359,16 @@ self_check() {
             warn "命令缺失：$c"
         fi
     done
+    if [[ -w "$LOG_FILE" || ! -e "$LOG_FILE" ]]; then
+        ok "文件日志可写：$LOG_FILE"
+    else
+        warn "文件日志当前不可写：$LOG_FILE"
+    fi
+    if has_cmd journalctl; then
+        ok "journalctl 可用：可使用 ${APP_NAME} journal 查看原始日志"
+    else
+        warn "journalctl 不可用：只能查看文件日志"
+    fi
     if [[ -f "$CONF_FILE" ]]; then
         load_config
         ok "配置文件存在：$CONF_FILE"
@@ -1375,7 +1402,8 @@ ${APP_VERSION}
   ${APP_NAME} edit-config             修改已有配置
   ${APP_NAME} history3                最近三天 IP 更换记录
   ${APP_NAME} history30               最近一个月 IP 更换记录
-  ${APP_NAME} logs                    实时日志
+  ${APP_NAME} logs                    实时中文文件日志
+  ${APP_NAME} journal                 查看 systemd journal 原始日志
   ${APP_NAME} config                  查看脱敏配置
   ${APP_NAME} doctor                  自检脚本/依赖/配置
   ${APP_NAME} update                  立即从 GitHub Raw 检查并升级
@@ -1407,9 +1435,10 @@ menu() {
         cecho " 16. 🗑️  卸载脚本"
         cecho " 17. 🩺 脚本自检"
         cecho " 18. ⬆️  立即检查 GitHub 更新"
+        cecho " 19. 🧾 查看 systemd journal 原始日志"
         cecho "  0. 🚪 退出"
         cecho "========================================"
-        read -r -p "请输入选项 [0-18]：" choice
+        read -r -p "请输入选项 [0-19]：" choice
         choice="$(normalize_choice "$choice")"
         case "$choice" in
             1|init|install) quick_init ;;
@@ -1430,8 +1459,9 @@ menu() {
             16|uninstall|remove) uninstall_app ;;
             17|doctor|check-script|self-check) self_check ;;
             18|update|self-update|upgrade) self_update manual ;;
+            19|journal|journal-logs) view_journal_logs ;;
             0|q|quit|exit) exit 0 ;;
-            *) warn "无效选项：${choice:-空输入}，请输入 0-18；手动换 IP 可输入 8 或 change。" ;;
+            *) warn "无效选项：${choice:-空输入}，请输入 0-19；手动换 IP 可输入 8 或 change。" ;;
         esac
     done
 }
@@ -1454,7 +1484,8 @@ main() {
         edit|edit-config|modify|settings|13) edit_config ;;
         history3) history_days 3 ;;
         history30) history_days 30 ;;
-        logs|log) view_logs ;;
+        logs|log|11) view_logs ;;
+        journal|journal-logs|19) view_journal_logs ;;
         config) show_config_masked ;;
         doctor|check-script|self-check|17) self_check ;;
         update|self-update|upgrade|18) self_update manual ;;

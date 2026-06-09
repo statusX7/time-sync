@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# hinet-gfw-changeip-v1.2.sh
+# hinet-gfw-changeip-v1.3.sh
 # HiNet 被墙检测 + Globalping 中国节点 ping 弱检测 + 单一商家 API 自动换 IP
 # 适合上传 GitHub：脚本本身不包含任何敏感信息，敏感 API 写入 /etc 配置文件
 # ============================================================
@@ -8,7 +8,7 @@
 set -Eeuo pipefail
 
 APP_NAME="hinet-gfw-changeip"
-APP_VERSION="hinet-gfw-changeip-v1.2"
+APP_VERSION="hinet-gfw-changeip-v1.3"
 INSTALL_PATH="/usr/local/bin/${APP_NAME}"
 CONF_DIR="/etc/${APP_NAME}"
 CONF_FILE="${CONF_DIR}/config.env"
@@ -19,6 +19,7 @@ HISTORY_FILE="${STATE_DIR}/ip_change_history.log"
 STATUS_FILE="${STATE_DIR}/status.env"
 SERVICE_FILE="/etc/systemd/system/${APP_NAME}.service"
 LOCK_FILE="/run/${APP_NAME}.lock"
+CHANGE_LOCK_FILE="/run/${APP_NAME}-change.lock"
 GLOBALPING_API_BASE="https://api.globalping.io/v1"
 
 # 默认值：快速初始化时可改
@@ -157,6 +158,23 @@ validate_number() {
     fi
 }
 
+normalize_choice() {
+    # 兼容：前后空格、全角数字、中文顿号/句号、08 这类输入。
+    local c="${1:-}"
+    c="${c//$'\r'/}"
+    c="${c//$'\t'/}"
+    c="$(printf '%s' "$c" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+    c="$(printf '%s' "$c" | sed \
+        -e 's/０/0/g' -e 's/１/1/g' -e 's/２/2/g' -e 's/３/3/g' -e 's/４/4/g' \
+        -e 's/５/5/g' -e 's/６/6/g' -e 's/７/7/g' -e 's/８/8/g' -e 's/９/9/g' \
+        -e 's/[．。]//g')"
+    if [[ "$c" =~ ^0*[0-9]+$ ]]; then
+        c="$((10#$c))"
+    fi
+    printf '%s' "$c"
+}
+
+
 validate_config_or_exit() {
     load_config
     [[ -n "$HINET_API_URL" ]] || { err "未配置 HINET_API_URL，请先执行快速初始化。"; exit 1; }
@@ -269,7 +287,7 @@ append_history() {
         "$(now_human)" "${old_ip:-unknown}" "${new_ip:-unknown}" "${CHECK_TARGET:-unknown}" "${reason:-manual}" "${note:-}" >> "$HISTORY_FILE"
 }
 
-change_ip() {
+change_ip_inner() {
     validate_config_or_exit
     local reason="${1:-manual}" old_ip="" api_body="" api_ip="" new_ip="" note=""
 
@@ -309,6 +327,18 @@ change_ip() {
     log "✅ 换 IP 流程完成：${old_ip:-unknown} -> ${new_ip}，reason=${reason}，note=${note}"
     ok "换 IP 流程完成：${old_ip:-unknown} -> ${new_ip}"
     return 0
+}
+
+change_ip() {
+    # 防止后台自动触发、菜单手动触发、命令行手动触发同时调用商家 API。
+    mkdir -p /run
+    exec 8>"$CHANGE_LOCK_FILE"
+    if ! flock -n 8; then
+        warn "已有换 IP 流程正在执行，本次跳过，避免重复调用商家 API。"
+        log "⚠️ 换 IP 流程已被锁定，跳过 reason=${1:-manual}"
+        return 1
+    fi
+    change_ip_inner "${1:-manual}"
 }
 
 # -----------------------------
@@ -787,6 +817,7 @@ ${APP_VERSION}
   ${APP_NAME} current-ip              显示检测目标当前解析 IP
   ${APP_NAME} check                   手动检测一次
   ${APP_NAME} change                  手动调用商家 API 换 IP
+  ${APP_NAME} 8                       等同于 change，兼容菜单编号
   ${APP_NAME} history3                最近三天 IP 更换记录
   ${APP_NAME} history30               最近一个月 IP 更换记录
   ${APP_NAME} logs                    实时日志
@@ -817,22 +848,23 @@ menu() {
         cecho "  0. 🚪 退出"
         cecho "========================================"
         read -r -p "请输入选项 [0-13]：" choice
+        choice="$(normalize_choice "$choice")"
         case "$choice" in
-            1) quick_init ;;
-            2) service_start ;;
-            3) service_stop ;;
-            4) service_restart ;;
-            5) service_status ;;
-            6) show_current_ip ;;
-            7) run_single_check ;;
-            8) change_ip "manual_menu" ;;
-            9) history_days 3 ;;
-            10) history_days 30 ;;
-            11) view_logs ;;
-            12) show_config_masked ;;
-            13) uninstall_app ;;
-            0) exit 0 ;;
-            *) warn "无效选项，请重新输入。" ;;
+            1|init|install) quick_init ;;
+            2|start) service_start ;;
+            3|stop) service_stop ;;
+            4|restart) service_restart ;;
+            5|status) service_status ;;
+            6|ip|showip|current-ip) show_current_ip ;;
+            7|check|test) run_single_check ;;
+            8|change|change-ip|manual) change_ip "manual_menu" ;;
+            9|history3) history_days 3 ;;
+            10|history30) history_days 30 ;;
+            11|log|logs) view_logs ;;
+            12|config) show_config_masked ;;
+            13|uninstall|remove) uninstall_app ;;
+            0|q|quit|exit) exit 0 ;;
+            *) warn "无效选项：${choice:-空输入}，请输入 0-13；手动换 IP 可输入 8 或 change。" ;;
         esac
     done
 }
@@ -848,7 +880,7 @@ main() {
         daemon) daemon_loop ;;
         current-ip|showip|ip) show_current_ip ;;
         check|test) run_single_check ;;
-        change|change-ip) change_ip "manual_cli" ;;
+        change|change-ip|manual|8) change_ip "manual_cli" ;;
         history3) history_days 3 ;;
         history30) history_days 30 ;;
         logs|log) view_logs ;;

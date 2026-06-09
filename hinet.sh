@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# hinet-gfw-changeip-v1.1.sh
+# hinet-gfw-changeip-v1.2.sh
 # HiNet 被墙检测 + Globalping 中国节点 ping 弱检测 + 单一商家 API 自动换 IP
 # 适合上传 GitHub：脚本本身不包含任何敏感信息，敏感 API 写入 /etc 配置文件
 # ============================================================
@@ -8,7 +8,7 @@
 set -Eeuo pipefail
 
 APP_NAME="hinet-gfw-changeip"
-APP_VERSION="hinet-gfw-changeip-v1.1"
+APP_VERSION="hinet-gfw-changeip-v1.2"
 INSTALL_PATH="/usr/local/bin/${APP_NAME}"
 CONF_DIR="/etc/${APP_NAME}"
 CONF_FILE="${CONF_DIR}/config.env"
@@ -534,7 +534,7 @@ After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=${INSTALL_PATH} daemon
+ExecStart=/usr/bin/env bash ${INSTALL_PATH} daemon
 Restart=always
 RestartSec=15
 WorkingDirectory=/
@@ -560,6 +560,12 @@ install_self() {
         chmod 755 "$INSTALL_PATH"
     else
         chmod 755 "$INSTALL_PATH"
+    fi
+
+    # 自检：确保安装后的入口文件可被 bash 解释，避免 systemd 203/EXEC。
+    if ! /usr/bin/env bash -n "$INSTALL_PATH"; then
+        err "安装后的脚本语法自检失败：$INSTALL_PATH"
+        exit 1
     fi
 
     write_service

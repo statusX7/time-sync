@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # ============================================================
-# hinet-gfw-changeip-v2.1.sh
+# hinet-gfw-changeip-v2.2.sh
 # HiNet 被墙检测 + Globalping 中国节点 ping 弱检测 + 双 API 自动换 IP
-# v2.1：彻底修复 daemon 正常退出/反复重启导致 Globalping 后台检测不生效的问题
+# v2.2：彻底改为 systemd timer + oneshot service，解决 daemon 静默退出/中文日志为空/后台检测不稳定问题
 # 适合上传 GitHub：脚本本身不包含任何敏感信息，敏感 API 写入 /etc 配置文件
 # ============================================================
 
-set -Eeuo pipefail
+set -u -o pipefail
 
 APP_NAME="hinet-gfw-changeip"
-APP_VERSION="hinet-gfw-changeip-v2.1"
+APP_VERSION="hinet-gfw-changeip-v2.2"
 INSTALL_PATH="/usr/local/bin/${APP_NAME}"
 CONF_DIR="/etc/${APP_NAME}"
 CONF_FILE="${CONF_DIR}/config.env"
@@ -19,11 +19,10 @@ LOG_FILE="${LOG_DIR}/${APP_NAME}.log"
 HISTORY_FILE="${STATE_DIR}/ip_change_history.log"
 STATUS_FILE="${STATE_DIR}/status.env"
 SERVICE_FILE="/etc/systemd/system/${APP_NAME}.service"
-LOCK_FILE="/run/${APP_NAME}.lock"
+TIMER_FILE="/etc/systemd/system/${APP_NAME}.timer"
 CHANGE_LOCK_FILE="/run/${APP_NAME}-change.lock"
 GLOBALPING_API_BASE="https://api.globalping.io/v1"
 
-# 默认值：快速初始化时可改
 DEFAULT_CHECK_INTERVAL="60"
 DEFAULT_CN_PROBES="2"
 DEFAULT_FAIL_THRESHOLD="3"
@@ -35,9 +34,6 @@ DEFAULT_POST_CHANGE_WAIT_SECONDS="180"
 DEFAULT_MIN_API_INTERVAL="60"
 DEFAULT_RESOLVER="1.1.1.1"
 
-# -----------------------------
-# 基础输出
-# -----------------------------
 cecho() { printf '%b\n' "$*"; }
 info() { cecho "ℹ️  $*"; }
 ok() { cecho "✅ $*"; }
@@ -45,16 +41,21 @@ warn() { cecho "⚠️  $*"; }
 err() { cecho "❌ $*" >&2; }
 now_human() { date '+%Y-%m-%d %H:%M:%S%z'; }
 now_epoch() { date '+%s'; }
+has_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+mkdirs() {
+    mkdir -p "$CONF_DIR" "$STATE_DIR" "$LOG_DIR"
+    chmod 700 "$CONF_DIR" "$STATE_DIR" 2>/dev/null || true
+    chmod 755 "$LOG_DIR" 2>/dev/null || true
+    touch "$LOG_FILE" "$HISTORY_FILE" "$STATUS_FILE" 2>/dev/null || true
+    chmod 600 "$LOG_FILE" "$HISTORY_FILE" "$STATUS_FILE" 2>/dev/null || true
+}
 
 log() {
     mkdir -p "$LOG_DIR" 2>/dev/null || true
     local line
     line="[$(now_human)] $*"
-    # 文件日志是菜单 11 的主要来源；写文件失败不能让 daemon 因 set -e 退出。
-    if ! printf '%s\n' "$line" >> "$LOG_FILE" 2>/dev/null; then
-        printf '%s\n' "[$(now_human)] ⚠️ 文件日志写入失败：${LOG_FILE}" >&2 || true
-    fi
-    # 同时输出到 stdout：systemd 会收进 journalctl，作为备用排查通道。
+    printf '%s\n' "$line" >> "$LOG_FILE" 2>/dev/null || printf '%s\n' "[$(now_human)] ⚠️ 文件日志写入失败：${LOG_FILE}" >&2
     printf '%s\n' "$line"
 }
 
@@ -65,24 +66,29 @@ require_root() {
     fi
 }
 
-mkdirs() {
-    mkdir -p "$CONF_DIR" "$STATE_DIR" "$LOG_DIR"
-    chmod 700 "$CONF_DIR" "$STATE_DIR"
-    chmod 755 "$LOG_DIR"
-    touch "$LOG_FILE" "$HISTORY_FILE"
-    chmod 600 "$LOG_FILE" "$HISTORY_FILE" 2>/dev/null || true
+number_in_range() {
+    local n="${1:-}" min="${2:-}" max="${3:-}"
+    [[ "$n" =~ ^[0-9]+$ ]] || return 1
+    (( n >= min && n <= max ))
 }
 
-has_cmd() { command -v "$1" >/dev/null 2>&1; }
+normalize_choice() {
+    printf '%s' "${1:-}" | sed 's/[[:space:]]//g; s/０/0/g; s/１/1/g; s/２/2/g; s/３/3/g; s/４/4/g; s/５/5/g; s/６/6/g; s/７/7/g; s/８/8/g; s/９/9/g'
+}
+
+quote_env() { printf '%q' "$1"; }
+
+mask_url() {
+    local s="${1:-}"
+    [[ -z "$s" ]] && { printf '未配置'; return 0; }
+    printf '%s' "$s" | sed -E 's#([?&][^=]*(api[_-]?key|apikey|token|key|password|passwd|secret|auth)[^=]*=)[^&]+#\1***#Ig'
+}
 
 install_packages() {
-    local need_install=0
-    for c in curl jq flock; do
-        has_cmd "$c" || need_install=1
-    done
-    # dig 不是绝对必须，但用于稳定解析 DDNS 当前 A 记录；没有 dig 时会回退 getent。
-    has_cmd dig || need_install=1
-    [[ "$need_install" -eq 0 ]] && return 0
+    local need=0
+    for c in curl jq flock; do has_cmd "$c" || need=1; done
+    has_cmd dig || need=1
+    [[ "$need" -eq 0 ]] && return 0
 
     warn "准备检查/安装依赖：curl jq flock dig。"
     if has_cmd apt-get; then
@@ -104,32 +110,15 @@ install_packages() {
         has_cmd "$c" || { err "依赖 $c 不可用，请手动安装后重试。"; exit 1; }
     done
 }
-
-# 兼容旧版本/误调用：v1.5 曾经把 install_packages 写成 install_dependencies。
 install_dependencies() { install_packages; }
-
-# -----------------------------
-# URL 脱敏与配置
-# -----------------------------
-mask_url() {
-    local s="${1:-}"
-    [[ -z "$s" ]] && { printf '未配置'; return 0; }
-    printf '%s' "$s" | sed -E 's#([?&][^=]*(api[_-]?key|apikey|token|key|password|passwd|secret|auth)[^=]*=)[^&]+#\1***#Ig'
-}
-
-quote_env() { printf '%q' "$1"; }
 
 load_config() {
     if [[ -f "$CONF_FILE" ]]; then
         # shellcheck disable=SC1090
         source "$CONF_FILE"
     fi
-
-    # v1.5 使用双 API：SHOW_IP_API_URL 用于获取当前 IP，CHANGE_IP_API_URL 用于真正更换 IP。
-    # 兼容 v1.1-v1.4 的 HINET_API_URL：如果存在，仅迁移为 CHANGE_IP_API_URL。
     SHOW_IP_API_URL="${SHOW_IP_API_URL:-}"
     CHANGE_IP_API_URL="${CHANGE_IP_API_URL:-${HINET_API_URL:-}}"
-    HINET_API_URL="${HINET_API_URL:-}"
     CHECK_TARGET="${CHECK_TARGET:-}"
     CHECK_INTERVAL="${CHECK_INTERVAL:-$DEFAULT_CHECK_INTERVAL}"
     CN_PROBES="${CN_PROBES:-$DEFAULT_CN_PROBES}"
@@ -141,6 +130,16 @@ load_config() {
     POST_CHANGE_WAIT_SECONDS="${POST_CHANGE_WAIT_SECONDS:-$DEFAULT_POST_CHANGE_WAIT_SECONDS}"
     DNS_RESOLVER="${DNS_RESOLVER:-$DEFAULT_RESOLVER}"
     MIN_API_INTERVAL="${MIN_API_INTERVAL:-$DEFAULT_MIN_API_INTERVAL}"
+
+    number_in_range "$CHECK_INTERVAL" 30 3600 || CHECK_INTERVAL="$DEFAULT_CHECK_INTERVAL"
+    number_in_range "$CN_PROBES" 1 50 || CN_PROBES="$DEFAULT_CN_PROBES"
+    number_in_range "$FAIL_THRESHOLD" 1 30 || FAIL_THRESHOLD="$DEFAULT_FAIL_THRESHOLD"
+    number_in_range "$GP_PACKETS" 1 20 || GP_PACKETS="$DEFAULT_GP_PACKETS"
+    number_in_range "$GP_RESULT_WAIT_SECONDS" 10 180 || GP_RESULT_WAIT_SECONDS="$DEFAULT_RESULT_WAIT_SECONDS"
+    number_in_range "$COOLDOWN_SECONDS" 0 86400 || COOLDOWN_SECONDS="$DEFAULT_COOLDOWN_SECONDS"
+    number_in_range "$CURL_TIMEOUT" 5 180 || CURL_TIMEOUT="$DEFAULT_CURL_TIMEOUT"
+    number_in_range "$POST_CHANGE_WAIT_SECONDS" 0 1800 || POST_CHANGE_WAIT_SECONDS="$DEFAULT_POST_CHANGE_WAIT_SECONDS"
+    number_in_range "$MIN_API_INTERVAL" 0 3600 || MIN_API_INTERVAL="$DEFAULT_MIN_API_INTERVAL"
 }
 
 save_config() {
@@ -148,9 +147,6 @@ save_config() {
     cat > "$CONF_FILE" <<EOF_CONF
 # ${APP_NAME} config
 # 由 ${APP_VERSION} 生成。敏感 URL 不要上传 GitHub。
-# SHOW_IP_API_URL：商家提供的获取当前 HiNet 公网 IP API。调用后不应触发换 IP。
-# CHANGE_IP_API_URL：商家提供的真正更换 HiNet IP API。调用后应触发换 IP，并可能返回新公网 IP 或成功文本。
-# CHECK_TARGET：用于 Globalping 中国节点检测的目标，建议填你的 HiNet DDNS 域名，也可以填公网 IPv4。
 SHOW_IP_API_URL=$(quote_env "$SHOW_IP_API_URL")
 CHANGE_IP_API_URL=$(quote_env "$CHANGE_IP_API_URL")
 CHECK_TARGET=$(quote_env "$CHECK_TARGET")
@@ -168,537 +164,6 @@ EOF_CONF
     chmod 600 "$CONF_FILE"
 }
 
-validate_number() {
-    local v="$1" min="$2" max="$3" name="$4"
-    if ! [[ "$v" =~ ^[0-9]+$ ]]; then
-        err "$name 必须是数字。"
-        exit 1
-    fi
-    if (( v < min || v > max )); then
-        err "$name 范围应为 ${min}-${max}。"
-        exit 1
-    fi
-}
-
-number_in_range() {
-    local v="$1" min="$2" max="$3"
-    [[ "$v" =~ ^[0-9]+$ ]] || return 1
-    (( v >= min && v <= max )) || return 1
-    return 0
-}
-
-normalize_choice() {
-    # 兼容：前后空格、全角数字、中文顿号/句号、08 这类输入。
-    local c="${1:-}"
-    c="${c//$'\r'/}"
-    c="${c//$'\t'/}"
-    c="$(printf '%s' "$c" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
-    c="$(printf '%s' "$c" | sed \
-        -e 's/０/0/g' -e 's/１/1/g' -e 's/２/2/g' -e 's/３/3/g' -e 's/４/4/g' \
-        -e 's/５/5/g' -e 's/６/6/g' -e 's/７/7/g' -e 's/８/8/g' -e 's/９/9/g' \
-        -e 's/[．。]//g')"
-    if [[ "$c" =~ ^0*[0-9]+$ ]]; then
-        c="$((10#$c))"
-    fi
-    printf '%s' "$c"
-}
-
-
-validate_config_or_exit() {
-    load_config
-    [[ -n "$SHOW_IP_API_URL" ]] || { err "未配置 SHOW_IP_API_URL（获取当前 IP API），请先执行快速初始化或修改配置。"; exit 1; }
-    [[ -n "$CHANGE_IP_API_URL" ]] || { err "未配置 CHANGE_IP_API_URL（更换 IP API），请先执行快速初始化或修改配置。"; exit 1; }
-    [[ -n "$CHECK_TARGET" ]] || { err "未配置 CHECK_TARGET，请先执行快速初始化。"; exit 1; }
-    validate_number "$CHECK_INTERVAL" 30 3600 "检测间隔秒"
-    validate_number "$CN_PROBES" 1 2 "中国节点数量"
-    validate_number "$FAIL_THRESHOLD" 1 20 "连续失败阈值"
-    validate_number "$GP_PACKETS" 1 10 "每节点 ping 包数量"
-    validate_number "$GP_RESULT_WAIT_SECONDS" 10 120 "Globalping 结果等待秒数"
-    validate_number "$COOLDOWN_SECONDS" 0 86400 "换 IP 冷却秒数"
-    validate_number "$CURL_TIMEOUT" 5 120 "curl 超时秒数"
-    validate_number "$POST_CHANGE_WAIT_SECONDS" 180 1800 "换 IP 后等待 DDNS 秒数"
-    validate_number "$MIN_API_INTERVAL" 0 3600 "商家 API 最小调用间隔秒数"
-}
-
-validate_config_safe() {
-    # daemon 使用：只返回 0/1，不 exit，避免配置或临时变量异常导致 systemd 反复重启。
-    load_config
-    [[ -n "${SHOW_IP_API_URL:-}" ]] || { log "❌ 配置错误：SHOW_IP_API_URL 为空。"; return 1; }
-    [[ -n "${CHANGE_IP_API_URL:-}" ]] || { log "❌ 配置错误：CHANGE_IP_API_URL 为空。"; return 1; }
-    [[ -n "${CHECK_TARGET:-}" ]] || { log "❌ 配置错误：CHECK_TARGET 为空。"; return 1; }
-    number_in_range "$CHECK_INTERVAL" 30 3600 || { log "❌ 配置错误：CHECK_INTERVAL=${CHECK_INTERVAL}，应为 30-3600。"; return 1; }
-    number_in_range "$CN_PROBES" 1 2 || { log "❌ 配置错误：CN_PROBES=${CN_PROBES}，应为 1-2。"; return 1; }
-    number_in_range "$FAIL_THRESHOLD" 1 20 || { log "❌ 配置错误：FAIL_THRESHOLD=${FAIL_THRESHOLD}，应为 1-20。"; return 1; }
-    number_in_range "$GP_PACKETS" 1 10 || { log "❌ 配置错误：GP_PACKETS=${GP_PACKETS}，应为 1-10。"; return 1; }
-    number_in_range "$GP_RESULT_WAIT_SECONDS" 10 120 || { log "❌ 配置错误：GP_RESULT_WAIT_SECONDS=${GP_RESULT_WAIT_SECONDS}，应为 10-120。"; return 1; }
-    number_in_range "$COOLDOWN_SECONDS" 0 86400 || { log "❌ 配置错误：COOLDOWN_SECONDS=${COOLDOWN_SECONDS}，应为 0-86400。"; return 1; }
-    number_in_range "$CURL_TIMEOUT" 5 120 || { log "❌ 配置错误：CURL_TIMEOUT=${CURL_TIMEOUT}，应为 5-120。"; return 1; }
-    number_in_range "$POST_CHANGE_WAIT_SECONDS" 180 1800 || { log "❌ 配置错误：POST_CHANGE_WAIT_SECONDS=${POST_CHANGE_WAIT_SECONDS}，应为 180-1800。"; return 1; }
-    number_in_range "$MIN_API_INTERVAL" 0 3600 || { log "❌ 配置错误：MIN_API_INTERVAL=${MIN_API_INTERVAL}，应为 0-3600。"; return 1; }
-    return 0
-}
-
-# -----------------------------
-# IP / 域名处理
-# -----------------------------
-valid_ipv4() {
-    local ip="$1" IFS=. a b c d
-    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
-    read -r a b c d <<< "$ip"
-    for n in "$a" "$b" "$c" "$d"; do
-        [[ "$n" =~ ^[0-9]+$ ]] || return 1
-        (( n >= 0 && n <= 255 )) || return 1
-    done
-    return 0
-}
-
-public_ipv4() {
-    local ip="$1" IFS=. a b c d
-    valid_ipv4 "$ip" || return 1
-    read -r a b c d <<< "$ip"
-    (( a == 10 )) && return 1
-    (( a == 127 )) && return 1
-    (( a == 0 )) && return 1
-    (( a == 100 && b >= 64 && b <= 127 )) && return 1
-    (( a == 169 && b == 254 )) && return 1
-    (( a == 172 && b >= 16 && b <= 31 )) && return 1
-    (( a == 192 && b == 168 )) && return 1
-    (( a == 192 && b == 0 && c == 2 )) && return 1
-    (( a == 198 && (b == 18 || b == 19) )) && return 1
-    (( a == 198 && b == 51 && c == 100 )) && return 1
-    (( a == 203 && b == 0 && c == 113 )) && return 1
-    (( a >= 224 )) && return 1
-    return 0
-}
-
-extract_public_ipv4() {
-    local body="$1" ip
-    while read -r ip; do
-        if public_ipv4 "$ip"; then
-            printf '%s\n' "$ip"
-            return 0
-        fi
-    done < <(printf '%s' "$body" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | awk '!seen[$0]++')
-    return 1
-}
-
-resolve_target_ip() {
-    load_config
-    local target="$CHECK_TARGET" ip
-    if public_ipv4 "$target"; then
-        printf '%s\n' "$target"
-        return 0
-    fi
-
-    if has_cmd dig; then
-        while read -r ip; do
-            if public_ipv4 "$ip"; then
-                printf '%s\n' "$ip"
-                return 0
-            fi
-        done < <(dig +time=3 +tries=1 +short A "$target" @"$DNS_RESOLVER" 2>/dev/null | awk '!seen[$0]++')
-    fi
-
-    if has_cmd getent; then
-        while read -r ip _rest; do
-            if public_ipv4 "$ip"; then
-                printf '%s\n' "$ip"
-                return 0
-            fi
-        done < <(getent ahostsv4 "$target" 2>/dev/null | awk '!seen[$1]++')
-    fi
-    return 1
-}
-
-show_current_ip() {
-    validate_config_or_exit
-    local api_ip="" ddns_ip="" api_body="" api_summary=""
-
-    cecho "🌐 当前 HiNet IP / DDNS 状态"
-    cecho "----------------------------------------"
-
-    if api_body="$(http_get_silent "$SHOW_IP_API_URL" 2>/dev/null)"; then
-        api_summary="$(api_response_summary "$api_body")"
-        api_ip="$(extract_public_ipv4 "$api_body" 2>/dev/null || true)"
-        cecho "🔎 获取 IP API：$(mask_url "$SHOW_IP_API_URL")"
-        cecho "🧾 API 返回摘要：${api_summary}"
-        if [[ -n "$api_ip" ]]; then
-            ok "API 当前公网 IP：${api_ip}"
-        else
-            warn "获取 IP API 返回内容里没有可识别的公网 IPv4。"
-        fi
-    else
-        warn "获取 IP API 请求失败：$(mask_url "$SHOW_IP_API_URL")"
-    fi
-
-    if ddns_ip="$(resolve_target_ip 2>/dev/null)"; then
-        ok "检测目标：${CHECK_TARGET}"
-        ok "DDNS 当前解析公网 IP：${ddns_ip}"
-    else
-        warn "无法解析 CHECK_TARGET 的公网 IPv4。请检查 DDNS 域名、DNS 解析或 DNS_RESOLVER。"
-    fi
-
-    if [[ -n "$api_ip" && -n "$ddns_ip" && "$api_ip" != "$ddns_ip" ]]; then
-        warn "获取 IP API 与 DDNS 解析不一致：API=${api_ip}，DDNS=${ddns_ip}。可能是 DDNS 尚未同步或检测目标不是同一台 HiNet。"
-    fi
-}
-
-query_current_ip_prefer_show() {
-    load_config
-    local body="" ip=""
-    if [[ -n "${SHOW_IP_API_URL:-}" ]]; then
-        if body="$(http_get_silent "$SHOW_IP_API_URL" 2>/dev/null)"; then
-            ip="$(extract_public_ipv4 "$body" 2>/dev/null || true)"
-            if [[ -n "$ip" ]]; then
-                printf '%s\n' "$ip"
-                return 0
-            fi
-        fi
-    fi
-    resolve_target_ip
-}
-
-http_get_silent() {
-    local url="$1"
-    curl -fsSL --connect-timeout 10 --max-time "$CURL_TIMEOUT" \
-        -A "${APP_NAME}/${APP_VERSION}" \
-        "$url"
-}
-
-append_history() {
-    local old_ip="$1" new_ip="$2" reason="$3" note="${4:-}"
-    mkdirs
-    printf '%s|old=%s|new=%s|target=%s|reason=%s|note=%s\n' \
-        "$(now_human)" "${old_ip:-unknown}" "${new_ip:-unknown}" "${CHECK_TARGET:-unknown}" "${reason:-manual}" "${note:-}" >> "$HISTORY_FILE"
-}
-
-
-api_response_summary() {
-    local body="${1:-}"
-    body="$(printf '%s' "$body" | tr '\r\n\t' '   ' | sed -E 's/[[:space:]]+/ /g; s/^[[:space:]]+//; s/[[:space:]]+$//')"
-    [[ -z "$body" ]] && { printf 'empty_response'; return 0; }
-    printf '%s' "$body" | cut -c 1-240
-}
-
-api_url_has_showip_action() {
-    local url="${1:-}"
-    printf '%s' "$url" | grep -qiE '([?&]action=showip)(&|$)'
-}
-
-warn_if_showip_action() {
-    local url="${1:-}"
-    if api_url_has_showip_action "$url"; then
-        warn "检测到商家 API URL 里包含 action=showip。它可能只是查询 IP，不一定会更换 IP；脚本不会阻止保存，但建议先用【手动测试商家 API】确认。"
-    fi
-}
-
-enforce_api_min_interval() {
-    load_config
-    load_status
-    local now delta remain
-    now="$(now_epoch)"
-    delta=$(( now - ${LAST_API_CALL_EPOCH:-0} ))
-    if (( MIN_API_INTERVAL > 0 && LAST_API_CALL_EPOCH > 0 && delta < MIN_API_INTERVAL )); then
-        remain=$(( MIN_API_INTERVAL - delta ))
-        warn "商家 API 最小调用间隔限制中，剩余 ${remain} 秒。为避免触发商家风控，本次不调用。"
-        log "⚠️ 商家 API 调用间隔限制：remain=${remain}s"
-        return 1
-    fi
-    return 0
-}
-
-mark_api_called() {
-    load_status
-    LAST_API_CALL_EPOCH="$(now_epoch)"
-    save_status
-}
-
-judgement_wait_seconds() {
-    local v="${POST_CHANGE_WAIT_SECONDS:-$DEFAULT_POST_CHANGE_WAIT_SECONDS}"
-    if ! [[ "$v" =~ ^[0-9]+$ ]]; then
-        v="$DEFAULT_POST_CHANGE_WAIT_SECONDS"
-    fi
-    (( v < 180 )) && v=180
-    printf '%s\n' "$v"
-}
-
-change_ip_inner() {
-    validate_config_or_exit
-    enforce_api_min_interval || return 1
-
-    local reason="${1:-manual}" old_ip="" api_body="" api_summary="" api_ip="" new_ip="" note="" wait_s=""
-
-    old_ip="$(query_current_ip_prefer_show 2>/dev/null || true)"
-    local old_ddns_ip="" new_ddns_ip=""
-    old_ddns_ip="$(resolve_target_ip 2>/dev/null || true)"
-    log "🔁 准备调用更换 IP API，reason=${reason}，old_ip=${old_ip:-unknown}，old_ddns=${old_ddns_ip:-unknown}，target=${CHECK_TARGET}"
-    cecho "🔁 准备调用【更换 IP API】。"
-    cecho "📌 原当前 IP：${old_ip:-unknown}"
-    cecho "📌 原 DDNS 解析 IP：${old_ddns_ip:-unknown}"
-
-    mark_api_called
-    api_body="$(http_get_silent "$CHANGE_IP_API_URL")" || {
-        log "❌ 更换 IP API 请求失败，reason=${reason}"
-        append_history "$old_ip" "unknown" "$reason" "change_api_request_failed"
-        err "更换 IP API 请求失败。请检查 URL、网络、商家面板限制或 API Key。"
-        return 1
-    }
-
-    api_summary="$(api_response_summary "$api_body")"
-    api_ip="$(extract_public_ipv4 "$api_body" 2>/dev/null || true)"
-    cecho "🧾 API 返回摘要：${api_summary}"
-    log "🧾 更换 IP API 返回摘要：${api_summary}"
-
-    if [[ -n "$api_ip" ]]; then
-        note="api_returned_public_ip"
-        log "ℹ️ 更换 IP API 返回公网 IP：${api_ip}"
-    else
-        note="api_no_public_ip"
-        log "⚠️ 更换 IP API 未直接返回公网 IPv4，将等待后通过获取 IP API / DDNS 复核。"
-    fi
-
-    wait_s="$(judgement_wait_seconds)"
-    log "⏳ 等待 DDNS/线路更新 ${wait_s} 秒后确认解析结果。"
-    cecho "⏳ 等待 ${wait_s} 秒后确认 DDNS 解析变化。"
-    sleep "$wait_s"
-
-    new_ip="$(query_current_ip_prefer_show 2>/dev/null || true)"
-    new_ddns_ip="$(resolve_target_ip 2>/dev/null || true)"
-    cecho "📌 新当前 IP：${new_ip:-unknown}"
-    cecho "📌 新 DDNS 解析 IP：${new_ddns_ip:-unknown}"
-
-    if [[ -z "$new_ip" ]]; then
-        new_ip="${api_ip:-unknown}"
-        note="${note}_current_ip_query_failed_after_change"
-        warn "换 IP 后无法通过获取 IP API/DDNS 获得公网 IPv4。"
-    elif [[ -n "$api_ip" && "$new_ip" != "$api_ip" ]]; then
-        note="${note}_current_ip_not_match_api_return"
-        warn "更换 API 返回 IP=${api_ip}，但当前查询 IP=${new_ip}，可能是返回旧 IP、DDNS 尚未同步或商家 API 返回格式特殊。"
-        log "⚠️ 更换 API 返回 IP=${api_ip}，当前查询 IP=${new_ip}。"
-    fi
-
-    if [[ -n "$old_ip" && -n "$new_ip" && "$new_ip" == "$old_ip" ]]; then
-        note="${note}_ip_unchanged_possible_wrong_change_api_or_delay"
-        warn "更换 API 调用完成，但当前 IP 未变化：${old_ip}。可能填成了获取 IP API、商家未实际换 IP，或等待时间不够。"
-        log "⚠️ 更换 API 调用完成但当前 IP 未变化：${old_ip}。"
-    fi
-
-    if [[ -n "$new_ip" && -n "$new_ddns_ip" && "$new_ip" != "$new_ddns_ip" ]]; then
-        note="${note}_ddns_not_match_current_ip"
-        warn "当前 IP=${new_ip}，但 DDNS=${new_ddns_ip}，可能是 DDNS 更新延迟。"
-    fi
-
-    append_history "$old_ip" "$new_ip" "$reason" "$note"
-    log "✅ 换 IP 流程完成：${old_ip:-unknown} -> ${new_ip}，reason=${reason}，note=${note}"
-    ok "换 IP 流程完成：${old_ip:-unknown} -> ${new_ip}"
-    return 0
-}
-change_ip() {
-    # 防止后台自动触发、菜单手动触发、命令行手动触发同时调用商家 API。
-    mkdir -p /run
-    exec 8>"$CHANGE_LOCK_FILE"
-    if ! flock -n 8; then
-        warn "已有换 IP 流程正在执行，本次跳过，避免重复调用商家 API。"
-        log "⚠️ 换 IP 流程已被锁定，跳过 reason=${1:-manual}"
-        return 1
-    fi
-    change_ip_inner "${1:-manual}"
-}
-
-
-test_show_ip_api() {
-    require_root
-    validate_config_or_exit
-    cecho "🧪 手动测试【获取当前 IP API】"
-    cecho "----------------------------------------"
-    local body summary ip ddns_ip
-    body="$(http_get_silent "$SHOW_IP_API_URL")" || { err "获取 IP API 请求失败。"; return 1; }
-    summary="$(api_response_summary "$body")"
-    ip="$(extract_public_ipv4 "$body" 2>/dev/null || true)"
-    ddns_ip="$(resolve_target_ip 2>/dev/null || true)"
-    cecho "🧾 API 返回摘要：${summary}"
-    [[ -n "$ip" ]] && ok "API 当前公网 IP：${ip}" || warn "API 返回内容里没有可识别的公网 IPv4。"
-    [[ -n "$ddns_ip" ]] && ok "DDNS 当前解析公网 IP：${ddns_ip}" || warn "DDNS 解析失败。"
-    if [[ -n "$ip" && -n "$ddns_ip" && "$ip" != "$ddns_ip" ]]; then
-        warn "获取 IP API 与 DDNS 不一致：API=${ip}，DDNS=${ddns_ip}。"
-    fi
-    log "🧪 获取 IP API 测试完成：api_ip=${ip:-none}, ddns=${ddns_ip:-none}, summary=${summary}"
-}
-
-test_vendor_api() {
-    require_root
-    validate_config_or_exit
-
-    mkdir -p /run
-    exec 8>"$CHANGE_LOCK_FILE"
-    if ! flock -n 8; then
-        warn "已有换 IP 流程正在执行，本次测试跳过，避免重复调用更换 IP API。"
-        return 1
-    fi
-
-    enforce_api_min_interval || return 1
-
-    cecho "🧪 手动测试【更换 IP API】"
-    cecho "----------------------------------------"
-    warn "这个测试会真实调用更换 IP API，可能会触发 HiNet 换 IP；但不会写入正式 IP 更换记录。"
-    warn_if_showip_action "$CHANGE_IP_API_URL"
-    local ans old_ip old_ddns api_body api_summary api_ip new_ip new_ddns wait_s
-    read -r -p "确认调用？输入 1 继续，其它取消：" ans
-    [[ "$ans" == "1" ]] || { info "已取消测试。"; return 0; }
-
-    old_ip="$(query_current_ip_prefer_show 2>/dev/null || true)"
-    old_ddns="$(resolve_target_ip 2>/dev/null || true)"
-    cecho "📌 原当前 IP：${old_ip:-unknown}"
-    cecho "📌 原 DDNS 解析 IP：${old_ddns:-unknown}"
-
-    mark_api_called
-    api_body="$(http_get_silent "$CHANGE_IP_API_URL")" || {
-        err "更换 IP API 请求失败。"
-        log "❌ 手动测试更换 IP API 请求失败。"
-        return 1
-    }
-
-    api_summary="$(api_response_summary "$api_body")"
-    api_ip="$(extract_public_ipv4 "$api_body" 2>/dev/null || true)"
-    cecho "🧾 API 返回摘要：${api_summary}"
-    [[ -n "$api_ip" ]] && cecho "🌐 更换 API 返回公网 IP：${api_ip}" || warn "更换 API 返回内容里没有可识别的公网 IPv4。"
-
-    wait_s="$(judgement_wait_seconds)"
-    cecho "⏳ 等待 ${wait_s} 秒后重新查询当前 IP / DDNS。"
-    sleep "$wait_s"
-
-    new_ip="$(query_current_ip_prefer_show 2>/dev/null || true)"
-    new_ddns="$(resolve_target_ip 2>/dev/null || true)"
-    cecho "📌 新当前 IP：${new_ip:-unknown}"
-    cecho "📌 新 DDNS 解析 IP：${new_ddns:-unknown}"
-
-    if [[ -n "$old_ip" && -n "$new_ip" && "$old_ip" == "$new_ip" ]]; then
-        warn "更换 API 调用成功返回，但当前 IP 未变化。可能是把获取 IP API 填到了更换 API，或商家/DDNS 尚未更新。"
-    elif [[ -n "$old_ip" && -n "$new_ip" ]]; then
-        ok "当前 IP 已变化：${old_ip} -> ${new_ip}"
-    else
-        warn "无法完成前后 IP 对比，请检查获取 IP API 和 DDNS。"
-    fi
-
-    log "🧪 更换 IP API 测试完成：old=${old_ip:-unknown}, new=${new_ip:-unknown}, api_ip=${api_ip:-none}, summary=${api_summary}"
-    ok "手动测试完成；本次未写入正式 IP 更换记录。"
-}
-
-# -----------------------------
-# Globalping CN ping 检测
-# 返回：0=有中国探针 ping 成功；1=中国探针全部失败；2=API/探针不可用，不能作为失败计数
-# -----------------------------
-globalping_measurement_create() {
-    local target="$1" payload response id
-    payload="$(jq -nc \
-        --arg target "$target" \
-        --argjson limit "$CN_PROBES" \
-        --argjson packets "$GP_PACKETS" \
-        '{target:$target,type:"ping",locations:[{country:"CN",limit:$limit}],measurementOptions:{packets:$packets}}')"
-
-    response="$(curl -fsSL --connect-timeout 10 --max-time 30 \
-        -A "${APP_NAME}/${APP_VERSION}" \
-        -H 'Content-Type: application/json' \
-        -X POST "${GLOBALPING_API_BASE}/measurements" \
-        --data "$payload")" || return 1
-
-    id="$(printf '%s' "$response" | jq -r '.id // empty' 2>/dev/null)"
-    [[ -n "$id" ]] || return 1
-    printf '%s\n' "$id"
-}
-
-globalping_measurement_get() {
-    local id="$1"
-    curl -fsSL --connect-timeout 10 --max-time 30 \
-        -A "${APP_NAME}/${APP_VERSION}" \
-        "${GLOBALPING_API_BASE}/measurements/${id}"
-}
-
-parse_globalping_result() {
-    jq -r '
-      def n: tonumber? // 0;
-      def raw: (.result.rawOutput? // .result.output? // .result.raw? // "");
-      def ok_by_stats:
-        (((.result.stats.rcv? // .result.stats.received? // .result.stats.packetsReceived? // 0) | n) > 0);
-      def ok_by_raw:
-        (raw | test("(^|[^0-9])([1-9][0-9]*)[[:space:]]+(packets[[:space:]]+)?received|(^|[^0-9])0%[[:space:]]+packet[[:space:]]+loss"; "i"));
-      [
-        (.status // "unknown"),
-        ((.results // []) | length),
-        ([.results[]? | select(ok_by_stats or ok_by_raw)] | length)
-      ] | @tsv
-    ' 2>/dev/null || printf 'parse_error\t0\t0\n'
-}
-
-globalping_check_target() {
-    # 注意：这里不调用 validate_config_or_exit。daemon 会在外层使用 validate_config_safe，
-    # 避免一次配置或临时异常直接 exit 造成 systemd “Succeeded/反复重启”。
-    load_config
-    local target="$1" id start deadline json parsed status total okn
-    id="$(globalping_measurement_create "$target" 2>/dev/null || true)"
-    if [[ -z "$id" ]]; then
-        log "⚠️ Globalping 创建 measurement 失败，不计入连续失败。"
-        return 2
-    fi
-
-    start="$(now_epoch)"
-    deadline=$(( start + GP_RESULT_WAIT_SECONDS ))
-
-    while true; do
-        json="$(globalping_measurement_get "$id" 2>/dev/null || true)"
-        if [[ -n "$json" ]]; then
-            parsed="$(printf '%s' "$json" | parse_globalping_result)"
-            status="$(printf '%s' "$parsed" | awk -F'\t' '{print $1}')"
-            total="$(printf '%s' "$parsed" | awk -F'\t' '{print $2}')"
-            okn="$(printf '%s' "$parsed" | awk -F'\t' '{print $3}')"
-
-            if [[ "$status" != "in-progress" && "$status" != "unknown" && "$status" != "parse_error" ]]; then
-                if [[ "$total" =~ ^[0-9]+$ && "$okn" =~ ^[0-9]+$ ]]; then
-                    if (( total < 1 )); then
-                        log "⚠️ Globalping 未返回中国探针结果，measurement=${id}，不计入连续失败。"
-                        return 2
-                    fi
-                    if (( okn > 0 )); then
-                        log "✅ Globalping CN ping 正常：target=${target}，ok=${okn}/${total}，measurement=${id}"
-                        return 0
-                    fi
-                    log "❌ Globalping CN ping 全部失败：target=${target}，ok=0/${total}，measurement=${id}"
-                    return 1
-                fi
-            fi
-        fi
-
-        if (( $(now_epoch) >= deadline )); then
-            log "⚠️ Globalping 等待结果超时，measurement=${id}，不计入连续失败。"
-            return 2
-        fi
-        sleep 3
-    done
-}
-
-run_single_check() {
-    validate_config_or_exit
-    local resolved_ip="" rc
-    resolved_ip="$(resolve_target_ip 2>/dev/null || true)"
-    info "开始检测目标：${CHECK_TARGET}"
-    [[ -n "$resolved_ip" ]] && info "当前解析 IP：${resolved_ip}"
-    info "Globalping 中国节点：${CN_PROBES} 个。"
-    if globalping_check_target "$CHECK_TARGET"; then
-        ok "检测结果：CN ping 正常。"
-    else
-        rc=$?
-        if [[ "$rc" -eq 1 ]]; then
-            warn "检测结果：CN ping 全部失败。"
-        else
-            warn "检测结果：Globalping API/探针不可用，本次不应计为被墙失败。"
-        fi
-        return "$rc"
-    fi
-}
-
-# -----------------------------
-# 状态持久化
-# -----------------------------
 load_status() {
     FAILURE_COUNT=0
     LAST_CHANGE_EPOCH=0
@@ -707,7 +172,8 @@ load_status() {
     LAST_TARGET=""
     LAST_RESOLVED_IP=""
     LAST_RESULT="unknown"
-    [[ -f "$STATUS_FILE" ]] && source "$STATUS_FILE" || true
+    LAST_MEASUREMENT_ID=""
+    [[ -f "$STATUS_FILE" ]] && source "$STATUS_FILE" 2>/dev/null || true
     FAILURE_COUNT="${FAILURE_COUNT:-0}"
     LAST_CHANGE_EPOCH="${LAST_CHANGE_EPOCH:-0}"
     LAST_API_CALL_EPOCH="${LAST_API_CALL_EPOCH:-0}"
@@ -715,6 +181,7 @@ load_status() {
     LAST_TARGET="${LAST_TARGET:-}"
     LAST_RESOLVED_IP="${LAST_RESOLVED_IP:-}"
     LAST_RESULT="${LAST_RESULT:-unknown}"
+    LAST_MEASUREMENT_ID="${LAST_MEASUREMENT_ID:-}"
 }
 
 save_status() {
@@ -727,151 +194,421 @@ LAST_CHECK_EPOCH=$(quote_env "${LAST_CHECK_EPOCH:-0}")
 LAST_TARGET=$(quote_env "${LAST_TARGET:-}")
 LAST_RESOLVED_IP=$(quote_env "${LAST_RESOLVED_IP:-}")
 LAST_RESULT=$(quote_env "${LAST_RESULT:-unknown}")
+LAST_MEASUREMENT_ID=$(quote_env "${LAST_MEASUREMENT_ID:-}")
 EOF_STATUS
-    chmod 600 "$STATUS_FILE"
+    chmod 600 "$STATUS_FILE" 2>/dev/null || true
+}
+
+validate_config_safe() {
+    load_config
+    [[ -n "$SHOW_IP_API_URL" ]] || { log "❌ 配置缺失：SHOW_IP_API_URL 获取当前 IP API 未配置。"; return 1; }
+    [[ -n "$CHANGE_IP_API_URL" ]] || { log "❌ 配置缺失：CHANGE_IP_API_URL 更换 IP API 未配置。"; return 1; }
+    [[ -n "$CHECK_TARGET" ]] || { log "❌ 配置缺失：CHECK_TARGET 检测目标未配置。"; return 1; }
+    return 0
+}
+
+validate_config_or_exit() {
+    validate_config_safe || { err "配置不完整，请先执行：${APP_NAME} init"; exit 1; }
+}
+
+is_public_ipv4() {
+    local ip="$1" a b c d IFS=.
+    read -r a b c d <<< "$ip"
+    for x in "$a" "$b" "$c" "$d"; do [[ "$x" =~ ^[0-9]+$ ]] && (( x >= 0 && x <= 255 )) || return 1; done
+    (( a == 0 || a == 10 || a == 127 || a >= 224 )) && return 1
+    (( a == 100 && b >= 64 && b <= 127 )) && return 1
+    (( a == 169 && b == 254 )) && return 1
+    (( a == 172 && b >= 16 && b <= 31 )) && return 1
+    (( a == 192 && b == 168 )) && return 1
+    (( a == 198 && (b == 18 || b == 19) )) && return 1
+    return 0
+}
+
+extract_public_ipv4() {
+    local text="${1:-}" ip
+    while read -r ip; do
+        is_public_ipv4 "$ip" && { printf '%s' "$ip"; return 0; }
+    done < <(printf '%s' "$text" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | awk '!seen[$0]++')
+    return 1
+}
+
+shorten() {
+    local s="${1:-}"
+    s="$(printf '%s' "$s" | tr '\n\r\t' '   ' | sed 's/[[:space:]][[:space:]]*/ /g' | cut -c1-360)"
+    printf '%s' "$s"
+}
+
+curl_get() {
+    local url="$1" timeout="${2:-$CURL_TIMEOUT}"
+    curl -sS -L --connect-timeout 10 --max-time "$timeout" "$url" 2>&1
+}
+
+resolve_target_ip() {
+    local target="${1:-$CHECK_TARGET}" resolver="${DNS_RESOLVER:-$DEFAULT_RESOLVER}" ip=""
+    if [[ "$target" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && is_public_ipv4 "$target"; then
+        printf '%s' "$target"; return 0
+    fi
+    if has_cmd dig; then
+        ip="$(dig +short A "$target" "@${resolver}" 2>/dev/null | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | while read -r x; do is_public_ipv4 "$x" && { echo "$x"; break; }; done)"
+    fi
+    if [[ -z "$ip" ]] && has_cmd getent; then
+        ip="$(getent ahostsv4 "$target" 2>/dev/null | awk '{print $1}' | while read -r x; do is_public_ipv4 "$x" && { echo "$x"; break; }; done)"
+    fi
+    [[ -n "$ip" ]] && { printf '%s' "$ip"; return 0; }
+    return 1
+}
+
+get_current_ip_from_api() {
+    load_config
+    local body ip
+    body="$(curl_get "$SHOW_IP_API_URL" "$CURL_TIMEOUT")"
+    ip="$(extract_public_ipv4 "$body" 2>/dev/null || true)"
+    if [[ -n "$ip" ]]; then
+        printf '%s' "$ip"
+        return 0
+    fi
+    log "❌ 获取当前 IP API 未返回公网 IPv4。返回摘要：$(shorten "$body")"
+    return 1
+}
+
+show_current_ip() {
+    require_root
+    load_config
+    validate_config_or_exit
+    local api_ip="" ddns_ip=""
+    cecho "🌐 当前 HiNet IP / DDNS 解析"
+    cecho "----------------------------------------"
+    api_ip="$(get_current_ip_from_api 2>/dev/null || true)"
+    ddns_ip="$(resolve_target_ip 2>/dev/null || true)"
+    cecho "获取 IP API：$(mask_url "$SHOW_IP_API_URL")"
+    cecho "API 当前 IP：${api_ip:-获取失败}"
+    cecho "检测目标：${CHECK_TARGET}"
+    cecho "DDNS 解析 IP：${ddns_ip:-解析失败}"
+}
+
+warn_if_showip_action() {
+    local url="${1:-}"
+    if printf '%s' "$url" | grep -qiE '([?&])action=showip(&|$)'; then
+        warn "你填的【更换 IP API】里包含 action=showip，这通常更像查询 IP。确认它是真正更换 IP 的 API 后再保存。"
+    fi
 }
 
 # -----------------------------
-# 后台守护
+# Globalping 检测
+# 返回码：0=至少一个 CN probe ping 正常；1=所有返回的 CN probe 均失败；2=API/探针异常，不计失败。
 # -----------------------------
-daemon_loop() {
-    require_root
-    mkdirs
+globalping_create_measurement() {
+    local target="$1" payload body id
+    payload="$(jq -nc \
+        --arg target "$target" \
+        --arg country "CN" \
+        --argjson limit "${CN_PROBES:-2}" \
+        --argjson packets "${GP_PACKETS:-3}" \
+        '{type:"ping",target:$target,locations:[{country:$country,limit:$limit}],measurementOptions:{packets:$packets}}' 2>/dev/null)"
+    [[ -n "$payload" ]] || { log "⚠️ 生成 Globalping 请求 JSON 失败。"; return 1; }
+    body="$(curl -sS -L --connect-timeout 10 --max-time "$CURL_TIMEOUT" -H 'Content-Type: application/json' -d "$payload" "${GLOBALPING_API_BASE}/measurements" 2>&1)"
+    id="$(printf '%s' "$body" | jq -r '.id // .measurementId // empty' 2>/dev/null)"
+    if [[ -z "$id" || "$id" == "null" ]]; then
+        log "⚠️ Globalping 创建 measurement 失败，不计入连续失败。返回摘要：$(shorten "$body")"
+        return 1
+    fi
+    printf '%s' "$id"
+}
 
-    # v2.1 关键修复：daemon 是长期运行进程，不能被 set -e 的业务返回码带走。
-    # 任何单轮检测失败都只能写日志、更新状态，然后进入下一轮。
-    set +e
-    trap 'log "❌ daemon 捕获异常：line=${LINENO}, cmd=${BASH_COMMAND}, rc=$?。守护进程继续运行。"' ERR
+globalping_parse_result() {
+    jq -r '
+      def norm: tostring | ascii_downcase;
+      def num(x): (x | tonumber? // 0);
+      def raw: (.result.rawOutput? // .rawOutput? // "");
+      def rx: num(.result.stats.packetsReceived? // .result.stats.received? // .result.stats.receivedPackets? // .result.stats.packets_received? // 0);
+      def loss: (.result.stats.packetLoss? // .result.stats.loss? // .result.stats.packet_loss? // 100 | tonumber? // 100);
+      def probe_ok: ((rx > 0) or ((raw | test("(?i)(bytes from|ttl=|time=[0-9]+[.]?[0-9]*[[:space:]]*ms)"))) or (loss < 100));
+      [.results[]?] as $r |
+      ($r | length) as $total |
+      ($r | map(select(probe_ok)) | length) as $ok |
+      (.status // "unknown") as $status |
+      [$status, $total, $ok] | @tsv
+    ' 2>/dev/null
+}
 
-    log "🧭 daemon entry：开始启动后台守护进程。pid=$$，version=${APP_VERSION}"
-
-    for c in curl jq flock; do
-        if ! has_cmd "$c"; then
-            log "❌ daemon 缺少依赖：$c。请执行 ${INSTALL_PATH} doctor 或重新 init。60 秒后继续自检。"
-            while ! has_cmd "$c"; do sleep 60; done
-        fi
-    done
-
-    exec 9>"$LOCK_FILE"
-    log "🔒 daemon 正在获取单实例锁：${LOCK_FILE}"
-    while ! flock -n 9; do
-        # 旧版本如果异常残留一个仍在运行的 daemon，systemd 会因为拿不到锁而反复 Succeeded/Restart。
-        # v2.1 改为不退出，等待锁释放，并持续写中文日志，避免静默重启。
-        log "⚠️ daemon 单实例锁被占用，可能已有旧 daemon 正在运行；60 秒后重试。可用 ps -ef | grep hinet-gfw-changeip 排查。"
-        sleep 60
-    done
-    log "✅ daemon 已获得单实例锁。"
-
-    load_status
-    local boot_loop=0
+globalping_check_target() {
+    load_config
+    local target="${1:-$CHECK_TARGET}" id deadline body parsed status total okn
+    log "🧪 Globalping 请求开始：target=${target}，country=CN，probes=${CN_PROBES}，packets=${GP_PACKETS}"
+    id="$(globalping_create_measurement "$target")"
+    if [[ -z "$id" ]]; then
+        return 2
+    fi
+    LAST_MEASUREMENT_ID="$id"
+    deadline=$(( $(now_epoch) + GP_RESULT_WAIT_SECONDS ))
 
     while true; do
-        boot_loop=$(( boot_loop + 1 ))
-        load_config
+        body="$(curl -sS -L --connect-timeout 10 --max-time "$CURL_TIMEOUT" "${GLOBALPING_API_BASE}/measurements/${id}" 2>&1)"
+        parsed="$(printf '%s' "$body" | globalping_parse_result)"
+        status="$(printf '%s' "$parsed" | awk -F'\t' '{print $1}')"
+        total="$(printf '%s' "$parsed" | awk -F'\t' '{print $2}')"
+        okn="$(printf '%s' "$parsed" | awk -F'\t' '{print $3}')"
 
-        if ! validate_config_safe; then
-            LAST_RESULT="config_invalid"
-            LAST_CHECK_EPOCH="$(now_epoch)"
-            save_status
-            log "💤 配置不可用，本轮不检测，60 秒后重试。"
-            sleep 60
-            continue
-        fi
-
-        load_status
-
-        local rc=2 now last_delta resolved_ip="" interval="${CHECK_INTERVAL:-60}"
-        number_in_range "$interval" 30 3600 || interval=60
-
-        now="$(now_epoch)"
-        LAST_CHECK_EPOCH="$now"
-        LAST_TARGET="$CHECK_TARGET"
-        resolved_ip="$(resolve_target_ip 2>/dev/null || true)"
-        LAST_RESOLVED_IP="$resolved_ip"
-        save_status
-
-        log "🛰️ 后台检测开始：round=${boot_loop}，target=${CHECK_TARGET}，resolved_ip=${resolved_ip:-unknown}，failure=${FAILURE_COUNT:-0}/${FAIL_THRESHOLD}，interval=${interval}s"
-
-        globalping_check_target "$CHECK_TARGET"
-        rc=$?
-
-        if [[ "$rc" -eq 0 ]]; then
-            FAILURE_COUNT=0
-            LAST_RESULT="ok"
-            save_status
-            log "✅ 后台判定：CN ping 正常，失败计数已清零。"
-        elif [[ "$rc" -eq 1 ]]; then
-            FAILURE_COUNT=$(( ${FAILURE_COUNT:-0} + 1 ))
-            LAST_RESULT="cn_ping_failed"
-            save_status
-            log "⚠️ 后台判定：CN ping 全部失败，连续失败计数：${FAILURE_COUNT}/${FAIL_THRESHOLD}，target=${CHECK_TARGET}，resolved_ip=${resolved_ip:-unknown}"
-
-            if (( FAILURE_COUNT >= FAIL_THRESHOLD )); then
-                now="$(now_epoch)"
-                last_delta=$(( now - ${LAST_CHANGE_EPOCH:-0} ))
-                if (( COOLDOWN_SECONDS > 0 && last_delta < COOLDOWN_SECONDS )); then
-                    log "⏳ 已达到失败阈值，但仍在冷却期：剩余 $(( COOLDOWN_SECONDS - last_delta )) 秒，本次不换 IP。"
-                else
-                    log "🚨 已达到失败阈值，准备自动调用更换 IP API。"
-                    if change_ip "globalping_cn_ping_failed_${FAILURE_COUNT}_times"; then
-                        LAST_CHANGE_EPOCH="$(now_epoch)"
-                        FAILURE_COUNT=0
-                        LAST_RESULT="changed_ip"
-                        LAST_RESOLVED_IP="$(resolve_target_ip 2>/dev/null || true)"
-                        save_status
-                        log "✅ 自动换 IP 已完成，失败计数已清零。"
-                    else
-                        LAST_RESULT="change_ip_failed"
-                        save_status
-                        log "❌ 自动换 IP 调用失败，保留失败计数，下一轮继续检测。"
-                    fi
+        if [[ "$total" =~ ^[0-9]+$ && "$okn" =~ ^[0-9]+$ && "$total" -gt 0 ]]; then
+            if [[ "$status" != "in-progress" && "$status" != "unknown" && "$status" != "" ]]; then
+                if (( okn > 0 )); then
+                    log "✅ Globalping CN ping 正常：target=${target}，ok=${okn}/${total}，measurement=${id}"
+                    return 0
                 fi
+                log "❌ Globalping CN ping 全部失败：target=${target}，ok=0/${total}，measurement=${id}"
+                return 1
             fi
-        else
-            LAST_RESULT="globalping_unknown"
-            save_status
-            log "⚠️ 后台判定：Globalping API/探针不可用，本轮不计入连续失败。target=${CHECK_TARGET}，resolved_ip=${resolved_ip:-unknown}"
         fi
 
-        log "💤 后台检测结束，${interval} 秒后进行下一轮。last_result=${LAST_RESULT}，failure_count=${FAILURE_COUNT:-0}/${FAIL_THRESHOLD}"
-        sleep "$interval"
+        if (( $(now_epoch) >= deadline )); then
+            if [[ "$total" =~ ^[0-9]+$ && "$total" -gt 0 ]]; then
+                if (( okn > 0 )); then
+                    log "✅ Globalping CN ping 正常：target=${target}，ok=${okn}/${total}，measurement=${id}"
+                    return 0
+                fi
+                log "❌ Globalping CN ping 全部失败：target=${target}，ok=0/${total}，measurement=${id}"
+                return 1
+            fi
+            log "⚠️ Globalping 等待结果超时或无中国探针结果，measurement=${id}，不计入连续失败。最后状态=${status:-unknown}"
+            return 2
+        fi
+        sleep 3
     done
 }
 
+run_single_check() {
+    require_root
+    validate_config_or_exit
+    local resolved_ip rc
+    resolved_ip="$(resolve_target_ip 2>/dev/null || true)"
+    info "开始检测目标：${CHECK_TARGET}"
+    [[ -n "$resolved_ip" ]] && info "当前解析 IP：${resolved_ip}"
+    info "Globalping 中国节点：${CN_PROBES} 个。"
+    globalping_check_target "$CHECK_TARGET"
+    rc=$?
+    if [[ "$rc" -eq 0 ]]; then
+        ok "检测结果：CN ping 正常。"
+    elif [[ "$rc" -eq 1 ]]; then
+        warn "检测结果：CN ping 全部失败。"
+    else
+        warn "检测结果：Globalping API/探针不可用，本次不应计为被墙失败。"
+    fi
+    return "$rc"
+}
+
 # -----------------------------
-# systemd / 安装卸载
+# 更换 IP
 # -----------------------------
-write_service() {
+append_history() {
+    local old_ip="$1" new_ip="$2" old_ddns="$3" new_ddns="$4" reason="$5" note="$6"
+    mkdirs
+    printf '%s\told_ip=%s\tnew_ip=%s\told_ddns=%s\tnew_ddns=%s\treason=%s\tnote=%s\n' \
+        "$(now_human)" "$old_ip" "$new_ip" "$old_ddns" "$new_ddns" "$reason" "$note" >> "$HISTORY_FILE"
+}
+
+change_ip() {
+    local reason="${1:-manual}" official="${2:-1}"
+    require_root
+    load_config
+    validate_config_or_exit
+    load_status
+    mkdirs
+
+    exec 8>"$CHANGE_LOCK_FILE"
+    if ! flock -n 8; then
+        log "⚠️ 更换 IP 锁被占用，已有换 IP 流程正在执行，本次跳过。reason=${reason}"
+        return 1
+    fi
+
+    local now last_delta old_ip old_ddns body returned_ip new_ip new_ddns note
+    now="$(now_epoch)"
+    last_delta=$(( now - ${LAST_API_CALL_EPOCH:-0} ))
+    if (( MIN_API_INTERVAL > 0 && LAST_API_CALL_EPOCH > 0 && last_delta < MIN_API_INTERVAL )); then
+        log "⏳ 距离上次调用更换 IP API 仅 ${last_delta}s，小于最小间隔 ${MIN_API_INTERVAL}s，本次不调用。"
+        return 1
+    fi
+
+    old_ip="$(get_current_ip_from_api 2>/dev/null || true)"
+    old_ddns="$(resolve_target_ip 2>/dev/null || true)"
+    log "🔁 准备调用更换 IP API，reason=${reason}，old_ip=${old_ip:-unknown}，old_ddns=${old_ddns:-unknown}，target=${CHECK_TARGET}"
+
+    body="$(curl_get "$CHANGE_IP_API_URL" "$CURL_TIMEOUT")"
+    LAST_API_CALL_EPOCH="$(now_epoch)"
+    save_status
+    log "🧾 更换 IP API 返回摘要：$(shorten "$body")"
+
+    returned_ip="$(extract_public_ipv4 "$body" 2>/dev/null || true)"
+    [[ -n "$returned_ip" ]] && log "ℹ️ 更换 IP API 返回公网 IP：${returned_ip}"
+
+    if (( POST_CHANGE_WAIT_SECONDS > 0 )); then
+        log "⏳ 等待 ${POST_CHANGE_WAIT_SECONDS} 秒后确认获取 API / DDNS 结果。"
+        sleep "$POST_CHANGE_WAIT_SECONDS"
+    fi
+
+    new_ip="$(get_current_ip_from_api 2>/dev/null || true)"
+    new_ddns="$(resolve_target_ip 2>/dev/null || true)"
+
+    note="api_called"
+    if [[ -n "$returned_ip" ]]; then
+        note="api_returned_public_ip"
+    fi
+    if [[ -n "$old_ip" && -n "$new_ip" && "$old_ip" == "$new_ip" && -n "$old_ddns" && -n "$new_ddns" && "$old_ddns" == "$new_ddns" ]]; then
+        log "⚠️ API 已调用，但当前 IP/DDNS 暂未变化：old_ip=${old_ip}，new_ip=${new_ip}，old_ddns=${old_ddns}，new_ddns=${new_ddns}。可能是 API 错误、DDNS 未更新或商家暂未完成切换。"
+        note="api_called_but_ip_not_changed"
+    fi
+
+    log "✅ 换 IP 流程完成：${old_ip:-unknown} -> ${new_ip:-${returned_ip:-unknown}}，DDNS：${old_ddns:-unknown} -> ${new_ddns:-unknown}，reason=${reason}，note=${note}"
+    LAST_CHANGE_EPOCH="$(now_epoch)"
+    LAST_RESOLVED_IP="$new_ddns"
+    save_status
+    if [[ "$official" == "1" ]]; then
+        append_history "${old_ip:-unknown}" "${new_ip:-${returned_ip:-unknown}}" "${old_ddns:-unknown}" "${new_ddns:-unknown}" "$reason" "$note"
+    fi
+    return 0
+}
+
+test_show_ip_api() {
+    require_root
+    load_config
+    [[ -n "$SHOW_IP_API_URL" ]] || { err "获取当前 IP API 未配置。"; return 1; }
+    local body ip
+    body="$(curl_get "$SHOW_IP_API_URL" "$CURL_TIMEOUT")"
+    ip="$(extract_public_ipv4 "$body" 2>/dev/null || true)"
+    cecho "🔎 获取当前 IP API 测试"
+    cecho "----------------------------------------"
+    cecho "API：$(mask_url "$SHOW_IP_API_URL")"
+    cecho "返回摘要：$(shorten "$body")"
+    if [[ -n "$ip" ]]; then ok "提取公网 IP：${ip}"; else err "未提取到公网 IPv4。"; return 1; fi
+}
+
+test_vendor_api() {
+    warn "这会调用【真正更换 IP API】，可能真的更换 HiNet IP；但不会写入正式换 IP 历史记录。"
+    read -r -p "确认测试更换 IP API？输入 1 继续，其它取消：" yn
+    yn="$(normalize_choice "$yn")"
+    [[ "$yn" == "1" ]] || { warn "已取消。"; return 0; }
+    change_ip "test_vendor_api" "0"
+}
+
+# -----------------------------
+# 定时检测：systemd timer 触发的单次检查
+# -----------------------------
+check_once() {
+    require_root
+    mkdirs
+    load_config
+    load_status
+
+    log "🧭 timer check entry：version=${APP_VERSION}，pid=$$"
+
+    if ! validate_config_safe; then
+        LAST_RESULT="config_invalid"
+        LAST_CHECK_EPOCH="$(now_epoch)"
+        save_status
+        log "💤 配置不可用，本轮不检测。"
+        return 0
+    fi
+
+    local resolved_ip rc now last_delta
+    resolved_ip="$(resolve_target_ip 2>/dev/null || true)"
+    LAST_CHECK_EPOCH="$(now_epoch)"
+    LAST_TARGET="$CHECK_TARGET"
+    LAST_RESOLVED_IP="$resolved_ip"
+    save_status
+
+    log "🛰️ 定时检测开始：target=${CHECK_TARGET}，resolved_ip=${resolved_ip:-unknown}，failure=${FAILURE_COUNT}/${FAIL_THRESHOLD}，interval=${CHECK_INTERVAL}s"
+
+    globalping_check_target "$CHECK_TARGET"
+    rc=$?
+
+    if [[ "$rc" -eq 0 ]]; then
+        FAILURE_COUNT=0
+        LAST_RESULT="ok"
+        save_status
+        log "✅ 定时判定：CN ping 正常，失败计数已清零。"
+    elif [[ "$rc" -eq 1 ]]; then
+        FAILURE_COUNT=$(( FAILURE_COUNT + 1 ))
+        LAST_RESULT="cn_ping_failed"
+        save_status
+        log "⚠️ 定时判定：CN ping 全部失败，连续失败计数：${FAILURE_COUNT}/${FAIL_THRESHOLD}。"
+        if (( FAILURE_COUNT >= FAIL_THRESHOLD )); then
+            now="$(now_epoch)"
+            last_delta=$(( now - ${LAST_CHANGE_EPOCH:-0} ))
+            if (( COOLDOWN_SECONDS > 0 && LAST_CHANGE_EPOCH > 0 && last_delta < COOLDOWN_SECONDS )); then
+                log "⏳ 达到失败阈值，但仍在冷却期：剩余 $(( COOLDOWN_SECONDS - last_delta )) 秒，本次不换 IP。"
+            else
+                log "🚨 达到失败阈值，开始自动调用更换 IP API。"
+                if change_ip "globalping_cn_ping_failed_${FAILURE_COUNT}_times" "1"; then
+                    FAILURE_COUNT=0
+                    LAST_RESULT="changed_ip"
+                    LAST_RESOLVED_IP="$(resolve_target_ip 2>/dev/null || true)"
+                    save_status
+                    log "✅ 自动换 IP 完成，失败计数已清零。"
+                else
+                    LAST_RESULT="change_ip_failed"
+                    save_status
+                    log "❌ 自动换 IP 失败，保留失败计数，等待下一轮。"
+                fi
+            fi
+        fi
+    else
+        LAST_RESULT="globalping_unknown"
+        save_status
+        log "⚠️ 定时判定：Globalping API/探针异常，本轮不计入连续失败。"
+    fi
+
+    log "🏁 定时检测结束：last_result=${LAST_RESULT}，failure_count=${FAILURE_COUNT}/${FAIL_THRESHOLD}"
+    return 0
+}
+
+# -----------------------------
+# systemd timer / 安装卸载
+# -----------------------------
+write_units() {
+    load_config
+    local interval="${CHECK_INTERVAL:-60}"
+    number_in_range "$interval" 30 3600 || interval=60
+
     cat > "$SERVICE_FILE" <<EOF_SERVICE
 [Unit]
-Description=HiNet GFW Auto Change IP by Globalping CN Ping
+Description=HiNet GFW Auto Change IP - one-shot Globalping CN check
 Wants=network-online.target
 After=network-online.target
 
 [Service]
-Type=simple
-ExecStart=/usr/bin/env bash ${INSTALL_PATH} daemon
-Restart=always
-RestartSec=15
+Type=oneshot
+ExecStart=/usr/bin/env bash ${INSTALL_PATH} check-once
+TimeoutStartSec=600
 WorkingDirectory=/
 Environment=LANG=C.UTF-8
 Environment=LC_ALL=C.UTF-8
 StandardOutput=journal
 StandardError=journal
+EOF_SERVICE
+
+    cat > "$TIMER_FILE" <<EOF_TIMER
+[Unit]
+Description=Run HiNet GFW Auto Change IP check every ${interval}s
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=${interval}s
+AccuracySec=1s
+Unit=${APP_NAME}.service
+Persistent=false
 
 [Install]
-WantedBy=multi-user.target
-EOF_SERVICE
-    chmod 644 "$SERVICE_FILE"
+WantedBy=timers.target
+EOF_TIMER
+
+    chmod 644 "$SERVICE_FILE" "$TIMER_FILE"
     systemctl daemon-reload
 }
 
 install_self() {
     require_root
-    has_cmd systemctl || { err "当前系统未检测到 systemctl。本脚本使用 systemd 管理后台服务。"; exit 1; }
+    has_cmd systemctl || { err "当前系统未检测到 systemctl。本脚本使用 systemd 管理后台定时器。"; exit 1; }
     install_packages
     mkdirs
-
     local src="${BASH_SOURCE[0]}"
     if [[ "$src" != "$INSTALL_PATH" ]]; then
         cp -f "$src" "$INSTALL_PATH"
@@ -879,232 +616,43 @@ install_self() {
     else
         chmod 755 "$INSTALL_PATH"
     fi
-
-    # 自检：确保安装后的入口文件可被 bash 解释，避免 systemd 203/EXEC。
     if ! /usr/bin/env bash -n "$INSTALL_PATH"; then
         err "安装后的脚本语法自检失败：$INSTALL_PATH"
         exit 1
     fi
-
-    write_service
+    write_units
     log "✅ 安装/覆盖完成：${INSTALL_PATH}，版本=${APP_VERSION}。"
     ok "安装完成：${INSTALL_PATH}"
     ok "服务文件：${SERVICE_FILE}"
-}
-
-quick_init() {
-    require_root
-    install_packages
-    install_self
-    mkdirs
-
-    cecho "🚀 ${APP_VERSION} 快速初始化"
-    cecho "----------------------------------------"
-    warn "请输入你的真实 API 地址。脚本不会内置示例 URL，也不会把敏感信息上传 GitHub。"
-    warn "v2.0 使用双 API：获取当前 IP API 不应换 IP；更换 IP API 只在手动/自动触发时调用。"
-    cecho ""
-
-    local show_api change_api target interval probes threshold packets wait cooldown timeout post_wait min_api resolver start_now
-
-    read -r -p "🔎 请输入【获取当前 IP API】地址：" show_api
-    while [[ -z "$show_api" ]]; do
-        read -r -p "🔎 获取当前 IP API 地址不能为空，请重新输入：" show_api
-    done
-
-    read -r -p "🔁 请输入【真正更换 IP API】地址：" change_api
-    while [[ -z "$change_api" ]]; do
-        read -r -p "🔁 更换 IP API 地址不能为空，请重新输入：" change_api
-    done
-
-    warn_if_showip_action "$change_api"
-
-    read -r -p "🎯 请输入【检测目标域名/IP】（建议填 HiNet DDNS 域名）：" target
-    while [[ -z "$target" ]]; do
-        read -r -p "🎯 检测目标不能为空，请重新输入：" target
-    done
-
-    read -r -p "⏱️ 检测间隔秒 [默认 ${DEFAULT_CHECK_INTERVAL}]：" interval
-    interval="${interval:-$DEFAULT_CHECK_INTERVAL}"
-
-    read -r -p "🇨🇳 每次使用几个中国节点 [默认 ${DEFAULT_CN_PROBES}，建议 1-2]：" probes
-    probes="${probes:-$DEFAULT_CN_PROBES}"
-
-    read -r -p "🚨 连续几次 CN ping 全部失败后换 IP [默认 ${DEFAULT_FAIL_THRESHOLD}]：" threshold
-    threshold="${threshold:-$DEFAULT_FAIL_THRESHOLD}"
-
-    read -r -p "📦 每个节点 ping 包数量 [默认 ${DEFAULT_GP_PACKETS}]：" packets
-    packets="${packets:-$DEFAULT_GP_PACKETS}"
-
-    read -r -p "⌛ 等待 Globalping 结果秒数 [默认 ${DEFAULT_RESULT_WAIT_SECONDS}]：" wait
-    wait="${wait:-$DEFAULT_RESULT_WAIT_SECONDS}"
-
-    read -r -p "🧊 自动换 IP 冷却秒数 [默认 ${DEFAULT_COOLDOWN_SECONDS}]：" cooldown
-    cooldown="${cooldown:-$DEFAULT_COOLDOWN_SECONDS}"
-
-    read -r -p "🌐 API curl 最大超时秒数 [默认 ${DEFAULT_CURL_TIMEOUT}]：" timeout
-    timeout="${timeout:-$DEFAULT_CURL_TIMEOUT}"
-
-    read -r -p "⏳ 换 IP 后等待 IP/DDNS 更新秒数 [默认 ${DEFAULT_POST_CHANGE_WAIT_SECONDS}，最小 180]：" post_wait
-    post_wait="${post_wait:-$DEFAULT_POST_CHANGE_WAIT_SECONDS}"
-
-    read -r -p "🧯 更换 IP API 最小调用间隔秒数 [默认 ${DEFAULT_MIN_API_INTERVAL}]：" min_api
-    min_api="${min_api:-$DEFAULT_MIN_API_INTERVAL}"
-
-    read -r -p "🧭 解析 DDNS 使用的 DNS 服务器 [默认 ${DEFAULT_RESOLVER}]：" resolver
-    resolver="${resolver:-$DEFAULT_RESOLVER}"
-
-    SHOW_IP_API_URL="$show_api"
-    CHANGE_IP_API_URL="$change_api"
-    CHECK_TARGET="$target"
-    CHECK_INTERVAL="$interval"
-    CN_PROBES="$probes"
-    FAIL_THRESHOLD="$threshold"
-    GP_PACKETS="$packets"
-    GP_RESULT_WAIT_SECONDS="$wait"
-    COOLDOWN_SECONDS="$cooldown"
-    CURL_TIMEOUT="$timeout"
-    POST_CHANGE_WAIT_SECONDS="$post_wait"
-    MIN_API_INTERVAL="$min_api"
-    DNS_RESOLVER="$resolver"
-
-    validate_number "$CHECK_INTERVAL" 30 3600 "检测间隔秒"
-    validate_number "$CN_PROBES" 1 2 "中国节点数量"
-    validate_number "$FAIL_THRESHOLD" 1 20 "连续失败阈值"
-    validate_number "$GP_PACKETS" 1 10 "每节点 ping 包数量"
-    validate_number "$GP_RESULT_WAIT_SECONDS" 10 120 "Globalping 结果等待秒数"
-    validate_number "$COOLDOWN_SECONDS" 0 86400 "换 IP 冷却秒数"
-    validate_number "$CURL_TIMEOUT" 5 120 "curl 超时秒数"
-    validate_number "$POST_CHANGE_WAIT_SECONDS" 180 1800 "换 IP 后等待秒数"
-    validate_number "$MIN_API_INTERVAL" 0 3600 "更换 IP API 最小调用间隔秒数"
-
-    save_config
-    ok "配置已保存：${CONF_FILE}（权限 600）"
-    info "获取 IP API：$(mask_url "$SHOW_IP_API_URL")"
-    info "更换 IP API：$(mask_url "$CHANGE_IP_API_URL")"
-    info "检测目标：${CHECK_TARGET}"
-
-    cecho ""
-    info "正在测试当前 IP / DDNS，不会调用更换 IP API..."
-    show_current_ip || warn "当前 IP / DDNS 测试失败，但配置已保存。"
-
-    cecho ""
-    info "正在测试 Globalping CN ping，不会调用更换 IP API..."
-    run_single_check || true
-
-    cecho ""
-    read -r -p "🚀 是否立即启动后台自动检测服务？[Y/n]：" start_now
-    start_now="${start_now:-Y}"
-    if [[ "$start_now" =~ ^[Yy]$ ]]; then
-        systemctl enable --now "$APP_NAME"
-        ok "已启动并设置开机自启：${APP_NAME}"
-        systemctl --no-pager --full status "$APP_NAME" || true
-    else
-        info "你可以稍后执行：${INSTALL_PATH} start"
-    fi
-}
-
-
-prompt_keep() {
-    local label="$1" current="$2" varname="$3" input=""
-    read -r -p "${label} [当前：${current}]，回车保留：" input
-    if [[ -n "$input" ]]; then
-        printf -v "$varname" '%s' "$input"
-    fi
-}
-
-edit_config() {
-    require_root
-    install_self
-    load_config
-
-    cecho "🛠️ 修改已有配置"
-    cecho "----------------------------------------"
-    cecho "回车表示保留当前值。API 会脱敏显示。"
-
-    local input_show="" input_change="" show_api="$SHOW_IP_API_URL" change_api="$CHANGE_IP_API_URL" target="$CHECK_TARGET" interval="$CHECK_INTERVAL" probes="$CN_PROBES" threshold="$FAIL_THRESHOLD" packets="$GP_PACKETS" wait="$GP_RESULT_WAIT_SECONDS" cooldown="$COOLDOWN_SECONDS" timeout="$CURL_TIMEOUT" post_wait="$POST_CHANGE_WAIT_SECONDS" min_api="$MIN_API_INTERVAL" resolver="$DNS_RESOLVER" restart_now=""
-
-    read -r -p "🔎 获取当前 IP API [当前：$(mask_url "$show_api")]，回车保留：" input_show
-    [[ -n "${input_show:-}" ]] && show_api="$input_show"
-
-    read -r -p "🔁 真正更换 IP API [当前：$(mask_url "$change_api")]，回车保留：" input_change
-    if [[ -n "${input_change:-}" ]]; then
-        change_api="$input_change"
-        warn_if_showip_action "$change_api"
-    else
-        warn_if_showip_action "$change_api"
-    fi
-
-    prompt_keep "🎯 检测目标域名/IP" "$target" target
-    prompt_keep "⏱️ 检测间隔秒" "$interval" interval
-    prompt_keep "🇨🇳 每次中国节点数，建议 1-2" "$probes" probes
-    prompt_keep "🚨 连续失败阈值" "$threshold" threshold
-    prompt_keep "📦 每节点 ping 包数量" "$packets" packets
-    prompt_keep "⌛ Globalping 结果等待秒数" "$wait" wait
-    prompt_keep "🧊 自动换 IP 冷却秒数" "$cooldown" cooldown
-    prompt_keep "🌐 API curl 最大超时秒数" "$timeout" timeout
-    prompt_keep "⏳ 换 IP 后等待秒数，最小 180" "$post_wait" post_wait
-    prompt_keep "🧯 更换 IP API 最小调用间隔秒数" "$min_api" min_api
-    prompt_keep "🧭 DDNS 解析 DNS 服务器" "$resolver" resolver
-    SHOW_IP_API_URL="$show_api"
-    CHANGE_IP_API_URL="$change_api"
-    CHECK_TARGET="$target"
-    CHECK_INTERVAL="$interval"
-    CN_PROBES="$probes"
-    FAIL_THRESHOLD="$threshold"
-    GP_PACKETS="$packets"
-    GP_RESULT_WAIT_SECONDS="$wait"
-    COOLDOWN_SECONDS="$cooldown"
-    CURL_TIMEOUT="$timeout"
-    POST_CHANGE_WAIT_SECONDS="$post_wait"
-    MIN_API_INTERVAL="$min_api"
-    DNS_RESOLVER="$resolver"
-
-    [[ -n "$SHOW_IP_API_URL" ]] || { err "获取当前 IP API 地址不能为空。"; return 1; }
-    [[ -n "$CHANGE_IP_API_URL" ]] || { err "更换 IP API 地址不能为空。"; return 1; }
-    [[ -n "$CHECK_TARGET" ]] || { err "检测目标不能为空。"; return 1; }
-    validate_number "$CHECK_INTERVAL" 30 3600 "检测间隔秒"
-    validate_number "$CN_PROBES" 1 2 "中国节点数量"
-    validate_number "$FAIL_THRESHOLD" 1 20 "连续失败阈值"
-    validate_number "$GP_PACKETS" 1 10 "每节点 ping 包数量"
-    validate_number "$GP_RESULT_WAIT_SECONDS" 10 120 "Globalping 结果等待秒数"
-    validate_number "$COOLDOWN_SECONDS" 0 86400 "换 IP 冷却秒数"
-    validate_number "$CURL_TIMEOUT" 5 120 "curl 超时秒数"
-    validate_number "$POST_CHANGE_WAIT_SECONDS" 180 1800 "换 IP 后等待秒数"
-    validate_number "$MIN_API_INTERVAL" 0 3600 "更换 IP API 最小调用间隔秒数"
-    save_config
-    ok "配置已更新：${CONF_FILE}"
-    show_config_masked
-
-    if systemctl is-active --quiet "$APP_NAME" 2>/dev/null; then
-        read -r -p "🔄 检测到服务正在运行，是否立即重启让新配置生效？[Y/n]：" restart_now
-        restart_now="${restart_now:-Y}"
-        if [[ "$restart_now" =~ ^[Yy]$ ]]; then
-            systemctl restart "$APP_NAME"
-            ok "服务已重启。"
-        fi
-    fi
+    ok "定时器文件：${TIMER_FILE}"
 }
 
 service_start() {
     require_root
     install_self
     validate_config_or_exit
-    systemctl enable --now "$APP_NAME"
-    ok "已启动：${APP_NAME}"
+    write_units
+    systemctl enable --now "${APP_NAME}.timer"
+    systemctl start "${APP_NAME}.service" 2>/dev/null || true
+    ok "已启动定时器：${APP_NAME}.timer"
+    systemctl --no-pager --full status "${APP_NAME}.timer" || true
 }
 
 service_stop() {
     require_root
-    systemctl stop "$APP_NAME" 2>/dev/null || true
-    ok "已停止：${APP_NAME}"
+    systemctl disable --now "${APP_NAME}.timer" 2>/dev/null || true
+    systemctl stop "${APP_NAME}.service" 2>/dev/null || true
+    ok "已停止定时器和当前检测任务。"
 }
 
 service_restart() {
     require_root
     install_self
     validate_config_or_exit
-    systemctl restart "$APP_NAME"
-    ok "已重启：${APP_NAME}"
+    write_units
+    systemctl restart "${APP_NAME}.timer"
+    systemctl start "${APP_NAME}.service" 2>/dev/null || true
+    ok "已重启定时器，并立即触发一次检测。"
 }
 
 service_status() {
@@ -1113,7 +661,11 @@ service_status() {
     load_status
     cecho "🧩 ${APP_VERSION} 状态"
     cecho "----------------------------------------"
-    systemctl --no-pager --full status "$APP_NAME" || true
+    cecho "⏱️ timer 状态："
+    systemctl --no-pager --full status "${APP_NAME}.timer" || true
+    cecho ""
+    cecho "🧪 最近一次 service 状态："
+    systemctl --no-pager --full status "${APP_NAME}.service" || true
     cecho ""
     cecho "📌 当前配置："
     cecho "  检测目标：${CHECK_TARGET:-未配置}"
@@ -1131,10 +683,116 @@ service_status() {
     cecho "  LAST_TARGET=${LAST_TARGET:-unknown}"
     cecho "  LAST_RESOLVED_IP=${LAST_RESOLVED_IP:-unknown}"
     cecho "  LAST_RESULT=${LAST_RESULT:-unknown}"
+    cecho "  LAST_MEASUREMENT_ID=${LAST_MEASUREMENT_ID:-unknown}"
     cecho "  FAILURE_COUNT=${FAILURE_COUNT:-0}"
     cecho "  LAST_CHECK_EPOCH=${LAST_CHECK_EPOCH:-0}"
     cecho "  LAST_CHANGE_EPOCH=${LAST_CHANGE_EPOCH:-0}"
     cecho "  LAST_API_CALL_EPOCH=${LAST_API_CALL_EPOCH:-0}"
+    cecho ""
+    if has_cmd systemctl; then
+        cecho "📅 定时器列表："
+        systemctl list-timers --all "${APP_NAME}.timer" || true
+    fi
+}
+
+quick_init() {
+    require_root
+    install_packages
+    install_self
+    mkdirs
+    cecho "🚀 ${APP_VERSION} 快速初始化"
+    cecho "----------------------------------------"
+    warn "请输入你的真实 API 地址。脚本不会内置示例 URL，也不会把敏感信息上传 GitHub。"
+    warn "v2.2 使用 systemd timer 定时触发检测，解决 daemon 静默退出问题。"
+    cecho ""
+
+    local show_api change_api target interval probes threshold packets wait cooldown timeout post_wait min_api resolver start_now
+    read -r -p "🔎 请输入【获取当前 IP API】地址：" show_api
+    while [[ -z "$show_api" ]]; do read -r -p "🔎 获取当前 IP API 地址不能为空，请重新输入：" show_api; done
+    read -r -p "🔁 请输入【真正更换 IP API】地址：" change_api
+    while [[ -z "$change_api" ]]; do read -r -p "🔁 更换 IP API 地址不能为空，请重新输入：" change_api; done
+    warn_if_showip_action "$change_api"
+    if [[ "$show_api" == "$change_api" ]]; then warn "获取 IP API 和更换 IP API 完全相同，请确认没有填错。"; fi
+    read -r -p "🎯 请输入【检测目标域名/IP】（建议填 HiNet DDNS 域名）：" target
+    while [[ -z "$target" ]]; do read -r -p "🎯 检测目标不能为空，请重新输入：" target; done
+
+    read -r -p "⏱️ 检测间隔秒 [默认 ${DEFAULT_CHECK_INTERVAL}]：" interval; interval="${interval:-$DEFAULT_CHECK_INTERVAL}"
+    read -r -p "🇨🇳 每次使用几个中国节点 [默认 ${DEFAULT_CN_PROBES}，建议 1-2]：" probes; probes="${probes:-$DEFAULT_CN_PROBES}"
+    read -r -p "🚨 连续几次 CN ping 全部失败后换 IP [默认 ${DEFAULT_FAIL_THRESHOLD}]：" threshold; threshold="${threshold:-$DEFAULT_FAIL_THRESHOLD}"
+    read -r -p "📦 每个节点 ping 包数量 [默认 ${DEFAULT_GP_PACKETS}]：" packets; packets="${packets:-$DEFAULT_GP_PACKETS}"
+    read -r -p "⌛ 等待 Globalping 结果秒数 [默认 ${DEFAULT_RESULT_WAIT_SECONDS}]：" wait; wait="${wait:-$DEFAULT_RESULT_WAIT_SECONDS}"
+    read -r -p "🧊 自动换 IP 冷却秒数 [默认 ${DEFAULT_COOLDOWN_SECONDS}]：" cooldown; cooldown="${cooldown:-$DEFAULT_COOLDOWN_SECONDS}"
+    read -r -p "🌐 API curl 最大超时秒数 [默认 ${DEFAULT_CURL_TIMEOUT}]：" timeout; timeout="${timeout:-$DEFAULT_CURL_TIMEOUT}"
+    read -r -p "⏳ 换 IP 后等待 DDNS/API 更新秒数 [默认 ${DEFAULT_POST_CHANGE_WAIT_SECONDS}]：" post_wait; post_wait="${post_wait:-$DEFAULT_POST_CHANGE_WAIT_SECONDS}"
+    read -r -p "🧭 解析 DDNS 使用的 DNS 服务器 [默认 ${DEFAULT_RESOLVER}]：" resolver; resolver="${resolver:-$DEFAULT_RESOLVER}"
+    read -r -p "🛡️ 更换 IP API 最小调用间隔秒 [默认 ${DEFAULT_MIN_API_INTERVAL}]：" min_api; min_api="${min_api:-$DEFAULT_MIN_API_INTERVAL}"
+
+    SHOW_IP_API_URL="$show_api"
+    CHANGE_IP_API_URL="$change_api"
+    CHECK_TARGET="$target"
+    CHECK_INTERVAL="$interval"
+    CN_PROBES="$probes"
+    FAIL_THRESHOLD="$threshold"
+    GP_PACKETS="$packets"
+    GP_RESULT_WAIT_SECONDS="$wait"
+    COOLDOWN_SECONDS="$cooldown"
+    CURL_TIMEOUT="$timeout"
+    POST_CHANGE_WAIT_SECONDS="$post_wait"
+    DNS_RESOLVER="$resolver"
+    MIN_API_INTERVAL="$min_api"
+    load_config
+    save_config
+    write_units
+
+    ok "配置已保存：${CONF_FILE}（权限 600）"
+    info "获取 IP API：$(mask_url "$SHOW_IP_API_URL")"
+    info "更换 IP API：$(mask_url "$CHANGE_IP_API_URL")"
+    info "检测目标：${CHECK_TARGET}"
+
+    info "正在测试获取 IP API..."
+    test_show_ip_api || warn "获取 IP API 测试失败，请检查 URL。"
+    info "正在测试检测目标解析..."
+    local tip=""
+    tip="$(resolve_target_ip 2>/dev/null || true)"
+    if [[ -n "$tip" ]]; then ok "当前解析公网 IP：${tip}"; else warn "检测目标暂时无法解析到公网 IPv4。"; fi
+    info "正在测试 Globalping CN ping，不会调用更换 IP API..."
+    run_single_check || true
+
+    read -r -p "🚀 是否立即启动后台定时检测？[Y/n]：" start_now
+    start_now="${start_now:-Y}"
+    if [[ "$start_now" =~ ^[Yy]$ ]]; then service_start; fi
+}
+
+edit_config() {
+    require_root
+    install_self
+    load_config
+    cecho "🛠️ 修改已有配置：直接回车保留原值"
+    cecho "----------------------------------------"
+    local v
+    read -r -p "🔎 获取当前 IP API [$(mask_url "$SHOW_IP_API_URL")]：" v; [[ -n "$v" ]] && SHOW_IP_API_URL="$v"
+    read -r -p "🔁 真正更换 IP API [$(mask_url "$CHANGE_IP_API_URL")]：" v; [[ -n "$v" ]] && CHANGE_IP_API_URL="$v"
+    warn_if_showip_action "$CHANGE_IP_API_URL"
+    if [[ "$SHOW_IP_API_URL" == "$CHANGE_IP_API_URL" ]]; then warn "获取 IP API 和更换 IP API 完全相同，请确认没有填错。"; fi
+    read -r -p "🎯 检测目标域名/IP [${CHECK_TARGET}]：" v; [[ -n "$v" ]] && CHECK_TARGET="$v"
+    read -r -p "⏱️ 检测间隔秒 [${CHECK_INTERVAL}]：" v; [[ -n "$v" ]] && CHECK_INTERVAL="$v"
+    read -r -p "🇨🇳 中国节点数量 [${CN_PROBES}]：" v; [[ -n "$v" ]] && CN_PROBES="$v"
+    read -r -p "🚨 失败阈值 [${FAIL_THRESHOLD}]：" v; [[ -n "$v" ]] && FAIL_THRESHOLD="$v"
+    read -r -p "📦 ping 包数量 [${GP_PACKETS}]：" v; [[ -n "$v" ]] && GP_PACKETS="$v"
+    read -r -p "⌛ Globalping 等待秒数 [${GP_RESULT_WAIT_SECONDS}]：" v; [[ -n "$v" ]] && GP_RESULT_WAIT_SECONDS="$v"
+    read -r -p "🧊 冷却秒数 [${COOLDOWN_SECONDS}]：" v; [[ -n "$v" ]] && COOLDOWN_SECONDS="$v"
+    read -r -p "🌐 curl 超时秒数 [${CURL_TIMEOUT}]：" v; [[ -n "$v" ]] && CURL_TIMEOUT="$v"
+    read -r -p "⏳ 换 IP 后等待秒数 [${POST_CHANGE_WAIT_SECONDS}]：" v; [[ -n "$v" ]] && POST_CHANGE_WAIT_SECONDS="$v"
+    read -r -p "🧭 DNS 服务器 [${DNS_RESOLVER}]：" v; [[ -n "$v" ]] && DNS_RESOLVER="$v"
+    read -r -p "🛡️ 更换 API 最小间隔秒 [${MIN_API_INTERVAL}]：" v; [[ -n "$v" ]] && MIN_API_INTERVAL="$v"
+    load_config
+    save_config
+    write_units
+    ok "配置已更新。"
+    if systemctl is-active --quiet "${APP_NAME}.timer" 2>/dev/null; then
+        systemctl restart "${APP_NAME}.timer"
+        ok "定时器已按新间隔重启。"
+    fi
 }
 
 view_logs() {
@@ -1142,204 +800,155 @@ view_logs() {
     mkdirs
     cecho "🧾 中文日志文件：${LOG_FILE}"
     cecho "----------------------------------------"
-    info "显示原来的中文文件日志。按 Ctrl+C 退出。"
+    info "显示中文文件日志。按 Ctrl+C 退出。"
     if [[ ! -s "$LOG_FILE" ]]; then
-        warn "当前文件日志为空。下面先给出服务状态，方便判断后台是否真正运行。"
-        if has_cmd systemctl && systemctl list-unit-files "${APP_NAME}.service" >/dev/null 2>&1; then
-            systemctl --no-pager --full status "$APP_NAME" || true
-            cecho ""
-            warn "如果服务状态正常但文件日志仍为空，可执行：${APP_NAME} journal 查看 systemd journal 原始输出。"
-        fi
+        warn "当前文件日志为空。下面先给出 timer/service 状态。"
+        systemctl --no-pager --full status "${APP_NAME}.timer" 2>/dev/null || true
+        systemctl --no-pager --full status "${APP_NAME}.service" 2>/dev/null || true
     fi
     tail -n 120 -F "$LOG_FILE"
 }
 
 view_journal_logs() {
     require_root
-    cecho "🧾 systemd journal：journalctl -u ${APP_NAME} -f -o cat"
+    cecho "🧾 systemd journal：journalctl -u ${APP_NAME}.service -u ${APP_NAME}.timer -f -o cat"
     cecho "----------------------------------------"
-    if has_cmd journalctl; then
-        journalctl -u "$APP_NAME" -n 120 -f -o cat || true
-    else
-        err "当前系统未检测到 journalctl。"
-        return 1
-    fi
+    journalctl -u "${APP_NAME}.service" -u "${APP_NAME}.timer" -n 120 -f -o cat || true
 }
 
 show_config_masked() {
     require_root
     load_config
-    cecho "🔐 当前配置（已脱敏）"
+    cecho "🔐 当前脱敏配置"
     cecho "----------------------------------------"
-    cecho "SHOW_IP_API_URL=$(mask_url "${SHOW_IP_API_URL:-}")"
-    cecho "CHANGE_IP_API_URL=$(mask_url "${CHANGE_IP_API_URL:-}")"
-    cecho "CHECK_TARGET=${CHECK_TARGET:-}"
-    cecho "CHECK_INTERVAL=${CHECK_INTERVAL:-$DEFAULT_CHECK_INTERVAL}"
-    cecho "CN_PROBES=${CN_PROBES:-$DEFAULT_CN_PROBES}"
-    cecho "FAIL_THRESHOLD=${FAIL_THRESHOLD:-$DEFAULT_FAIL_THRESHOLD}"
-    cecho "GP_PACKETS=${GP_PACKETS:-$DEFAULT_GP_PACKETS}"
-    cecho "GP_RESULT_WAIT_SECONDS=${GP_RESULT_WAIT_SECONDS:-$DEFAULT_RESULT_WAIT_SECONDS}"
-    cecho "COOLDOWN_SECONDS=${COOLDOWN_SECONDS:-$DEFAULT_COOLDOWN_SECONDS}"
-    cecho "CURL_TIMEOUT=${CURL_TIMEOUT:-$DEFAULT_CURL_TIMEOUT}"
-    cecho "POST_CHANGE_WAIT_SECONDS=${POST_CHANGE_WAIT_SECONDS:-$DEFAULT_POST_CHANGE_WAIT_SECONDS}"
-    cecho "DNS_RESOLVER=${DNS_RESOLVER:-$DEFAULT_RESOLVER}"
-    cecho "MIN_API_INTERVAL=${MIN_API_INTERVAL:-$DEFAULT_MIN_API_INTERVAL}"
+    cecho "获取 IP API：$(mask_url "$SHOW_IP_API_URL")"
+    cecho "更换 IP API：$(mask_url "$CHANGE_IP_API_URL")"
+    cecho "检测目标：${CHECK_TARGET:-未配置}"
+    cecho "检测间隔：${CHECK_INTERVAL}s"
+    cecho "中国节点：${CN_PROBES}"
+    cecho "失败阈值：${FAIL_THRESHOLD}"
+    cecho "ping 包数：${GP_PACKETS}"
+    cecho "等待结果：${GP_RESULT_WAIT_SECONDS}s"
+    cecho "冷却：${COOLDOWN_SECONDS}s"
+    cecho "curl 超时：${CURL_TIMEOUT}s"
+    cecho "换 IP 后等待：${POST_CHANGE_WAIT_SECONDS}s"
+    cecho "DNS 服务器：${DNS_RESOLVER}"
+    cecho "API 最小间隔：${MIN_API_INTERVAL}s"
 }
 
-history_days() {
+history_recent() {
     require_root
-    local days="$1" since
     mkdirs
-    since="$(date -d "${days} days ago" '+%Y-%m-%d' 2>/dev/null || date '+%Y-%m-%d')"
-    cecho "📜 最近 ${days} 天 IP 更换记录"
+    local days="$1" since
+    cecho "📜 最近 ${days} 天 IP 更换记录：${HISTORY_FILE}"
     cecho "----------------------------------------"
-    if [[ ! -s "$HISTORY_FILE" ]]; then
-        warn "暂无记录。"
-        return 0
-    fi
-    awk -F'|' -v since="$since" 'substr($1,1,10) >= since {print}' "$HISTORY_FILE" | tail -n 500 || true
+    if [[ ! -s "$HISTORY_FILE" ]]; then warn "暂无历史记录。"; return 0; fi
+    since="$(date -d "${days} days ago" '+%Y-%m-%d' 2>/dev/null || date '+%Y-%m-%d')"
+    awk -v s="$since" '$1 >= s {print}' "$HISTORY_FILE" || true
 }
 
-uninstall_app() {
+uninstall_script() {
     require_root
-    local ans
-    warn "将停止服务并删除程序文件。默认保留配置和日志。"
-    read -r -p "确认卸载？输入 1 继续，其它退出：" ans
-    [[ "$ans" == "1" ]] || { info "已取消。"; return 0; }
-    systemctl disable --now "$APP_NAME" 2>/dev/null || true
-    rm -f "$SERVICE_FILE"
+    warn "将停止并删除 systemd service/timer 和安装入口，但保留配置、日志、历史。"
+    read -r -p "确认卸载？输入 1 继续：" yn
+    yn="$(normalize_choice "$yn")"
+    [[ "$yn" == "1" ]] || { warn "已取消。"; return 0; }
+    systemctl disable --now "${APP_NAME}.timer" 2>/dev/null || true
+    systemctl stop "${APP_NAME}.service" 2>/dev/null || true
+    rm -f "$SERVICE_FILE" "$TIMER_FILE" "$INSTALL_PATH"
     systemctl daemon-reload 2>/dev/null || true
-    rm -f "$INSTALL_PATH"
-    ok "已卸载程序和 systemd 服务。"
-    info "配置保留：${CONF_FILE}"
-    info "日志保留：${LOG_FILE}"
-    info "历史保留：${HISTORY_FILE}"
+    ok "已卸载程序和 systemd 单元。配置保留：${CONF_FILE}"
 }
 
-self_check() {
+doctor() {
     require_root
+    mkdirs
     cecho "🩺 ${APP_VERSION} 自检"
     cecho "----------------------------------------"
-    mkdirs
-    if /usr/bin/env bash -n "${BASH_SOURCE[0]}"; then
-        ok "脚本语法检查通过。"
-    else
-        err "脚本语法检查失败。"
-        return 1
-    fi
-    for fn in install_packages quick_init install_self write_service validate_config_safe globalping_measurement_create globalping_check_target change_ip test_show_ip_api test_vendor_api daemon_loop view_logs view_journal_logs; do
-        if declare -F "$fn" >/dev/null 2>&1; then
-            ok "函数存在：$fn"
-        else
-            err "函数缺失：$fn"
-            return 1
-        fi
+    local ok_all=1
+    for c in bash curl jq flock systemctl; do
+        if has_cmd "$c"; then ok "依赖存在：$c"; else err "缺少依赖：$c"; ok_all=0; fi
     done
-    for c in curl jq flock systemctl; do
-        if has_cmd "$c"; then
-            ok "命令可用：$c"
-        else
-            warn "命令缺失：$c"
-        fi
-    done
-    if [[ -w "$LOG_FILE" || ! -e "$LOG_FILE" ]]; then
-        ok "文件日志可写：$LOG_FILE"
-    else
-        warn "文件日志当前不可写：$LOG_FILE"
-    fi
-    if has_cmd journalctl; then
-        ok "journalctl 可用：可使用 ${APP_NAME} journal 查看原始日志"
-    else
-        warn "journalctl 不可用：只能查看文件日志"
-    fi
-    if [[ -f "$CONF_FILE" ]]; then
-        load_config
-        ok "配置文件存在：$CONF_FILE"
-        cecho "  获取 IP API：$(mask_url "${SHOW_IP_API_URL:-}")"
-        cecho "  更换 IP API：$(mask_url "${CHANGE_IP_API_URL:-}")"
-        cecho "  检测目标：${CHECK_TARGET:-未配置}"
-            else
-        warn "配置文件不存在，首次使用请执行快速初始化。"
-    fi
+    if /usr/bin/env bash -n "${BASH_SOURCE[0]}"; then ok "脚本语法检查通过。"; else err "脚本语法检查失败。"; ok_all=0; fi
+    if [[ -w "$LOG_FILE" ]]; then ok "中文日志可写：$LOG_FILE"; else warn "中文日志不可写或不存在，尝试创建。"; mkdirs; [[ -w "$LOG_FILE" ]] && ok "中文日志已恢复可写。" || ok_all=0; fi
+    load_config
+    if [[ -n "$SHOW_IP_API_URL" && -n "$CHANGE_IP_API_URL" && -n "$CHECK_TARGET" ]]; then ok "配置字段完整。"; else warn "配置不完整，请执行 init。"; fi
+    if [[ -f "$SERVICE_FILE" ]]; then ok "service 文件存在：$SERVICE_FILE"; else warn "service 文件不存在，执行 init/start 会自动生成。"; fi
+    if [[ -f "$TIMER_FILE" ]]; then ok "timer 文件存在：$TIMER_FILE"; else warn "timer 文件不存在，执行 init/start 会自动生成。"; fi
+    systemctl list-timers --all "${APP_NAME}.timer" 2>/dev/null || true
+    [[ "$ok_all" -eq 1 ]] && ok "自检完成。" || warn "自检发现问题，请按上方提示处理。"
 }
 
-print_usage() {
-    cat <<EOF_USAGE
+print_help() {
+    cat <<EOF_HELP
 ${APP_VERSION}
 
 用法：
-  bash ${APP_NAME}.sh                 打开管理菜单
-  bash ${APP_NAME}.sh init            快速初始化并安装
-  ${APP_NAME} start                   启动服务
-  ${APP_NAME} stop                    停止服务
-  ${APP_NAME} restart                 重启服务
+  ${APP_NAME} init                    快速初始化 / 安装
+  ${APP_NAME} start                   启动 systemd timer 后台检测
+  ${APP_NAME} stop                    停止 systemd timer
+  ${APP_NAME} restart                 重启 systemd timer 并立即检测一次
   ${APP_NAME} status                  查看状态
-  ${APP_NAME} current-ip              显示检测目标当前解析 IP
-  ${APP_NAME} check                   手动检测一次
-  ${APP_NAME} test-show-api           手动测试获取当前 IP API
-  ${APP_NAME} test-api                手动测试更换 IP API，不写入正式换 IP记录
-  ${APP_NAME} change                  手动调用更换 IP API 换 IP
-  ${APP_NAME} 8                       等同于 change，兼容菜单编号
-  ${APP_NAME} edit-config             修改已有配置
-  ${APP_NAME} history3                最近三天 IP 更换记录
-  ${APP_NAME} history30               最近一个月 IP 更换记录
-  ${APP_NAME} logs                    实时中文文件日志
-  ${APP_NAME} journal                 查看 systemd journal 原始日志
-  ${APP_NAME} config                  查看脱敏配置
-  ${APP_NAME} doctor                  自检脚本/依赖/配置
-  ${APP_NAME} uninstall               卸载
-EOF_USAGE
+  ${APP_NAME} check-once              systemd timer 使用：执行一次检测并自动处理失败计数
+  ${APP_NAME} check                   手动 Globalping 检测一次
+  ${APP_NAME} change                  手动调用更换 IP API
+  ${APP_NAME} show-ip                 显示当前 IP / DDNS 解析
+  ${APP_NAME} logs                    中文文件日志
+  ${APP_NAME} journal                 systemd 原始日志
+  ${APP_NAME} edit-config             修改配置
+  ${APP_NAME} doctor                  自检
+EOF_HELP
 }
 
 menu() {
-    require_root
     while true; do
         cecho ""
         cecho "🌏 ${APP_VERSION} 管理菜单"
         cecho "========================================"
         cecho "  1. 🚀 快速初始化 / 安装"
-        cecho "  2. ▶️  启动自动检测服务"
-        cecho "  3. ⏹️  停止自动检测服务"
-        cecho "  4. 🔄 重启自动检测服务"
-        cecho "  5. 📊 查看服务状态"
+        cecho "  2. ▶️  启动自动检测定时器"
+        cecho "  3. ⏹️  停止自动检测定时器"
+        cecho "  4. 🔄 重启自动检测定时器"
+        cecho "  5. 📊 查看 timer/service 状态"
         cecho "  6. 🌐 显示当前 HiNet IP / DDNS 解析"
         cecho "  7. 🧪 手动检测一次 Globalping CN ping"
         cecho "  8. 🔁 手动调用更换 IP API"
         cecho "  9. 📜 查看最近三天 IP 更换记录"
         cecho " 10. 🗓️  查看最近一个月 IP 更换记录"
-        cecho " 11. 🧾 查看实时日志"
+        cecho " 11. 🧾 查看中文实时日志"
         cecho " 12. 🔐 查看脱敏配置"
         cecho " 13. 🛠️  修改已有配置"
         cecho " 14. 🔎 手动测试获取当前 IP API（安全）"
-        cecho " 15. 🧪 手动测试更换 IP API（不写正式记录）"
+        cecho " 15. 🧪 手动测试更换 IP API（可能换 IP，不写正式记录）"
         cecho " 16. 🗑️  卸载脚本"
         cecho " 17. 🩺 脚本自检"
         cecho " 18. 🧾 查看 systemd journal 原始日志"
         cecho "  0. 🚪 退出"
         cecho "========================================"
+        local choice
         read -r -p "请输入选项 [0-18]：" choice
         choice="$(normalize_choice "$choice")"
         case "$choice" in
-            1|init|install) quick_init ;;
+            1|init) quick_init ;;
             2|start) service_start ;;
             3|stop) service_stop ;;
             4|restart) service_restart ;;
             5|status) service_status ;;
-            6|ip|showip|current-ip) show_current_ip ;;
-            7|check|test) run_single_check ;;
-            8|change|change-ip|manual) change_ip "manual_menu" ;;
-            9|history3) history_days 3 ;;
-            10|history30) history_days 30 ;;
-            11|log|logs) view_logs ;;
+            6|show|show-ip) show_current_ip ;;
+            7|check) run_single_check ;;
+            8|change|change-ip|manual) change_ip "manual_menu" "1" ;;
+            9) history_recent 3 ;;
+            10) history_recent 30 ;;
+            11|logs|log) view_logs ;;
             12|config) show_config_masked ;;
-            13|edit|edit-config|modify|settings) edit_config ;;
-            14|test-show-api|showapi|show-api) test_show_ip_api ;;
-            15|test-api|test-change-api|apitest|vendor-test) test_vendor_api ;;
-            16|uninstall|remove) uninstall_app ;;
-            17|doctor|check-script|self-check) self_check ;;
-            18|journal|journal-logs) view_journal_logs ;;
-            0|q|quit|exit) exit 0 ;;
-            *) warn "无效选项：${choice:-空输入}，请输入 0-18；手动换 IP 可输入 8 或 change。" ;;
+            13|edit|edit-config) edit_config ;;
+            14|test-show|test-show-api) test_show_ip_api ;;
+            15|test-api|test-change-api) test_vendor_api ;;
+            16|uninstall) uninstall_script ;;
+            17|doctor) doctor ;;
+            18|journal) view_journal_logs ;;
+            0|exit|quit|q) exit 0 ;;
+            *) warn "无效输入，请重新输入。" ;;
         esac
     done
 }
@@ -1347,26 +956,27 @@ menu() {
 main() {
     local cmd="${1:-menu}"
     case "$cmd" in
-        init|install) quick_init ;;
+        init) quick_init ;;
         start) service_start ;;
         stop) service_stop ;;
         restart) service_restart ;;
         status) service_status ;;
-        daemon) daemon_loop ;;
-        current-ip|showip|ip) show_current_ip ;;
-        check|test) run_single_check ;;
-        test-show-api|showapi|show-api|14) test_show_ip_api ;;
-        test-api|test-change-api|apitest|vendor-test|15) test_vendor_api ;;
-        change|change-ip|manual|8) change_ip "manual_cli" ;;
-        edit|edit-config|modify|settings|13) edit_config ;;
-        history3) history_days 3 ;;
-        history30) history_days 30 ;;
+        check-once) check_once ;;
+        daemon) check_once ;; # 兼容旧 service，不再使用长期 daemon
+        check|7) run_single_check ;;
+        change|8) change_ip "manual_cli" "1" ;;
+        show|show-ip|6) show_current_ip ;;
         logs|log|11) view_logs ;;
-        journal|journal-logs|18) view_journal_logs ;;
-        config) show_config_masked ;;
-        doctor|check-script|self-check|17) self_check ;;
-        uninstall|remove) uninstall_app ;;
-        help|-h|--help) print_usage ;;
+        journal|18) view_journal_logs ;;
+        edit|edit-config|13) edit_config ;;
+        config|show-config|12) show_config_masked ;;
+        test-show-api|test-show|14) test_show_ip_api ;;
+        test-api|test-change-api|15) test_vendor_api ;;
+        history3|9) history_recent 3 ;;
+        history30|10) history_recent 30 ;;
+        doctor|17) doctor ;;
+        uninstall|16) uninstall_script ;;
+        help|-h|--help) print_help ;;
         menu|*) menu ;;
     esac
 }

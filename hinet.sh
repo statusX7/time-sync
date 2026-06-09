@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # ============================================================
-# hinet-gfw-changeip-v2.0.sh
+# hinet-gfw-changeip-v2.1.sh
 # HiNet 被墙检测 + Globalping 中国节点 ping 弱检测 + 双 API 自动换 IP
-# v2.0：移除 GitHub 自动更新功能，修复后台日志/守护循环/配置残留问题
+# v2.1：彻底修复 daemon 正常退出/反复重启导致 Globalping 后台检测不生效的问题
 # 适合上传 GitHub：脚本本身不包含任何敏感信息，敏感 API 写入 /etc 配置文件
 # ============================================================
 
 set -Eeuo pipefail
 
 APP_NAME="hinet-gfw-changeip"
-APP_VERSION="hinet-gfw-changeip-v2.0"
+APP_VERSION="hinet-gfw-changeip-v2.1"
 INSTALL_PATH="/usr/local/bin/${APP_NAME}"
 CONF_DIR="/etc/${APP_NAME}"
 CONF_FILE="${CONF_DIR}/config.env"
@@ -180,6 +180,13 @@ validate_number() {
     fi
 }
 
+number_in_range() {
+    local v="$1" min="$2" max="$3"
+    [[ "$v" =~ ^[0-9]+$ ]] || return 1
+    (( v >= min && v <= max )) || return 1
+    return 0
+}
+
 normalize_choice() {
     # 兼容：前后空格、全角数字、中文顿号/句号、08 这类输入。
     local c="${1:-}"
@@ -211,6 +218,24 @@ validate_config_or_exit() {
     validate_number "$CURL_TIMEOUT" 5 120 "curl 超时秒数"
     validate_number "$POST_CHANGE_WAIT_SECONDS" 180 1800 "换 IP 后等待 DDNS 秒数"
     validate_number "$MIN_API_INTERVAL" 0 3600 "商家 API 最小调用间隔秒数"
+}
+
+validate_config_safe() {
+    # daemon 使用：只返回 0/1，不 exit，避免配置或临时变量异常导致 systemd 反复重启。
+    load_config
+    [[ -n "${SHOW_IP_API_URL:-}" ]] || { log "❌ 配置错误：SHOW_IP_API_URL 为空。"; return 1; }
+    [[ -n "${CHANGE_IP_API_URL:-}" ]] || { log "❌ 配置错误：CHANGE_IP_API_URL 为空。"; return 1; }
+    [[ -n "${CHECK_TARGET:-}" ]] || { log "❌ 配置错误：CHECK_TARGET 为空。"; return 1; }
+    number_in_range "$CHECK_INTERVAL" 30 3600 || { log "❌ 配置错误：CHECK_INTERVAL=${CHECK_INTERVAL}，应为 30-3600。"; return 1; }
+    number_in_range "$CN_PROBES" 1 2 || { log "❌ 配置错误：CN_PROBES=${CN_PROBES}，应为 1-2。"; return 1; }
+    number_in_range "$FAIL_THRESHOLD" 1 20 || { log "❌ 配置错误：FAIL_THRESHOLD=${FAIL_THRESHOLD}，应为 1-20。"; return 1; }
+    number_in_range "$GP_PACKETS" 1 10 || { log "❌ 配置错误：GP_PACKETS=${GP_PACKETS}，应为 1-10。"; return 1; }
+    number_in_range "$GP_RESULT_WAIT_SECONDS" 10 120 || { log "❌ 配置错误：GP_RESULT_WAIT_SECONDS=${GP_RESULT_WAIT_SECONDS}，应为 10-120。"; return 1; }
+    number_in_range "$COOLDOWN_SECONDS" 0 86400 || { log "❌ 配置错误：COOLDOWN_SECONDS=${COOLDOWN_SECONDS}，应为 0-86400。"; return 1; }
+    number_in_range "$CURL_TIMEOUT" 5 120 || { log "❌ 配置错误：CURL_TIMEOUT=${CURL_TIMEOUT}，应为 5-120。"; return 1; }
+    number_in_range "$POST_CHANGE_WAIT_SECONDS" 180 1800 || { log "❌ 配置错误：POST_CHANGE_WAIT_SECONDS=${POST_CHANGE_WAIT_SECONDS}，应为 180-1800。"; return 1; }
+    number_in_range "$MIN_API_INTERVAL" 0 3600 || { log "❌ 配置错误：MIN_API_INTERVAL=${MIN_API_INTERVAL}，应为 0-3600。"; return 1; }
+    return 0
 }
 
 # -----------------------------
@@ -606,7 +631,9 @@ parse_globalping_result() {
 }
 
 globalping_check_target() {
-    validate_config_or_exit
+    # 注意：这里不调用 validate_config_or_exit。daemon 会在外层使用 validate_config_safe，
+    # 避免一次配置或临时异常直接 exit 造成 systemd “Succeeded/反复重启”。
+    load_config
     local target="$1" id start deadline json parsed status total okn
     id="$(globalping_measurement_create "$target" 2>/dev/null || true)"
     if [[ -z "$id" ]]; then
@@ -710,83 +737,104 @@ EOF_STATUS
 daemon_loop() {
     require_root
     mkdirs
-    log "🧭 daemon entry：开始启动后台守护进程。"
 
-    # daemon 内不再自动 apt/yum 安装依赖，避免服务启动时卡在包管理器导致日志静默。
+    # v2.1 关键修复：daemon 是长期运行进程，不能被 set -e 的业务返回码带走。
+    # 任何单轮检测失败都只能写日志、更新状态，然后进入下一轮。
+    set +e
+    trap 'log "❌ daemon 捕获异常：line=${LINENO}, cmd=${BASH_COMMAND}, rc=$?。守护进程继续运行。"' ERR
+
+    log "🧭 daemon entry：开始启动后台守护进程。pid=$$，version=${APP_VERSION}"
+
     for c in curl jq flock; do
         if ! has_cmd "$c"; then
-            log "❌ daemon 缺少依赖：$c。请执行 ${INSTALL_PATH} doctor 或重新 init。"
-            exit 1
+            log "❌ daemon 缺少依赖：$c。请执行 ${INSTALL_PATH} doctor 或重新 init。60 秒后继续自检。"
+            while ! has_cmd "$c"; do sleep 60; done
         fi
     done
 
-    validate_config_or_exit
-
     exec 9>"$LOCK_FILE"
-    if ! flock -n 9; then
-        log "⚠️ 已有守护进程在运行，退出。"
-        exit 0
-    fi
+    log "🔒 daemon 正在获取单实例锁：${LOCK_FILE}"
+    while ! flock -n 9; do
+        # 旧版本如果异常残留一个仍在运行的 daemon，systemd 会因为拿不到锁而反复 Succeeded/Restart。
+        # v2.1 改为不退出，等待锁释放，并持续写中文日志，避免静默重启。
+        log "⚠️ daemon 单实例锁被占用，可能已有旧 daemon 正在运行；60 秒后重试。可用 ps -ef | grep hinet-gfw-changeip 排查。"
+        sleep 60
+    done
+    log "✅ daemon 已获得单实例锁。"
 
     load_status
-    log "🚀 ${APP_VERSION} 守护进程启动。target=${CHECK_TARGET}, interval=${CHECK_INTERVAL}s, cn_probes=${CN_PROBES}, threshold=${FAIL_THRESHOLD}, cooldown=${COOLDOWN_SECONDS}s"
+    local boot_loop=0
 
     while true; do
+        boot_loop=$(( boot_loop + 1 ))
         load_config
+
+        if ! validate_config_safe; then
+            LAST_RESULT="config_invalid"
+            LAST_CHECK_EPOCH="$(now_epoch)"
+            save_status
+            log "💤 配置不可用，本轮不检测，60 秒后重试。"
+            sleep 60
+            continue
+        fi
+
         load_status
 
+        local rc=2 now last_delta resolved_ip="" interval="${CHECK_INTERVAL:-60}"
+        number_in_range "$interval" 30 3600 || interval=60
 
-        local rc=2 now last_delta resolved_ip=""
         now="$(now_epoch)"
         LAST_CHECK_EPOCH="$now"
         LAST_TARGET="$CHECK_TARGET"
         resolved_ip="$(resolve_target_ip 2>/dev/null || true)"
         LAST_RESOLVED_IP="$resolved_ip"
+        save_status
 
-        # 重要：globalping_check_target 返回 1 表示“CN ping 全部失败”，这是业务状态，不能让 set -e 直接退出守护进程。
-        # v1.6 的后台自动换 IP 失效核心原因就在这里：非 0 返回值会在执行到 rc=$? 之前触发 errexit。
-        log "🛰️ 后台检测开始：target=${CHECK_TARGET}，resolved_ip=${resolved_ip:-unknown}，threshold=${FAILURE_COUNT}/${FAIL_THRESHOLD}"
-        set +e
+        log "🛰️ 后台检测开始：round=${boot_loop}，target=${CHECK_TARGET}，resolved_ip=${resolved_ip:-unknown}，failure=${FAILURE_COUNT:-0}/${FAIL_THRESHOLD}，interval=${interval}s"
+
         globalping_check_target "$CHECK_TARGET"
         rc=$?
-        set -e
 
         if [[ "$rc" -eq 0 ]]; then
             FAILURE_COUNT=0
             LAST_RESULT="ok"
             save_status
+            log "✅ 后台判定：CN ping 正常，失败计数已清零。"
         elif [[ "$rc" -eq 1 ]]; then
-            FAILURE_COUNT=$(( FAILURE_COUNT + 1 ))
+            FAILURE_COUNT=$(( ${FAILURE_COUNT:-0} + 1 ))
             LAST_RESULT="cn_ping_failed"
             save_status
-            log "⚠️ 连续失败计数：${FAILURE_COUNT}/${FAIL_THRESHOLD}，target=${CHECK_TARGET}，resolved_ip=${resolved_ip:-unknown}"
+            log "⚠️ 后台判定：CN ping 全部失败，连续失败计数：${FAILURE_COUNT}/${FAIL_THRESHOLD}，target=${CHECK_TARGET}，resolved_ip=${resolved_ip:-unknown}"
 
             if (( FAILURE_COUNT >= FAIL_THRESHOLD )); then
                 now="$(now_epoch)"
-                last_delta=$(( now - LAST_CHANGE_EPOCH ))
+                last_delta=$(( now - ${LAST_CHANGE_EPOCH:-0} ))
                 if (( COOLDOWN_SECONDS > 0 && last_delta < COOLDOWN_SECONDS )); then
                     log "⏳ 已达到失败阈值，但仍在冷却期：剩余 $(( COOLDOWN_SECONDS - last_delta )) 秒，本次不换 IP。"
                 else
+                    log "🚨 已达到失败阈值，准备自动调用更换 IP API。"
                     if change_ip "globalping_cn_ping_failed_${FAILURE_COUNT}_times"; then
                         LAST_CHANGE_EPOCH="$(now_epoch)"
                         FAILURE_COUNT=0
                         LAST_RESULT="changed_ip"
                         LAST_RESOLVED_IP="$(resolve_target_ip 2>/dev/null || true)"
                         save_status
+                        log "✅ 自动换 IP 已完成，失败计数已清零。"
                     else
                         LAST_RESULT="change_ip_failed"
                         save_status
+                        log "❌ 自动换 IP 调用失败，保留失败计数，下一轮继续检测。"
                     fi
                 fi
             fi
         else
             LAST_RESULT="globalping_unknown"
             save_status
-            log "⚠️ Globalping 本轮结果不可用或探针异常，不计入连续失败。target=${CHECK_TARGET}，resolved_ip=${resolved_ip:-unknown}"
+            log "⚠️ 后台判定：Globalping API/探针不可用，本轮不计入连续失败。target=${CHECK_TARGET}，resolved_ip=${resolved_ip:-unknown}"
         fi
 
-        log "💤 后台检测结束，${CHECK_INTERVAL} 秒后进行下一轮。last_result=${LAST_RESULT}，failure_count=${FAILURE_COUNT}/${FAIL_THRESHOLD}"
-        sleep "$CHECK_INTERVAL"
+        log "💤 后台检测结束，${interval} 秒后进行下一轮。last_result=${LAST_RESULT}，failure_count=${FAILURE_COUNT:-0}/${FAIL_THRESHOLD}"
+        sleep "$interval"
     done
 }
 
@@ -1179,7 +1227,7 @@ self_check() {
         err "脚本语法检查失败。"
         return 1
     fi
-    for fn in install_packages quick_init install_self write_service globalping_measurement_create change_ip test_show_ip_api test_vendor_api daemon_loop view_logs view_journal_logs; do
+    for fn in install_packages quick_init install_self write_service validate_config_safe globalping_measurement_create globalping_check_target change_ip test_show_ip_api test_vendor_api daemon_loop view_logs view_journal_logs; do
         if declare -F "$fn" >/dev/null 2>&1; then
             ok "函数存在：$fn"
         else

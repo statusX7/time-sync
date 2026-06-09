@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # ============================================================
-# hinet-gfw-changeip-v1.6.sh
+# hinet-gfw-changeip-v1.7.sh
 # HiNet 被墙检测 + Globalping 中国节点 ping 弱检测 + 双 API 自动换 IP
+# v1.7 修复：后台 daemon 遇到 Globalping 返回失败码时不会被 set -e 直接退出
 # 适合上传 GitHub：脚本本身不包含任何敏感信息，敏感 API 写入 /etc 配置文件
 # ============================================================
 
 set -Eeuo pipefail
 
 APP_NAME="hinet-gfw-changeip"
-APP_VERSION="hinet-gfw-changeip-v1.6"
+APP_VERSION="hinet-gfw-changeip-v1.7"
 INSTALL_PATH="/usr/local/bin/${APP_NAME}"
 CONF_DIR="/etc/${APP_NAME}"
 CONF_FILE="${CONF_DIR}/config.env"
@@ -722,8 +723,13 @@ daemon_loop() {
         resolved_ip="$(resolve_target_ip 2>/dev/null || true)"
         LAST_RESOLVED_IP="$resolved_ip"
 
+        # 重要：globalping_check_target 返回 1 表示“CN ping 全部失败”，这是业务状态，不能让 set -e 直接退出守护进程。
+        # v1.6 的后台自动换 IP 失效核心原因就在这里：非 0 返回值会在执行到 rc=$? 之前触发 errexit。
+        log "🛰️ 后台检测开始：target=${CHECK_TARGET}，resolved_ip=${resolved_ip:-unknown}，threshold=${FAILURE_COUNT}/${FAIL_THRESHOLD}"
+        set +e
         globalping_check_target "$CHECK_TARGET"
         rc=$?
+        set -e
 
         if [[ "$rc" -eq 0 ]]; then
             FAILURE_COUNT=0
@@ -756,8 +762,10 @@ daemon_loop() {
         else
             LAST_RESULT="globalping_unknown"
             save_status
+            log "⚠️ Globalping 本轮结果不可用或探针异常，不计入连续失败。target=${CHECK_TARGET}，resolved_ip=${resolved_ip:-unknown}"
         fi
 
+        log "💤 后台检测结束，${CHECK_INTERVAL} 秒后进行下一轮。last_result=${LAST_RESULT}，failure_count=${FAILURE_COUNT}/${FAIL_THRESHOLD}"
         sleep "$CHECK_INTERVAL"
     done
 }

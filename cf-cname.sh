@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # cfcname - Cloudflare CNAME Pair-Swap Manager
-# Version: 1.9
+# Version: 2.0
 # License: MIT
 #
 # 功能简要注释：
@@ -14,7 +14,7 @@
 set -Eeuo pipefail
 
 APP_NAME="cfcname"
-APP_VERSION="1.9"
+APP_VERSION="2.0"
 INSTALL_DIR="/opt/${APP_NAME}"
 INSTALL_SCRIPT="${INSTALL_DIR}/${APP_NAME}.sh"
 INSTALL_BIN="/usr/local/bin/${APP_NAME}"
@@ -24,6 +24,10 @@ CONFIG_FILE="${CONFIG_DIR}/config.json"
 STATE_DIR="/var/lib/${APP_NAME}"
 BACKUP_DIR="${STATE_DIR}/backups"
 DEPS_MARKER="${STATE_DIR}/installed_deps.txt"
+SOURCE_URL_FILE="${CONFIG_DIR}/source_url"
+# 可选：用于远程安装/修复时重新下载完整脚本。
+# 用法示例：sudo CFCNAME_INSTALL_URL="https://raw.githubusercontent.com/USER/REPO/main/cfcname.sh" bash cfcname.sh install
+CFCNAME_INSTALL_URL="${CFCNAME_INSTALL_URL:-}"
 LOG_DIR="/var/log/${APP_NAME}"
 LOG_FILE="${LOG_DIR}/${APP_NAME}.log"
 SYSTEMD_SERVICE="/etc/systemd/system/${APP_NAME}.service"
@@ -445,6 +449,111 @@ EOF
   chmod 755 "$target"
 }
 
+
+# ---------- 远程安装源 URL ----------
+# 说明：当用户用 bash <(curl -Ls URL) 这类方式从 GitHub 运行脚本时，脚本本体通常在 /dev/fd/xx。
+# 运行到修复函数时，/dev/fd/xx 可能已无法完整读取，导致无法写入 /opt/cfcname/cfcname.sh。
+# v2.0 起支持保存 GitHub Raw URL，修复时自动重新下载完整脚本。
+normalize_install_url() {
+  local url
+  url="$(trim_text "${1:-}")"
+  printf '%s' "$url"
+}
+
+valid_install_url() {
+  [[ "${1:-}" =~ ^https?://[^[:space:]]+$ ]]
+}
+
+
+extract_url_arg() {
+  local arg next
+  while [[ $# -gt 0 ]]; do
+    arg="$1"
+    case "$arg" in
+      --url=*) normalize_install_url "${arg#--url=}"; return 0 ;;
+      --source-url=*) normalize_install_url "${arg#--source-url=}"; return 0 ;;
+      --raw-url=*) normalize_install_url "${arg#--raw-url=}"; return 0 ;;
+      --url|--source-url|--raw-url)
+        shift || true
+        next="${1:-}"
+        normalize_install_url "$next"
+        return 0
+        ;;
+    esac
+    shift || true
+  done
+  normalize_install_url "${CFCNAME_INSTALL_URL:-}"
+}
+
+save_install_url() {
+  local url
+  url="$(normalize_install_url "${1:-}")"
+  valid_install_url "$url" || return 1
+  ensure_dirs
+  printf '%s\n' "$url" > "$SOURCE_URL_FILE"
+  chmod 600 "$SOURCE_URL_FILE" 2>/dev/null || true
+}
+
+get_saved_install_url() {
+  if [[ -n "${CFCNAME_INSTALL_URL:-}" ]]; then
+    normalize_install_url "$CFCNAME_INSTALL_URL"
+    return 0
+  fi
+  if [[ -s "$SOURCE_URL_FILE" ]]; then
+    normalize_install_url "$(head -n 1 "$SOURCE_URL_FILE" 2>/dev/null || true)"
+    return 0
+  fi
+  return 1
+}
+
+prompt_install_url() {
+  local url=""
+  echo
+  echo "当前脚本无法从 /dev/fd 或临时输入流复制完整本体。"
+  echo "如果脚本放在 GitHub，请粘贴 raw.githubusercontent.com 的完整 Raw URL。"
+  echo "示例：https://raw.githubusercontent.com/USER/REPO/main/cfcname.sh"
+  echo "留空则取消。"
+  read -r -p "GitHub Raw URL: " url || true
+  url="$(normalize_install_url "$url")"
+  [[ -n "$url" ]] || return 1
+  if ! valid_install_url "$url"; then
+    echo "URL 格式不正确，只支持 http:// 或 https://。" >&2
+    return 1
+  fi
+  printf '%s' "$url"
+}
+
+download_install_script_from_url() {
+  local url="$1" tmp err marker
+  url="$(normalize_install_url "$url")"
+  valid_install_url "$url" || { echo "安装源 URL 无效：$url" >&2; return 1; }
+  marker='cfcname - Cloudflare CNAME Pair-Swap Manager'
+  tmp="$(mktemp)"
+  err="$(mktemp)"
+
+  echo "正在从安装源下载完整脚本：$url"
+  if ! curl -fsSL --connect-timeout 15 --max-time 120 "$url" -o "$tmp" 2>"$err"; then
+    echo "下载失败：$url" >&2
+    sed 's/^/curl: /' "$err" >&2 || true
+    rm -f "$tmp" "$err"
+    return 1
+  fi
+  rm -f "$err"
+
+  if [[ ! -s "$tmp" ]] || ! grep -qF "$marker" "$tmp"; then
+    echo "下载内容不像 cfcname 完整脚本，已拒绝写入。" >&2
+    echo "请确认使用的是 GitHub Raw 地址，而不是 GitHub 网页地址。" >&2
+    rm -f "$tmp"
+    return 1
+  fi
+
+  install -m 755 "$tmp" "$INSTALL_SCRIPT"
+  rm -f "$tmp"
+  save_install_url "$url" || true
+  echo "已从安装源写入主程序：$INSTALL_SCRIPT"
+  return 0
+}
+
 verify_launcher() {
   local ok=1
   for f in "$INSTALL_SCRIPT" "$INSTALL_BIN" "$INSTALL_BIN_COMPAT"; do
@@ -459,9 +568,11 @@ verify_launcher() {
 }
 
 copy_current_script_to_install_dir() {
-  # 说明：修复 / 安装时，把当前正在运行的完整脚本写入 /opt/cfcname/cfcname.sh。
-  # 重点修复：通过 sudo bash xxx.sh install/repair 运行时，管理命令没有落盘的问题。
-  local src tmp marker copied=0
+  # 说明：修复 / 安装时，把完整脚本写入 /opt/cfcname/cfcname.sh。
+  # v2.0 重点修复：支持 GitHub 远程执行场景。
+  # - 本地文件运行：直接复制当前脚本。
+  # - bash <(curl ...)：如果 fd 无法完整读取，则使用 CFCNAME_INSTALL_URL / 已保存 URL / 手动粘贴 Raw URL 下载。
+  local src tmp marker copied=0 provided_url="${1:-}" saved_url=""
   mkdir -p "$INSTALL_DIR"
 
   if [[ -s "$INSTALL_SCRIPT" && "$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || true)" == "$(readlink -f "$INSTALL_SCRIPT" 2>/dev/null || true)" ]]; then
@@ -472,8 +583,7 @@ copy_current_script_to_install_dir() {
   marker='cfcname - Cloudflare CNAME Pair-Swap Manager'
   tmp="$(mktemp)"
 
-  # 优先使用 BASH_SOURCE[0]，再尝试 $0 和 readlink 后路径。
-  # 不直接依赖 /dev/fd，因为部分环境下 fd 被读取后会变空。
+  # 优先尝试复制当前运行文件。适用于 sudo bash cfcname_v2.0.sh install 这种本地文件方式。
   local candidates=()
   candidates+=("${BASH_SOURCE[0]:-}")
   candidates+=("${0:-}")
@@ -490,10 +600,30 @@ copy_current_script_to_install_dir() {
       break
     fi
   done
-
   rm -f "$tmp"
+
   if [[ "$copied" -eq 1 && -s "$INSTALL_SCRIPT" ]]; then
+    [[ -n "$provided_url" ]] && save_install_url "$provided_url" || true
     return 0
+  fi
+
+  # 如果当前入口无法复制，尝试 URL 下载。
+  provided_url="$(normalize_install_url "$provided_url")"
+  if [[ -z "$provided_url" ]]; then
+    saved_url="$(get_saved_install_url 2>/dev/null || true)"
+  else
+    saved_url="$provided_url"
+  fi
+  if [[ -n "$saved_url" ]] && valid_install_url "$saved_url"; then
+    download_install_script_from_url "$saved_url" && return 0
+  fi
+
+  # 交互式修复时允许用户粘贴 GitHub Raw URL。
+  if [[ -t 0 ]]; then
+    saved_url="$(prompt_install_url || true)"
+    if [[ -n "$saved_url" ]] && valid_install_url "$saved_url"; then
+      download_install_script_from_url "$saved_url" && return 0
+    fi
   fi
 
   if [[ -s "$INSTALL_SCRIPT" ]]; then
@@ -502,15 +632,21 @@ copy_current_script_to_install_dir() {
   fi
 
   echo "无法写入主程序：${INSTALL_SCRIPT}" >&2
-  echo "请把完整脚本保存为文件后执行：sudo bash cfcname_v${APP_VERSION}.sh repair" >&2
+  echo "原因：当前脚本可能来自 /dev/fd，无法复制完整本体。" >&2
+  echo "推荐方式一：先保存再安装：" >&2
+  echo "  curl -fsSL https://raw.githubusercontent.com/USER/REPO/main/cfcname.sh -o /tmp/cfcname.sh" >&2
+  echo "  sudo bash /tmp/cfcname.sh install --url https://raw.githubusercontent.com/USER/REPO/main/cfcname.sh" >&2
+  echo "推荐方式二：远程执行时显式传入 URL：" >&2
+  echo "  sudo CFCNAME_INSTALL_URL=https://raw.githubusercontent.com/USER/REPO/main/cfcname.sh bash <(curl -fsSL https://raw.githubusercontent.com/USER/REPO/main/cfcname.sh) install" >&2
   return 1
 }
 
 repair_management_commands() {
   # 说明：只修复 cfcname 管理命令入口，不改配置、不改任务。
+  local url="${1:-}"
   need_root
   ensure_dirs
-  copy_current_script_to_install_dir || return 1
+  copy_current_script_to_install_dir "$url" || return 1
   write_launcher "$INSTALL_BIN"
   write_launcher "$INSTALL_BIN_COMPAT"
   hash -r 2>/dev/null || true
@@ -524,10 +660,47 @@ repair_dependencies() {
   install_deps
 }
 
+
+set_install_url_interactive() {
+  # 说明：保存 GitHub Raw URL，后续 repair/install 可自动重新下载完整脚本。
+  need_root
+  ensure_dirs
+  local current url
+  current="$(get_saved_install_url 2>/dev/null || true)"
+  echo
+  echo "当前安装源 URL：${current:-未设置}"
+  echo "请输入 GitHub Raw URL，例如："
+  echo "https://raw.githubusercontent.com/USER/REPO/main/cfcname.sh"
+  echo
+  read -r -p "新的安装源 URL: " url || true
+  url="$(normalize_install_url "$url")"
+  if [[ -z "$url" ]]; then
+    echo "已取消。"
+    return 0
+  fi
+  if ! valid_install_url "$url"; then
+    echo "URL 格式不正确，只支持 http:// 或 https://。" >&2
+    return 1
+  fi
+  save_install_url "$url"
+  echo "已保存安装源 URL：$url"
+}
+
+repair_from_url_interactive() {
+  # 说明：专用于 GitHub 远程脚本场景，粘贴 Raw URL 后下载完整脚本并修复入口。
+  need_root
+  ensure_dirs
+  local url
+  url="$(prompt_install_url || true)"
+  [[ -n "$url" ]] || { echo "已取消。"; return 0; }
+  repair_all "$url"
+}
+
 repair_scheduler() {
   # 说明：修复定时服务。会先确保管理命令存在，再重建 systemd timer 或 cron。
+  local url="${1:-}"
   need_root
-  repair_management_commands || return 1
+  repair_management_commands "$url" || return 1
   disable_scheduler || true
   setup_scheduler
   log_msg INFO "已修复定时服务。"
@@ -535,11 +708,12 @@ repair_scheduler() {
 
 repair_all() {
   # 说明：一键修复依赖、主程序、管理命令、配置目录、定时服务。
+  local url="${1:-}"
   need_root
   repair_dependencies
   ensure_dirs
   migrate_config
-  repair_management_commands || return 1
+  repair_management_commands "$url" || return 1
   disable_scheduler || true
   setup_scheduler
   echo
@@ -555,12 +729,15 @@ repair_menu() {
     section_title "修复工具"
     echo "用于修复依赖、管理命令、主程序入口、定时服务。"
     echo "不会修改你的 CNAME 任务内容，也不会删除 Token。"
+    echo "如果脚本来自 GitHub 远程执行，建议先设置/粘贴 Raw URL。"
     echo
     menu_item 1 "一键修复：依赖 + 主程序 + 管理命令 + 定时服务"
     menu_item 2 "只检测/安装缺失依赖"
     menu_item 3 "只修复管理命令 cfcname"
     menu_item 4 "只修复定时服务 systemd timer / cron"
     menu_item 5 "运行自检"
+    menu_item 6 "设置 / 更新 GitHub Raw 安装源 URL"
+    menu_item 7 "粘贴 GitHub Raw URL 并一键修复"
     menu_item 0 "返回主菜单"
     echo
     local ans
@@ -572,6 +749,8 @@ repair_menu() {
       3) repair_management_commands; pause_enter ;;
       4) repair_scheduler; pause_enter ;;
       5) self_check; pause_enter ;;
+      6) set_install_url_interactive; pause_enter ;;
+      7) repair_from_url_interactive; pause_enter ;;
       0) return 0 ;;
       *) log_msg WARN "无效选项"; pause_enter ;;
     esac
@@ -603,12 +782,13 @@ remove_marked_deps() {
 }
 
 install_self() {
+  local url="${1:-}"
   need_root
   install_deps
   ensure_dirs
   migrate_config
 
-  copy_current_script_to_install_dir || exit 1
+  copy_current_script_to_install_dir "$url" || exit 1
 
   # 同时写入 /usr/local/bin 和 /usr/bin，解决 sudo secure_path 或 PATH 不一致导致的 command not found/空入口问题。
   write_launcher "$INSTALL_BIN"
@@ -628,6 +808,7 @@ install_self() {
 }
 
 uninstall_self() {
+  local url="${1:-}"
   need_root
   print_header
   section_title "卸载 cfcname"
@@ -1934,7 +2115,7 @@ self_check() {
   if validate_config_file; then echo "✅ 配置 JSON 正常：${CONFIG_FILE}"; else echo "❌ 配置 JSON 异常：${CONFIG_FILE}"; ok=0; fi
   if [[ -x "$INSTALL_BIN" ]]; then echo "✅ 管理命令存在：${INSTALL_BIN}"; else echo "⚠️  管理命令不存在：${INSTALL_BIN}"; fi
   if [[ -x "$INSTALL_BIN_COMPAT" || -L "$INSTALL_BIN_COMPAT" ]]; then echo "✅ sudo 兼容命令存在：${INSTALL_BIN_COMPAT}"; else echo "⚠️  sudo 兼容命令不存在：${INSTALL_BIN_COMPAT}"; fi
-  if command -v cfcname >/dev/null 2>&1; then echo "✅ 当前 PATH 可找到：$(command -v cfcname)"; else echo "⚠️  当前 PATH 找不到 cfcname，可执行 sudo bash $0 repair 修复。"; fi
+  if command -v cfcname >/dev/null 2>&1; then echo "✅ 当前 PATH 可找到：$(command -v cfcname)"; else echo "⚠️  当前 PATH 找不到 cfcname，可执行 sudo bash $0 install 修复。"; fi
   for f in "$INSTALL_SCRIPT" "$INSTALL_BIN" "$INSTALL_BIN_COMPAT"; do
     if [[ -s "$f" ]]; then echo "✅ 入口文件正常：$f"; else echo "⚠️  入口文件不存在或为空：$f"; ok=0; fi
   done
@@ -1997,19 +2178,22 @@ usage() {
 cfcname v${APP_VERSION}
 
 用法：
-  sudo bash cfcname_v${APP_VERSION}.sh install     安装/更新管理命令 cfcname
-  cfcname                                         打开菜单（非 root 会自动尝试 sudo）
-  sudo cfcname                                    打开菜单
-  sudo cfcname run --quiet                       定时器调用，按当前时间执行
-  sudo cfcname run --force                       立即强制执行所有启用任务
-  sudo cfcname start                             启动定时服务
-  sudo cfcname stop                              停止定时服务
-  sudo cfcname restart                           重启定时服务
-  sudo cfcname status                            查看定时服务状态
-  sudo cfcname self-check                        自检
-  sudo cfcname repair                            一键修复依赖/管理命令/定时服务
-  sudo cfcname repair-menu                       打开修复工具菜单
-  sudo cfcname uninstall                         卸载
+  sudo bash cfcname_v${APP_VERSION}.sh install                         本地文件安装/更新
+  sudo bash cfcname_v${APP_VERSION}.sh install --url <GitHubRawURL>     安装并保存 GitHub Raw URL
+  sudo CFCNAME_INSTALL_URL=<GitHubRawURL> bash cfcname.sh install       通过环境变量指定安装源
+  cfcname                                                             打开菜单（非 root 会自动尝试 sudo）
+  sudo cfcname                                                        打开菜单
+  sudo cfcname run --quiet                                           定时器调用，按当前时间执行
+  sudo cfcname run --force                                           立即强制执行所有启用任务
+  sudo cfcname start                                                 启动定时服务
+  sudo cfcname stop                                                  停止定时服务
+  sudo cfcname restart                                               重启定时服务
+  sudo cfcname status                                                查看定时服务状态
+  sudo cfcname self-check                                            自检
+  sudo cfcname repair                                                一键修复依赖/管理命令/定时服务
+  sudo cfcname repair --url <GitHubRawURL>                            用 GitHub Raw URL 修复远程安装
+  sudo cfcname set-url                                               设置/更新 GitHub Raw 安装源 URL
+  sudo cfcname uninstall                                             卸载
 
 核心逻辑：
   正常/恢复模式：记录A -> 目标A，记录B -> 目标B
@@ -2024,7 +2208,7 @@ main() {
   local cmd="${1:-menu}"
   [[ -z "$cmd" ]] && cmd="menu"
   case "$cmd" in
-    install) install_self ;;
+    install) shift || true; install_self "$(extract_url_arg "$@")" ;;
     uninstall) uninstall_self ;;
     menu) main_menu ;;
     run)
@@ -2046,11 +2230,12 @@ main() {
     restart) scheduler_restart ;;
     status) need_root; migrate_config; scheduler_status ;;
     self-check|check) need_root; migrate_config; self_check ;;
-    repair) repair_all ;;
+    repair) shift || true; repair_all "$(extract_url_arg "$@")" ;;
     repair-menu) repair_menu ;;
-    repair-cmd|fix-cmd) repair_management_commands ;;
+    repair-cmd|fix-cmd) shift || true; repair_management_commands "$(extract_url_arg "$@")" ;;
     repair-deps|fix-deps) repair_dependencies ;;
-    repair-scheduler|fix-scheduler) repair_scheduler ;;
+    repair-scheduler|fix-scheduler) shift || true; repair_scheduler "$(extract_url_arg "$@")" ;;
+    set-url|source-url) set_install_url_interactive ;;
     help|-h|--help) usage ;;
     *) usage; exit 1 ;;
   esac

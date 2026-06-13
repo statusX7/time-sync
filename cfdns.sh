@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# cfdns v2.0 installer
+# cfdns v2.1 installer
 # Cloudflare DNS multi-group A-record incremental sync tool
 
 APP_NAME="cf-dns-sync"
@@ -101,7 +101,7 @@ TSV
 write_sync_script() {
   cat > "${BIN_SYNC}" <<'SYNC'
 #!/usr/bin/env bash
-set -euo pipefail
+set -uo pipefail
 
 BASE_DIR="/etc/cf-dns-sync"
 VAR_DIR="/var/lib/cf-dns-sync"
@@ -154,7 +154,9 @@ log() {
     touch "${LOG_FILE}"
     chmod 600 "${LOG_FILE}"
     echo "[$(timestamp)] [${level}] ${msg}" >> "${LOG_FILE}"
-    echo "[$(timestamp)] [${level}] ${msg}" | systemd-cat -t cf-dns-sync
+    if command -v systemd-cat >/dev/null 2>&1; then
+      echo "[$(timestamp)] [${level}] ${msg}" | systemd-cat -t cf-dns-sync 2>/dev/null || true
+    fi
   fi
 }
 
@@ -174,17 +176,37 @@ cf_api() {
   local token="$2"
   local endpoint="$3"
   local data="${4:-}"
+  local resp rc
 
   if [[ -n "${data}" ]]; then
-    curl -sS -X "${method}" "https://api.cloudflare.com/client/v4${endpoint}" \
+    resp="$(curl -sS --connect-timeout 10 --max-time 35 --retry 2 --retry-delay 1 \
+      -X "${method}" "https://api.cloudflare.com/client/v4${endpoint}" \
       -H "Authorization: Bearer ${token}" \
       -H "Content-Type: application/json" \
-      --data "${data}"
+      --data "${data}" 2>&1)"
+    rc=$?
   else
-    curl -sS -X "${method}" "https://api.cloudflare.com/client/v4${endpoint}" \
+    resp="$(curl -sS --connect-timeout 10 --max-time 35 --retry 2 --retry-delay 1 \
+      -X "${method}" "https://api.cloudflare.com/client/v4${endpoint}" \
       -H "Authorization: Bearer ${token}" \
-      -H "Content-Type: application/json"
+      -H "Content-Type: application/json" 2>&1)"
+    rc=$?
   fi
+
+  if [[ "${rc}" -ne 0 ]]; then
+    jq -nc --arg msg "curl failed rc=${rc}: ${resp}" '{success:false,result:null,errors:[{message:$msg}]}' 2>/dev/null || printf '{"success":false,"result":null,"errors":[{"message":"curl failed"}]}
+'
+    return 0
+  fi
+
+  if ! printf '%s' "${resp}" | jq . >/dev/null 2>&1; then
+    jq -nc --arg msg "non-json response: ${resp}" '{success:false,result:null,errors:[{message:$msg}]}' 2>/dev/null || printf '{"success":false,"result":null,"errors":[{"message":"non-json response"}]}
+'
+    return 0
+  fi
+
+  printf '%s
+' "${resp}"
 }
 
 normalize_sources_csv() {
@@ -423,9 +445,12 @@ sync_one_group() {
     : > "${tmp_old_state}"
   fi
 
-  log DEBUG "组 ${group_name}: 开始同步 -> ${target_fqdn}"
+  log DEBUG "组 ${group_name}: 开始同步 -> ${target_fqdn}，源域名数量=${source_count}"
 
-  get_group_map "${mode}" "${SOURCES_ARRAY[@]}" | sort -u > "${map_file}"
+  if ! get_group_map "${mode}" "${SOURCES_ARRAY[@]}" | sort -u > "${map_file}"; then
+    log ERROR "组 ${group_name}: 源域名解析流程异常，但不会让 service 失败；请使用菜单自检/解析测试定位"
+    : > "${map_file}"
+  fi
 
   if [[ ! -s "${map_file}" ]]; then
     log ERROR "组 ${group_name}: 未查询到任何源 IPv4，跳过同步"
@@ -538,7 +563,7 @@ SYNC
 write_ctl_script() {
   cat > "${BIN_CTL}" <<'CTL'
 #!/usr/bin/env bash
-set -euo pipefail
+set -uo pipefail
 
 APP_NAME="cf-dns-sync"
 BASE_DIR="/etc/${APP_NAME}"
@@ -581,9 +606,9 @@ line() {
 title() {
   clear 2>/dev/null || true
   line
-  color "1;36" "                          🚀 cfdns 管理菜单 v2.0"
+  color "1;36" "                          🚀 cfdns 管理菜单 v2.1"
   echo
-  color "0;37" "  多组目标域名 / 独立周期 / 历史二级菜单 / 当前解析IP / 批量导入导出"
+  color "0;37" "  多组目标域名 / 独立周期 / 历史二级菜单 / 自检修复 / 当前解析IP / 批量导入导出"
   line
 }
 
@@ -1437,6 +1462,206 @@ history_menu() {
   done
 }
 
+self_check() {
+  local errors=0 warnings=0 group_count=0 enabled_count=0
+  echo "🩺 cfdns v2.1 自检"
+  line
+
+  check_ok() { printf "✅ %s\n" "$*"; }
+  check_warn() { warnings=$((warnings+1)); printf "⚠️  %s\n" "$*"; }
+  check_fail() { errors=$((errors+1)); printf "❌ %s\n" "$*"; }
+
+  [[ "$(id -u)" -eq 0 ]] && check_ok "当前为 root 用户" || check_fail "请使用 root 运行 cfdns"
+
+  for d in "${BASE_DIR}" "${VAR_DIR}"; do
+    [[ -d "${d}" ]] && check_ok "目录存在：${d}" || check_fail "目录不存在：${d}"
+  done
+
+  [[ -f "${SETTINGS_FILE}" ]] && check_ok "全局配置存在：${SETTINGS_FILE}" || check_fail "全局配置不存在：${SETTINGS_FILE}"
+  [[ -f "${GROUPS_FILE}" ]] && check_ok "组配置存在：${GROUPS_FILE}" || check_fail "组配置不存在：${GROUPS_FILE}"
+  [[ -x /usr/local/bin/cfdns ]] && check_ok "管理命令存在且可执行：/usr/local/bin/cfdns" || check_fail "管理命令缺失或不可执行：/usr/local/bin/cfdns"
+  [[ -x /usr/local/bin/cf-dns-sync.sh ]] && check_ok "同步脚本存在且可执行：/usr/local/bin/cf-dns-sync.sh" || check_fail "同步脚本缺失或不可执行：/usr/local/bin/cf-dns-sync.sh"
+
+  bash -n /usr/local/bin/cfdns >/dev/null 2>&1 && check_ok "管理脚本语法正常" || check_fail "管理脚本语法异常"
+  bash -n /usr/local/bin/cf-dns-sync.sh >/dev/null 2>&1 && check_ok "同步脚本语法正常" || check_fail "同步脚本语法异常"
+
+  for cmd in curl jq dig flock logrotate zcat awk sed grep comm mktemp paste cut tr date wc systemctl; do
+    command -v "${cmd}" >/dev/null 2>&1 && check_ok "依赖存在：${cmd}" || check_fail "缺少依赖：${cmd}"
+  done
+
+  case "${LOG_LEVEL:-INFO}" in
+    NONE|ERROR|INFO|DEBUG) check_ok "LOG_LEVEL 合法：${LOG_LEVEL:-INFO}" ;;
+    *) check_warn "LOG_LEVEL 非标准：${LOG_LEVEL:-unset}，建议设为 NONE/ERROR/INFO/DEBUG" ;;
+  esac
+
+  if [[ -f "${GROUPS_FILE}" ]]; then
+    local line_no=0 name enabled interval token zone target ttl proxied mode sources_csv src_count seen_names="|"
+    while IFS=$'\t' read -r name enabled interval token zone target ttl proxied mode sources_csv extra; do
+      line_no=$((line_no+1))
+      [[ -z "${name}" ]] && continue
+      [[ "${name}" =~ ^# ]] && continue
+      group_count=$((group_count+1))
+
+      [[ -z "${extra:-}" ]] || check_warn "groups.tsv 第 ${line_no} 行字段过多，可能包含多余 TAB"
+      if [[ "${seen_names}" == *"|${name}|"* ]]; then
+        check_fail "组名重复：${name}"
+      else
+        seen_names="${seen_names}${name}|"
+      fi
+
+      [[ "${enabled}" == "true" || "${enabled}" == "false" ]] || check_fail "组 ${name}: enabled 必须为 true/false"
+      [[ "${enabled}" == "true" ]] && enabled_count=$((enabled_count+1))
+      [[ "${interval}" =~ ^[0-9]+$ && "${interval}" -ge 60 ]] || check_fail "组 ${name}: interval_sec 必须是 >=60 的数字"
+      [[ -n "${token}" ]] || check_fail "组 ${name}: API Token 为空"
+      [[ "${zone}" =~ ^[a-fA-F0-9]{32}$ ]] || check_warn "组 ${name}: Zone ID 看起来不像 32 位十六进制"
+      [[ "${target}" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}\.?$ ]] || check_warn "组 ${name}: 目标域名格式可疑：${target}"
+      [[ "${ttl}" =~ ^[0-9]+$ ]] || check_fail "组 ${name}: TTL 必须是数字"
+      [[ "${proxied}" == "false" ]] || check_fail "组 ${name}: proxied 当前仅支持 false"
+      [[ "${mode}" == "ALL_IPS" || "${mode}" == "SINGLE_IP" ]] || check_fail "组 ${name}: mode 必须为 ALL_IPS/SINGLE_IP"
+      src_count="$(count_sources_csv "${sources_csv:-}")"
+      [[ "${src_count}" -ge 1 && "${src_count}" -le 20 ]] || check_fail "组 ${name}: 源域名数量必须为 1~20，当前 ${src_count}"
+    done < "${GROUPS_FILE}"
+  fi
+
+  [[ "${group_count}" -gt 0 ]] && check_ok "已配置组数量：${group_count}" || check_warn "当前没有任何组，timer 会空跑但不再失败"
+  [[ "${enabled_count}" -gt 0 ]] && check_ok "启用组数量：${enabled_count}" || check_warn "当前没有启用组"
+
+  [[ -f /etc/systemd/system/cf-dns-sync.service ]] && check_ok "systemd service 存在" || check_fail "systemd service 不存在"
+  [[ -f /etc/systemd/system/cf-dns-sync.timer ]] && check_ok "systemd timer 存在" || check_fail "systemd timer 不存在"
+  systemctl is-active --quiet cf-dns-sync.timer && check_ok "timer 正在运行" || check_warn "timer 未运行"
+  systemctl is-failed --quiet cf-dns-sync.service && check_warn "service 当前处于 failed 状态，建议执行一键修复" || check_ok "service 未处于 failed 状态"
+
+  if command -v cfcname >/dev/null 2>&1 || [[ -f /etc/systemd/system/cfcname.service || -f /etc/cfcname/config.json ]]; then
+    check_warn "检测到 cfcname。二者命令、service、配置目录不同，通常不直接冲突；若同一域名同时被两个脚本管理，需要避免记录类型/目标重叠。"
+    if [[ -f /etc/cfcname/config.json && -f "${GROUPS_FILE}" ]]; then
+      while IFS=$'\t' read -r name enabled interval token zone target ttl proxied mode sources_csv; do
+        [[ -z "${name}" || "${name}" =~ ^# ]] && continue
+        if grep -Fq "${target}" /etc/cfcname/config.json 2>/dev/null; then
+          check_warn "目标域名 ${target} 也出现在 /etc/cfcname/config.json 中，请确认没有被两个脚本同时管理"
+        fi
+      done < "${GROUPS_FILE}"
+    fi
+  else
+    check_ok "未检测到 cfcname 运行环境"
+  fi
+
+  line
+  echo "自检完成：errors=${errors}, warnings=${warnings}"
+  if [[ "${errors}" -gt 0 ]]; then
+    return 1
+  fi
+  return 0
+}
+
+one_key_repair() {
+  echo "🧯 cfdns 一键修复"
+  line
+
+  if [[ "$(id -u)" -ne 0 ]]; then
+    echo "请使用 root 运行。"
+    return 1
+  fi
+
+  local missing_pkgs=()
+  command -v curl >/dev/null 2>&1 || missing_pkgs+=("curl")
+  command -v jq >/dev/null 2>&1 || missing_pkgs+=("jq")
+  if ! command -v dig >/dev/null 2>&1; then
+    if command -v apt-get >/dev/null 2>&1; then
+      missing_pkgs+=("dnsutils")
+    else
+      missing_pkgs+=("bind-utils")
+    fi
+  fi
+  command -v logrotate >/dev/null 2>&1 || missing_pkgs+=("logrotate")
+  command -v zcat >/dev/null 2>&1 || missing_pkgs+=("gzip")
+
+  if [[ "${#missing_pkgs[@]}" -gt 0 ]]; then
+    echo "检测到缺少依赖：${missing_pkgs[*]}"
+    if command -v apt-get >/dev/null 2>&1; then
+      apt-get update || true
+      apt-get install -y "${missing_pkgs[@]}" || true
+    elif command -v dnf >/dev/null 2>&1; then
+      dnf install -y "${missing_pkgs[@]}" || true
+    elif command -v yum >/dev/null 2>&1; then
+      yum install -y "${missing_pkgs[@]}" || true
+    else
+      echo "未识别包管理器，请手动安装：${missing_pkgs[*]}"
+    fi
+  fi
+
+  mkdir -p "${BASE_DIR}" "${VAR_DIR}" /var/log
+  chmod 700 "${BASE_DIR}" "${VAR_DIR}" 2>/dev/null || true
+
+  if [[ ! -f "${SETTINGS_FILE}" ]]; then
+    cat > "${SETTINGS_FILE}" <<'CFG'
+LOG_LEVEL="INFO"
+CFG
+    echo "已重建 settings.conf"
+  fi
+
+  if [[ ! -f "${GROUPS_FILE}" ]]; then
+    cat > "${GROUPS_FILE}" <<'TSV'
+# group_name<TAB>enabled<TAB>interval_sec<TAB>api_token<TAB>zone_id<TAB>target_fqdn<TAB>ttl<TAB>proxied<TAB>mode<TAB>source_domains_csv
+TSV
+    echo "已重建 groups.tsv 空配置"
+  fi
+
+  sed -i 's/\r$//' "${SETTINGS_FILE}" "${GROUPS_FILE}" 2>/dev/null || true
+  chmod 600 "${SETTINGS_FILE}" "${GROUPS_FILE}" 2>/dev/null || true
+  touch "${HISTORY_FILE}" "${RUNSTATE_FILE}" "${LOG_FILE}" 2>/dev/null || true
+  chmod 600 "${HISTORY_FILE}" "${RUNSTATE_FILE}" "${LOG_FILE}" 2>/dev/null || true
+
+  chmod +x /usr/local/bin/cfdns /usr/local/bin/cf-dns-sync.sh 2>/dev/null || true
+
+  cat > /etc/systemd/system/cf-dns-sync.service <<'SERVICE'
+[Unit]
+Description=Cloudflare DNS Multi-Group Incremental Sync Service
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/cf-dns-sync.sh ALL
+User=root
+Group=root
+SERVICE
+
+  cat > /etc/systemd/system/cf-dns-sync.timer <<'TIMER'
+[Unit]
+Description=Run Cloudflare DNS Multi-Group Incremental Sync every minute
+
+[Timer]
+OnCalendar=*-*-* *:*:00
+AccuracySec=1s
+Persistent=true
+Unit=cf-dns-sync.service
+
+[Install]
+WantedBy=timers.target
+TIMER
+
+  cat > /etc/logrotate.d/cf-dns-sync <<'ROTATE'
+/var/log/cf-dns-sync.log /var/log/cf-dns-sync-history.tsv {
+    monthly
+    rotate 12
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    create 600 root root
+}
+ROTATE
+
+  systemctl daemon-reload || true
+  systemctl reset-failed cf-dns-sync.service cf-dns-sync.timer 2>/dev/null || true
+  systemctl enable --now cf-dns-sync.timer || true
+  /usr/local/bin/cf-dns-sync.sh ALL || true
+  systemctl start cf-dns-sync.service || true
+
+  echo "一键修复已完成。建议再执行一次自检，并查看 service/timer 状态。"
+}
+
 edit_raw_files() {
   echo
   echo "1. 📝 编辑 settings.conf（全局日志等级）"
@@ -1506,10 +1731,12 @@ menu() {
     echo " 21.  📌 查看单组运行日志（One Group Logs / 单组日志）"
     echo " 22.  🩺 查看 service/timer 状态（Status / 状态）"
     echo " 23.  🧰 查看依赖状态（Dependencies / 依赖）"
-    echo " 24.  🕓 查看各组上次执行时间（Run State / 执行状态）"
-    echo " 25.  📜 查看域名 IP 历史记录（History / 历史记录）"
-    echo " 26.  🛠️  编辑原始配置文件（Edit Raw Files / 原始配置）"
-    echo " 27.  💣 彻底卸载（Uninstall / 卸载）"
+    echo " 24.  🔎 脚本自检（Self Check / 自检）"
+    echo " 25.  🧯 一键修复（Repair / 修复）"
+    echo " 26.  🕓 查看各组上次执行时间（Run State / 执行状态）"
+    echo " 27.  📜 查看域名 IP 历史记录（History / 历史记录）"
+    echo " 28.  🛠️  编辑原始配置文件（Edit Raw Files / 原始配置）"
+    echo " 29.  💣 彻底卸载（Uninstall / 卸载）"
     echo "  0.  🚪 退出（Exit / 退出）"
     line
     if ! read -rp "请选择: " choice; then
@@ -1540,10 +1767,12 @@ menu() {
       21) show_group_runtime_logs; pause_wait ;;
       22) show_status; pause_wait ;;
       23) show_dep_status; pause_wait ;;
-      24) show_runstate; pause_wait ;;
-      25) history_menu ;;
-      26) edit_raw_files ;;
-      27) uninstall_all ;;
+      24) self_check; pause_wait ;;
+      25) one_key_repair; pause_wait ;;
+      26) show_runstate; pause_wait ;;
+      27) history_menu ;;
+      28) edit_raw_files ;;
+      29) uninstall_all ;;
       0) exit 0 ;;
       *) echo "无效选择"; sleep 1 ;;
     esac
@@ -1623,14 +1852,16 @@ main() {
   fi
 
   echo
-  echo "安装/升级完成: v2.0"
+  echo "安装/升级完成: v2.1"
   echo "管理命令: cfdns"
   echo "组配置文件: ${GROUPS_FILE}"
   echo "全局设置文件: ${SETTINGS_FILE}"
   echo "同步脚本: ${BIN_SYNC}"
   echo "日志文件: ${LOG_FILE}"
   echo "历史文件: ${HISTORY_FILE}"
-  echo "日志轮转: ${LOGROTATE_FILE}"
+  echo "日志轮转: ${LOGROTATE_FILE}
+  自检功能: cfdns 菜单 24
+  一键修复: cfdns 菜单 25"
   echo
   if [[ "${CFDNS_NO_START:-0}" != "1" ]]; then
     systemctl status "${APP_NAME}.timer" --no-pager -l || true

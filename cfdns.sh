@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# cfdns v2.3 installer
+# cfdns v2.4 installer
 # Cloudflare DNS multi-group A-record incremental sync tool
 
 APP_NAME="cf-dns-sync"
-APP_VERSION="2.3"
+APP_VERSION="2.4"
 INSTALL_DIR="/opt/cfdns"
 INSTALL_COPY="${INSTALL_DIR}/cfdns-installer.sh"
 BASE_DIR="/etc/${APP_NAME}"
@@ -116,7 +116,7 @@ write_sync_script() {
 #!/usr/bin/env bash
 set -uo pipefail
 
-APP_VERSION="2.3"
+APP_VERSION="2.4"
 BASE_DIR="/etc/cf-dns-sync"
 VAR_DIR="/var/lib/cf-dns-sync"
 SETTINGS_FILE="${BASE_DIR}/settings.conf"
@@ -613,7 +613,7 @@ write_ctl_script() {
 set -uo pipefail
 
 APP_NAME="cf-dns-sync"
-APP_VERSION="2.3"
+APP_VERSION="2.4"
 BASE_DIR="/etc/${APP_NAME}"
 VAR_DIR="/var/lib/${APP_NAME}"
 SETTINGS_FILE="${BASE_DIR}/settings.conf"
@@ -664,9 +664,9 @@ line() {
 title() {
   clear 2>/dev/null || true
   line
-  color "1;36" "                          🚀 cfdns 管理菜单 v2.3"
+  color "1;36" "                          🚀 cfdns 管理菜单 v2.4"
   echo
-  color "0;37" "  5秒本机检测 / 安全DNS联动 / 历史查看修复 / 日志清理 / 自检修复 / 多组独立周期"
+  color "0;37" "  5秒本机检测 / 跨轮转日志查看 / 安全DNS联动 / 自检修复 / 多组独立周期"
   line
 }
 
@@ -699,6 +699,23 @@ count_sources_csv() {
   normalized="$(normalize_sources_csv "${1}")"
   [[ -z "${normalized}" ]] && { echo 0; return; }
   awk -F',' '{print NF}' <<< "${normalized}"
+}
+
+valid_ttl() {
+  local ttl="${1:-}"
+  [[ "${ttl}" =~ ^[0-9]+$ ]] || return 1
+  [[ "${ttl}" -eq 1 || ( "${ttl}" -ge 60 && "${ttl}" -le 86400 ) ]]
+}
+
+validate_sources_csv() {
+  local csv="${1:-}" count domain
+  count="$(count_sources_csv "${csv}")"
+  [[ "${count}" -ge 1 && "${count}" -le 20 ]] || return 1
+  parse_sources_to_array "${csv}"
+  for domain in "${SOURCES_ARRAY[@]}"; do
+    valid_domain "${domain}" || return 1
+  done
+  return 0
 }
 
 save_groups_with_tmp() {
@@ -912,14 +929,27 @@ run_init_wizard() {
   line
   read -rp "请选择 [1-2]: " wizard_choice
 
+  local before_count after_count
+  before_count="$(get_group_count)"
   case "${wizard_choice}" in
-    1) quick_add_first_group ;;
-    2|"") ;;
-    *) ;;
+    1)
+      quick_add_first_group
+      after_count="$(get_group_count)"
+      if [[ "${after_count}" -gt "${before_count}" ]]; then
+        touch "${INIT_FLAG}"
+        chmod 600 "${INIT_FLAG}"
+      else
+        echo "初始化未完成，下次进入 cfdns 时仍会显示快速初始化向导。"
+      fi
+      ;;
+    2|"")
+      touch "${INIT_FLAG}"
+      chmod 600 "${INIT_FLAG}"
+      ;;
+    *)
+      echo "无效选择；初始化状态未写入。"
+      ;;
   esac
-
-  touch "${INIT_FLAG}"
-  chmod 600 "${INIT_FLAG}"
 }
 
 quick_add_first_group() {
@@ -941,7 +971,7 @@ quick_add_first_group() {
   duplicate="$(find_duplicate_target "${zone_id}" "${target_fqdn}")"
   [[ -z "${duplicate}" ]] || { echo "目标域名已由组 ${duplicate} 管理，禁止重复管理"; return; }
   read -rp "TTL（推荐60）: " ttl || return
-  [[ "${ttl}" =~ ^[0-9]+$ ]] || { echo "TTL 必须为数字"; return; }
+  valid_ttl "${ttl}" || { echo "TTL 必须为 1（自动）或 60~86400 秒"; return; }
 
   echo "解析模式："
   echo "1. 🌐 ALL_IPS（全部IP模式）"
@@ -954,6 +984,7 @@ quick_add_first_group() {
   sources_csv="$(normalize_sources_csv "${sources_csv}")"
   src_count="$(count_sources_csv "${sources_csv}")"
   [[ "${src_count}" -ge 1 && "${src_count}" -le 20 ]] || { echo "源域名数量必须为1~20"; return; }
+  validate_sources_csv "${sources_csv}" || { echo "源域名列表中存在格式错误的域名"; return; }
 
   printf '%s	%s	%s	%s	%s	%s	%s	%s	%s	%s\n' \
     "${group_name}" true "${interval_sec}" "${api_token}" "${zone_id}" "${target_fqdn}" "${ttl}" false "${mode}" "${sources_csv}" >> "${GROUPS_FILE}"
@@ -1040,7 +1071,7 @@ add_group() {
   duplicate="$(find_duplicate_target "${zone_id}" "${target_fqdn}")"
   [[ -z "${duplicate}" ]] || { echo "目标域名已由组 ${duplicate} 管理，禁止重复管理"; return; }
   read -rp "请输入 TTL（推荐 60）: " ttl || return
-  [[ "${ttl}" =~ ^[0-9]+$ ]] || { echo "TTL 必须为数字"; return; }
+  valid_ttl "${ttl}" || { echo "TTL 必须为 1（自动）或 60~86400 秒"; return; }
 
   echo "请选择解析模式："
   echo "1. 🌐 ALL_IPS（全部IP模式）"
@@ -1057,6 +1088,7 @@ add_group() {
   sources_csv="$(normalize_sources_csv "${sources_csv}")"
   src_count="$(count_sources_csv "${sources_csv}")"
   [[ "${src_count}" -ge 1 && "${src_count}" -le 20 ]] || { echo "源域名数量必须为1~20"; return; }
+  validate_sources_csv "${sources_csv}" || { echo "源域名列表中存在格式错误的域名"; return; }
 
   printf '%s	%s	%s	%s	%s	%s	%s	%s	%s	%s\n' \
     "${group_name}" "${enabled}" "${interval_sec}" "${api_token}" "${zone_id}" "${target_fqdn}" "${ttl}" "${proxied}" "${mode}" "${sources_csv}" >> "${GROUPS_FILE}"
@@ -1164,6 +1196,7 @@ manage_group_sources() {
         read -rp "请输入新的源域名: " new_domain
         new_domain="$(normalize_sources_csv "${new_domain}")"
         [[ -n "${new_domain}" ]] || { echo "不能为空"; pause_wait; continue; }
+        valid_domain "${new_domain}" || { echo "源域名格式不正确"; pause_wait; continue; }
         if printf '%s\n' "${SOURCES_ARRAY[@]}" | grep -Fxq "${new_domain}"; then
           echo "该源域名已存在"
           pause_wait
@@ -1193,6 +1226,11 @@ manage_group_sources() {
         import_count="$(count_sources_csv "${import_csv}")"
         if [[ "${import_count}" -lt 1 || "${import_count}" -gt 20 ]]; then
           echo "导入后的源域名数量必须为 1~20"
+          pause_wait
+          continue
+        fi
+        if ! validate_sources_csv "${import_csv}"; then
+          echo "批量导入内容中存在格式错误的源域名"
           pause_wait
           continue
         fi
@@ -1236,7 +1274,7 @@ edit_group_basic() {
   echo "当前 TTL: ${GROUP_TTL}"
   read -rp "新 TTL（回车保持）: " new_ttl || return
   [[ -z "${new_ttl}" ]] || GROUP_TTL="${new_ttl}"
-  [[ "${GROUP_TTL}" =~ ^[0-9]+$ ]] || { echo "TTL 必须为数字"; return; }
+  valid_ttl "${GROUP_TTL}" || { echo "TTL 必须为 1（自动）或 60~86400 秒"; return; }
 
   echo "当前 Zone ID: ${GROUP_ZONE_ID}"
   read -rp "新 Zone ID（回车保持）: " new_zone || return
@@ -1420,27 +1458,132 @@ manual_run_one() {
 }
 
 
-show_logs() {
-  if [[ ! -s "${LOG_FILE}" ]]; then echo "暂无项目运行日志"; return; fi
-  tail -n 150 "${LOG_FILE}"
+collect_log_family_to_file() {
+  local base="$1" output="$2" f
+  : > "${output}"
+  shopt -s nullglob
+  local files=("${base}" "${base}".* "${base}"-*)
+  shopt -u nullglob
+  for f in "${files[@]}"; do
+    [[ -f "${f}" ]] || continue
+    case "${f}" in
+      *.gz) gzip -cd -- "${f}" >> "${output}" 2>/dev/null || true ;;
+      *) cat -- "${f}" >> "${output}" 2>/dev/null || true ;;
+    esac
+  done
 }
 
+collect_runtime_logs_to_file() {
+  collect_log_family_to_file "${LOG_FILE}" "$1"
+}
+
+runtime_log_renderer_self_test() {
+  local dir base raw sorted out
+  dir="$(mktemp -d)" || return 1
+  base="${dir}/runtime.log"
+  printf '%s\n' '[2026-01-01 00:00:00] [INFO] old-rotated-log' > "${base}-20260101"
+  printf '%s\n' '[2026-01-02 00:00:00] [INFO] compressed-log' > "${base}-20260102"
+  gzip -f "${base}-20260102"
+  printf '%s\n' '[2026-01-03 00:00:00] [INFO] current-log' > "${base}"
+  raw="${dir}/raw"; sorted="${dir}/sorted"
+  collect_log_family_to_file "${base}" "${raw}"
+  LC_ALL=C sort "${raw}" > "${sorted}"
+  out="$(cat "${sorted}")"
+  rm -rf "${dir}"
+  grep -Fq 'old-rotated-log' <<< "${out}" && \
+    grep -Fq 'compressed-log' <<< "${out}" && \
+    grep -Fq 'current-log' <<< "${out}"
+}
+
+filter_runtime_logs() {
+  local input="$1" output="$2" days="$3" target_group="${4:-}" cutoff
+  if [[ "${days}" == "0" ]]; then
+    cutoff="0000-00-00 00:00:00"
+  else
+    cutoff="$(date -d "${days} days ago" '+%F %T' 2>/dev/null)" || return 1
+  fi
+  awk -v cutoff="${cutoff}" -v group="${target_group}" '
+    /^\[[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\]/ {
+      ts=substr($0,2,19)
+      if (ts < cutoff) next
+      if (group != "" && index($0, "组 " group ":") == 0) next
+      print
+    }
+  ' "${input}" > "${output}"
+}
+
+display_log_file() {
+  local file="$1"
+  [[ -s "${file}" ]] || { echo "暂无符合条件的项目运行日志"; return 0; }
+  if [[ -t 0 && -t 1 ]] && command -v less >/dev/null 2>&1; then
+    less -R "${file}"
+  else
+    cat "${file}"
+  fi
+}
+
+runtime_logs_menu() {
+  local target_group="${1:-}" choice days raw sorted filtered latest
+  while true; do
+    clear 2>/dev/null || true
+    line
+    if [[ -n "${target_group}" ]]; then
+      echo "📌 查看单组运行日志：${target_group}"
+    else
+      echo "📄 查看 cfdns 项目运行日志"
+    fi
+    line
+    echo "1. 🧾 查看跨全部轮转文件的最近 200 条"
+    echo "2. 🕒 查看最近 3 天"
+    echo "3. 📅 查看最近 7 天"
+    echo "4. 🗓️  查看最近 30 天"
+    echo "5. ✍️  自定义最近多少天"
+    echo "6. 📚 查看当前保留的全部项目日志"
+    echo "0. ↩️  返回"
+    read -rp "请选择: " choice || return
+    case "${choice}" in
+      1) days=0 ;;
+      2) days=3 ;;
+      3) days=7 ;;
+      4) days=30 ;;
+      5)
+        read -rp "请输入天数（>=1）: " days || return
+        [[ "${days}" =~ ^[0-9]+$ && "${days}" -ge 1 ]] || { echo "天数无效"; pause_wait; continue; }
+        ;;
+      6) days=0 ;;
+      0) return ;;
+      *) echo "无效选择"; pause_wait; continue ;;
+    esac
+
+    raw="$(mktemp)"; sorted="$(mktemp)"; filtered="$(mktemp)"; latest="$(mktemp)"
+    collect_runtime_logs_to_file "${raw}"
+    LC_ALL=C sort "${raw}" > "${sorted}" 2>/dev/null || cp -f "${raw}" "${sorted}"
+    filter_runtime_logs "${sorted}" "${filtered}" "${days}" "${target_group}" || true
+    if [[ "${choice}" == "1" ]]; then
+      tail -n 200 "${filtered}" > "${latest}"
+      display_log_file "${latest}"
+    else
+      display_log_file "${filtered}"
+    fi
+    rm -f "${raw}" "${sorted}" "${filtered}" "${latest}"
+    pause_wait
+  done
+}
+
+show_logs() {
+  runtime_logs_menu ""
+}
 
 follow_logs() {
   touch "${LOG_FILE}"; chmod 600 "${LOG_FILE}" 2>/dev/null || true
-  echo "按 Ctrl+C 退出实时日志"
+  echo "按 Ctrl+C 退出实时日志。实时模式只跟踪当前写入文件；历史轮转日志请使用菜单 19。"
   tail -n 50 -f "${LOG_FILE}"
 }
-
 
 show_group_runtime_logs() {
   echo
   select_group || { echo "序号无效"; return; }
-  if [[ -f "${LOG_FILE}" ]]; then
-    grep -F "组 ${CHOSEN_GROUP_NAME}:" "${LOG_FILE}" | tail -n 200 || echo "暂无该组运行日志"
-  else
-    echo "日志文件不存在"
-  fi
+  runtime_logs_menu "${CHOSEN_GROUP_NAME}"
 }
 
 
@@ -1491,19 +1634,7 @@ show_runstate() {
 }
 
 collect_history_to_file() {
-  local output="$1" f
-  : > "${output}"
-  shopt -s nullglob
-  local files=("${HISTORY_FILE}" "${HISTORY_FILE}".*)
-  shopt -u nullglob
-
-  for f in "${files[@]}"; do
-    [[ -f "${f}" ]] || continue
-    case "${f}" in
-      *.gz) gzip -cd -- "${f}" >> "${output}" 2>/dev/null || true ;;
-      *) cat -- "${f}" >> "${output}" 2>/dev/null || true ;;
-    esac
-  done
+  collect_log_family_to_file "${HISTORY_FILE}" "$1"
 }
 
 render_history_data_file() {
@@ -1645,7 +1776,7 @@ self_check() {
   local errors=0 warnings=0 group_count=0 enabled_count=0
   local line_no=0 name enabled interval token zone target ttl proxied mode sources_csv extra src_count key duplicate source_domain
   declare -A seen_names=() seen_targets=()
-  echo "🩺 cfdns v2.3 自检"
+  echo "🩺 cfdns v2.4 自检"
   line
   check_ok(){ printf '✅ %s\n' "$*"; }
   check_warn(){ warnings=$((warnings+1)); printf '⚠️  %s\n' "$*"; }
@@ -1674,7 +1805,7 @@ self_check() {
     [[ -n "${token}" ]] || check_fail "组 ${name}: Token 为空"
     [[ "${zone}" =~ ^[a-fA-F0-9]{32}$ ]] || check_warn "组 ${name}: Zone ID 格式可疑"
     valid_domain "${target}" || check_fail "组 ${name}: 目标域名格式错误"
-    [[ "${ttl}" =~ ^[0-9]+$ ]] || check_fail "组 ${name}: TTL 非数字"
+    valid_ttl "${ttl}" || check_fail "组 ${name}: TTL 必须为1或60~86400"
     [[ "${proxied}" == false ]] || check_fail "组 ${name}: 仅支持 proxied=false"
     [[ "${mode}" == ALL_IPS || "${mode}" == SINGLE_IP ]] || check_fail "组 ${name}: mode 非法"
     src_count="$(count_sources_csv "${sources_csv:-}")"; [[ "${src_count}" -ge 1 && "${src_count}" -le 20 ]] || check_fail "组 ${name}: 源域名数量=${src_count}，应为1~20"
@@ -1696,6 +1827,7 @@ self_check() {
   fi
   [[ -f "${INSTALL_COPY}" ]] && check_ok "一键修复安装器副本存在" || check_warn "安装器副本不存在；一键修复只能修复外围文件"
   history_renderer_self_test && check_ok "历史记录渲染自测正常" || check_fail "历史记录渲染自测失败"
+  runtime_log_renderer_self_test && check_ok "跨当前/轮转/压缩日志读取自测正常" || check_fail "跨轮转日志读取自测失败"
 
   local malformed_history=0 history_raw history_line fields
   history_raw="$(mktemp)"
@@ -1724,7 +1856,7 @@ self_check() {
 
 
 one_key_repair() {
-  echo "🧯 cfdns v2.3 一键修复"
+  echo "🧯 cfdns v2.4 一键修复"
   line
   [[ "$(id -u)" -eq 0 ]] || { echo "请使用 root 运行"; return 1; }
 
@@ -1768,7 +1900,9 @@ collect_log_family() {
   LOG_FAMILY=("${base}")
   shopt -s nullglob
   local f
-  for f in "${base}".*; do LOG_FAMILY+=("${f}"); done
+  for f in "${base}".* "${base}"-*; do
+    [[ -f "${f}" ]] && LOG_FAMILY+=("${f}")
+  done
   shopt -u nullglob
 }
 
@@ -1802,7 +1936,7 @@ purge_project_log() {
 
   # 先原子替换当前文件，成功后再删除轮转副本，避免清理中断造成日志丢失。
   install -m 600 "${tmp}" "${base}" || { rm -f "${tmp}" "${combined}"; return 1; }
-  rm -f "${base}".* 2>/dev/null || true
+  rm -f "${base}".* "${base}"-* 2>/dev/null || true
   rm -f "${tmp}" "${combined}"
 }
 
@@ -1918,9 +2052,9 @@ menu() {
     echo " 16.  🔄 重启（Restart / 重启）"
     echo " 17.  🚀 手动强制同步全部组（Sync All / 全部同步）"
     echo " 18.  🎯 手动强制同步单个组（Sync One / 单组同步）"
-    echo " 19.  📄 查看最近项目日志（Logs / 最近日志）"
+    echo " 19.  📄 查看项目运行日志（含轮转/压缩日志）"
     echo " 20.  👀 实时查看项目日志（Follow Logs / 实时日志）"
-    echo " 21.  📌 查看单组运行日志（One Group Logs / 单组日志）"
+    echo " 21.  📌 查看单组运行日志（含轮转/压缩日志）"
     echo " 22.  🩺 查看 service/timer 状态（Status / 状态）"
     echo " 23.  🧰 查看依赖状态（Dependencies / 依赖）"
     echo " 24.  🔎 脚本自检（Self Check / 自检）"
@@ -1940,7 +2074,7 @@ menu() {
       10) view_group_current_ips; pause_wait ;; 11) move_group_up; pause_wait ;; 12) move_group_down; pause_wait ;;
       13) set_log_level; pause_wait ;; 14) start_sync; pause_wait ;; 15) stop_sync; pause_wait ;;
       16) restart_sync; pause_wait ;; 17) manual_run_all; pause_wait ;; 18) manual_run_one; pause_wait ;;
-      19) show_logs; pause_wait ;; 20) follow_logs ;; 21) show_group_runtime_logs; pause_wait ;;
+      19) show_logs ;; 20) follow_logs ;; 21) show_group_runtime_logs ;;
       22) show_status; pause_wait ;; 23) show_dep_status; pause_wait ;; 24) self_check; pause_wait ;;
       25) one_key_repair; pause_wait ;; 26) show_runstate; pause_wait ;; 27) history_menu ;;
       28) clean_logs_menu ;; 29) edit_raw_files ;; 30) uninstall_all ;; 0) exit 0 ;;
@@ -2021,7 +2155,7 @@ backup_existing() {
 
 store_installer_copy() {
   mkdir -p "${INSTALL_DIR}"
-  if [[ -f "$0" ]] && grep -q 'cfdns v2.3 installer' "$0" 2>/dev/null; then
+  if [[ -f "$0" ]] && grep -q 'cfdns v2.4 installer' "$0" 2>/dev/null; then
     install -m 700 "$0" "${INSTALL_COPY}"
   fi
 }
@@ -2049,7 +2183,7 @@ main() {
     systemctl start "${APP_NAME}.service" || true
   fi
   echo
-  echo "安装/升级完成: v2.3"
+  echo "安装/升级完成: v2.4"
   echo "管理命令: cfdns"
   echo "本机基础调度周期: 5 秒"
   echo "每组按照独立周期查询源域名；源 IP 未变化时不会调用 Cloudflare API。"

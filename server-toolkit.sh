@@ -1,38 +1,202 @@
 #!/bin/bash
 set -u
 
-SERVER_TOOLKIT_VERSION="v2.4"
+SERVER_TOOLKIT_VERSION="v2.5"
 
 # ============================================================
-# server-toolkit.sh v2.4
+# server-toolkit.sh v2.5
 # 适用：Debian 10/11/12/13/testing/sid、Ubuntu 20.04/22.04/24.04/26.04、
 #      CentOS 7/Stream 8/9/10、RHEL 8/9/10、Alma/Rocky/Oracle、
 #      Fedora、Amazon Linux 2/2023。
 # 原则：先备份、先检测、尽量不破坏当前 SSH 会话；危险操作默认取消并使用数字确认。
-# v2.4 摘要：修复流媒体/YABS/IP质量三个远程脚本入口；新增 leitbogioro/Tools
-#            系统重装向导；修复防火墙首次启用的 SSH 放行顺序、GRUB UEFI
-#            误写风险、长间隔 cron、SSH 逐项配置取消未回滚、Fail2Ban 后端/
-#            端口刷新保留参数、APT deb822 套件探测、时间同步回滚、直接运行入口。
+# v2.5 摘要：确认 v2.4 未遗漏 v2.3 功能；重构终端 UI 为宽屏双栏/窄屏单栏自适应，
+#            使用 Emoji 与动态终端宽度，并为非 UTF-8 终端自动降级 ASCII，避免中文宽度错位；强化 SSH 生效验证与回滚、
+#            Fail2Ban 空日志/首次安装回滚、APT 写入失败回滚、容器时间同步降级、GRUB 参数
+#            处理、OpenSSH 定向升级、sysctl 失败回滚、定时重启管理和远程脚本失败现场保留。
 # ============================================================
 
 # ---------- 彩色输出 / UI ----------
-echo_color() { echo -e "\e[1;32m${1:-}\e[0m"; }
-echo_warn()  { echo -e "\e[1;33m${1:-}\e[0m"; }
-echo_error() { echo -e "\e[1;31m${1:-}\e[0m"; }
-echo_info()  { echo -e "\e[1;36m${1:-}\e[0m"; }
-echo_blue()  { echo -e "\e[1;34m${1:-}\e[0m"; }
-echo_pink()  { echo -e "\e[1;35m${1:-}\e[0m"; }
-echo_dim()   { echo -e "\e[2m${1:-}\e[0m"; }
+UI_COLOR_ENABLED=0
+UI_EMOJI_ENABLED=1
+UI_HR_CHAR="-"
+UI_RESET=""
+UI_GREEN=""
+UI_YELLOW=""
+UI_RED=""
+UI_CYAN=""
+UI_BLUE=""
+UI_MAGENTA=""
+UI_DIM=""
 
-UI_LINE="────────────────────────────────────────────────────────────"
+ui_init() {
+  local locale_name="${LC_ALL:-${LC_CTYPE:-${LANG:-}}}"
+  if [ -t 1 ] && [ "${TERM:-dumb}" != "dumb" ] && [ -z "${NO_COLOR:-}" ]; then
+    UI_COLOR_ENABLED=1
+    UI_RESET=$'\033[0m'
+    UI_GREEN=$'\033[1;32m'
+    UI_YELLOW=$'\033[1;33m'
+    UI_RED=$'\033[1;31m'
+    UI_CYAN=$'\033[1;36m'
+    UI_BLUE=$'\033[1;34m'
+    UI_MAGENTA=$'\033[1;35m'
+    UI_DIM=$'\033[2m'
+  fi
+  case "$locale_name" in
+    *UTF-8*|*utf8*|*UTF8*) UI_HR_CHAR="─" ;;
+    *) UI_EMOJI_ENABLED=0; UI_HR_CHAR="-" ;;
+  esac
+  case "${SERVER_TOOLKIT_NO_EMOJI:-0}" in 1|yes|true) UI_EMOJI_ENABLED=0 ;; esac
+}
+ui_init
 
-ui_hr() { printf "\e[1;36m%s\e[0m\n" "$UI_LINE"; }
-ui_title() { echo; ui_hr; printf "\e[1;35m  %s\e[0m\n" "${1:-}"; ui_hr; }
-ui_option() { local num="${1:-}" text="${2:-}"; printf "  \e[1;32m%-4s\e[0m %s\n" "${num})" "$text"; }
-ui_back() { printf "  \e[1;31m%-4s\e[0m %s\n" "0)" "返回"; }
-ui_prompt() { local target="${1:-}"; [ -n "$target" ] || return 1; read -r -p "请选择: " "$target"; }
-pause_return() { echo; read -r -p "按 Enter 返回菜单..." _pause_dummy; }
+ui_icon() {
+  local kind="${1:-info}"
+  if [ "$UI_EMOJI_ENABLED" -eq 0 ]; then
+    case "$kind" in success) printf '[OK]' ;; warning) printf '[!]' ;; error) printf '[X]' ;; info) printf '[i]' ;; title) printf '[*]' ;; back) printf '<-' ;; prompt) printf '>' ;; menu) printf '-' ;; *) printf '-' ;; esac
+  else
+    case "$kind" in success) printf '✅' ;; warning) printf '⚠️' ;; error) printf '❌' ;; info) printf 'ℹ️' ;; title) printf '🧰' ;; back) printf '↩️' ;; prompt) printf '👉' ;; menu) printf '🔹' ;; *) printf '•' ;; esac
+  fi
+}
 
+ui_symbol() {
+  local kind="${1:-menu}"
+  [ "$UI_EMOJI_ENABLED" -eq 1 ] || return 0
+  case "$kind" in
+    time) printf '⏱️' ;; firewall) printf '🛡️' ;; selinux) printf '🔐' ;; ssh) printf '🔒' ;;
+    ban) printf '🚫' ;; key) printf '🔑' ;; media) printf '🎬' ;; info) printf '📊' ;;
+    benchmark) printf '🧪' ;; reboot) printf '🔄' ;; nezha) printf '📡' ;; world) printf '🌍' ;;
+    ipv6) printf '🌐' ;; harden) printf '🧱' ;; package) printf '📦' ;; reinstall) printf '💿' ;;
+    exit) printf '🚪' ;; menu) printf '📚' ;; host) printf '🖥️' ;; linux) printf '🐧' ;;
+    kernel) printf '🧩' ;; arch) printf '🏗️' ;; cpu) printf '⚙️' ;; cores) printf '🧮' ;;
+    load) printf '📈' ;; memory) printf '🧠' ;; disk) printf '🗄️' ;; network) printf '🌐' ;;
+    receive) printf '📥' ;; speed) printf '🚀' ;; dns) printf '🔎' ;; uptime) printf '⏱️' ;;
+    swap) printf '💾' ;; *) printf '🔹' ;;
+  esac
+}
+
+ui_terminal_columns() {
+  local cols="${COLUMNS:-}" stty_size=""
+  # 此函数通常通过命令替换调用；此时函数自身 stdout 已是管道，不能用 [ -t 1 ] 判断终端。
+  # 优先直接查询控制终端 /dev/tty，避免宽屏被错误识别为 80 列而永久退化为单栏。
+  if ! [[ "$cols" =~ ^[0-9]+$ ]] || [ "$cols" -lt 40 ]; then
+    if command -v stty >/dev/null 2>&1; then
+      stty_size="$(stty size </dev/tty 2>/dev/null || true)"
+      cols="${stty_size##* }"
+    fi
+  fi
+  if ! [[ "$cols" =~ ^[0-9]+$ ]] || [ "$cols" -lt 40 ]; then
+    if command -v tput >/dev/null 2>&1; then cols="$(tput cols 2>/dev/null || true)"; fi
+  fi
+  [[ "$cols" =~ ^[0-9]+$ ]] || cols=80
+  [ "$cols" -gt 120 ] && cols=120
+  [ "$cols" -lt 48 ] && cols=48
+  printf '%s' "$cols"
+}
+
+ui_repeat() {
+  local char="${1:--}" count="${2:-60}" out=""
+  [[ "$count" =~ ^[0-9]+$ ]] || count=60
+  while [ "${#out}" -lt "$count" ]; do out="${out}${char}"; done
+  printf '%s' "${out:0:count}"
+}
+
+ui_hr() {
+  local cols
+  cols="$(ui_terminal_columns)"
+  printf '%s' "$UI_CYAN"
+  ui_repeat "$UI_HR_CHAR" "$cols"
+  printf '%s\n' "$UI_RESET"
+}
+
+ui_clear() {
+  if [ -t 1 ] && [ "${TERM:-dumb}" != "dumb" ]; then printf '\033[2J\033[H'; fi
+}
+
+ui_message() {
+  local color="${1:-}" kind="${2:-info}" msg="${3:-}"
+  printf '%s' "$color"
+  ui_icon "$kind"
+  printf '  %s%s\n' "$msg" "$UI_RESET"
+}
+
+echo_color() { ui_message "$UI_GREEN" success "${1:-}"; }
+echo_warn()  { ui_message "$UI_YELLOW" warning "${1:-}"; }
+echo_error() { ui_message "$UI_RED" error "${1:-}"; }
+echo_info()  { ui_message "$UI_CYAN" info "${1:-}"; }
+echo_blue()  { ui_message "$UI_BLUE" info "${1:-}"; }
+echo_pink()  { ui_message "$UI_MAGENTA" info "${1:-}"; }
+echo_dim()   { printf '%s  • %s%s\n' "$UI_DIM" "${1:-}" "$UI_RESET"; }
+
+ui_title() {
+  local title="${1:-server-toolkit}"
+  printf '\n'
+  ui_hr
+  printf '%s  ' "$UI_MAGENTA"
+  ui_icon title
+  printf '  %s%s\n' "$title" "$UI_RESET"
+  ui_hr
+}
+
+ui_option() {
+  local num="${1:-}" text="${2:-}"
+  printf '  %s%2s)%s  ' "$UI_GREEN" "$num" "$UI_RESET"
+  ui_icon menu
+  printf '  %s\n' "$text"
+}
+
+ui_back() {
+  printf '  %s%2s)%s  ' "$UI_RED" "0" "$UI_RESET"
+  ui_icon back
+  printf '  返回\n'
+}
+
+ui_prompt() {
+  local target="${1:-}" prompt="${2:-请选择}" prefix
+  [ -n "$target" ] || return 1
+  prefix="$(ui_icon prompt)"
+  read -r -p "${prefix}  ${prompt}: " "$target"
+}
+
+pause_return() {
+  local _pause_dummy=""
+  printf '\n'
+  read -r -p "$(ui_icon back)  按 Enter 返回菜单..." _pause_dummy
+}
+
+ui_kv() {
+  local symbol_kind="${1:-menu}" label="${2:-}" value="${3:-}" symbol=""
+  symbol="$(ui_symbol "$symbol_kind")"
+  [ -n "$symbol" ] && label="${symbol}  ${label}"
+  if [ -t 1 ] && [ "${TERM:-dumb}" != "dumb" ] && [ "$(ui_terminal_columns)" -ge 64 ]; then
+    printf '  %s%s%s' "$UI_CYAN" "$label" "$UI_RESET"
+    printf '\033[28G%s\n' "$value"
+  else
+    printf '  %s: %s\n' "$label" "$value"
+  fi
+}
+
+ui_main_row() {
+  local left="${1:-}" right="${2:-}" cols split
+  cols="$(ui_terminal_columns)"
+  if [ -t 1 ] && [ "${TERM:-dumb}" != "dumb" ] && [ "$cols" -ge 94 ] && [ -n "$right" ]; then
+    split=$((cols / 2 + 1))
+    printf '  %s' "$left"
+    printf '\033[%sG%s\n' "$split" "$right"
+  else
+    [ -n "$left" ] && printf '  %s\n' "$left"
+    [ -n "$right" ] && printf '  %s\n' "$right"
+  fi
+}
+
+ui_menu_label() {
+  local kind="${1:-menu}" num="${2:-}" text="${3:-}" symbol=""
+  symbol="$(ui_symbol "$kind")"
+  if [ -n "$symbol" ]; then
+    printf '%s  %2s) %s' "$symbol" "$num" "$text"
+  else
+    printf '%2s) %s' "$num" "$text"
+  fi
+}
 confirm_action() {
   local msg="${1:-确认继续？}"
   local default="${2:-2}"
@@ -41,7 +205,7 @@ confirm_action() {
   ui_option 1 "继续"
   ui_option 2 "取消（默认）"
   ui_back
-  read -r -p "请选择 [默认 ${default}]: " ans
+  ui_prompt ans "请选择 [默认 ${default}]"
   ans="${ans:-$default}"
   case "$ans" in
     1) return 0 ;;
@@ -55,7 +219,7 @@ choice_ssh_port_keep_policy() {
   ui_option 1 "只保留新端口"
   ui_option 2 "新旧端口都保留（默认，推荐）"
   ui_back
-  read -r -p "请选择 [默认 2]: " ans
+  ui_prompt ans "请选择 [默认 2]"
   ans="${ans:-2}"
   case "$ans" in
     1) echo "new_only" ;;
@@ -71,7 +235,7 @@ choice_private_key_action() {
   ui_option 2 "不显示，仅保留服务器路径（默认，推荐）"
   ui_option 3 "删除服务器上的私钥文件（确认本地已保存后再用）"
   ui_back
-  read -r -p "请选择 [默认 2]: " ans
+  ui_prompt ans "请选择 [默认 2]"
   ans="${ans:-2}"
   case "$ans" in
     1|2|3|0) echo "$ans" ;;
@@ -176,19 +340,21 @@ has_cap_sys_time() {
 }
 
 backup_file() {
-  local file="${1:-}"
+  local file="${1:-}" stamp
   [ -n "$file" ] || return 1
   if [ -e "$file" ]; then
-    cp -a "$file" "${file}.bak.$(date +%F_%H-%M-%S)"
+    stamp="$(date +%F_%H-%M-%S).$$"
+    cp -a "$file" "${file}.bak.${stamp}" || { echo_error "备份失败：$file"; return 1; }
   fi
 }
 
 make_backup_dir() {
-  local name="${1:-backup}"
-  local dir
-  dir="/root/server-toolkit-backups/${name}-$(date +%F_%H-%M-%S)"
-  mkdir -p "$dir"
-  chmod 700 /root/server-toolkit-backups 2>/dev/null || true
+  local name="${1:-backup}" base dir
+  base="/root/server-toolkit-backups"
+  mkdir -p "$base" || return 1
+  chmod 700 "$base" 2>/dev/null || true
+  dir="$(mktemp -d "${base}/${name}-$(date +%F_%H-%M-%S).XXXXXX")" || return 1
+  chmod 700 "$dir" 2>/dev/null || true
   echo "$dir"
 }
 
@@ -283,12 +449,12 @@ pkg_install() {
     mapped="$(pkg_map_name "$p")"
     [ -n "$mapped" ] && pkgs+=("$mapped")
   done
-  [ "${#pkgs[@]}" -eq 0 ] && { echo_warn "没有可安装的软件包。"; return 0; }
+  [ -n "${pkgs[*]-}" ] || { echo_warn "没有可安装的软件包。"; return 0; }
   echo_info "正在安装：${pkgs[*]}"
   case "$pm" in
-    apt) DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold install -y "${pkgs[@]}" ;;
-    dnf) dnf install -y "${pkgs[@]}" ;;
-    yum) yum install -y "${pkgs[@]}" ;;
+    apt) DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold install -y "${pkgs[@]+"${pkgs[@]}"}" ;;
+    dnf) dnf install -y "${pkgs[@]+"${pkgs[@]}"}" ;;
+    yum) yum install -y "${pkgs[@]+"${pkgs[@]}"}" ;;
   esac
 }
 
@@ -303,13 +469,31 @@ pkg_upgrade() {
   esac
 }
 
+pkg_upgrade_packages() {
+  local pm mapped p
+  local pkgs=()
+  pm="$(detect_pkg_manager)"
+  for p in "$@"; do
+    mapped="$(pkg_map_name "$p")"
+    [ -n "$mapped" ] && pkgs+=("$mapped")
+  done
+  [ -n "${pkgs[*]-}" ] || return 0
+  echo_info "正在定向升级：${pkgs[*]}"
+  case "$pm" in
+    apt) DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold install --only-upgrade -y "${pkgs[@]+"${pkgs[@]}"}" ;;
+    dnf) dnf upgrade -y "${pkgs[@]+"${pkgs[@]}"}" ;;
+    yum) yum update -y "${pkgs[@]+"${pkgs[@]}"}" ;;
+    *) echo_error "未检测到支持的包管理器。"; return 1 ;;
+  esac
+}
+
 pkg_full_upgrade() {
   local pm
   pm="$(detect_pkg_manager)"
   case "$pm" in
     apt)
-      DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold dist-upgrade -y
-      DEBIAN_FRONTEND=noninteractive apt-get autoremove -y
+      DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold dist-upgrade -y || return 1
+      DEBIAN_FRONTEND=noninteractive apt-get autoremove -y || return 1
       ;;
     dnf) dnf upgrade -y --refresh && dnf autoremove -y ;;
     yum) yum update -y ;;
@@ -325,11 +509,11 @@ pkg_remove() {
     mapped="$(pkg_map_name "$p")"
     [ -n "$mapped" ] && pkgs+=("$mapped")
   done
-  [ "${#pkgs[@]}" -eq 0 ] && return 0
+  [ -n "${pkgs[*]-}" ] || return 0
   case "$pm" in
-    apt) DEBIAN_FRONTEND=noninteractive apt-get remove -y "${pkgs[@]}" ;;
-    dnf) dnf remove -y "${pkgs[@]}" ;;
-    yum) yum remove -y "${pkgs[@]}" ;;
+    apt) DEBIAN_FRONTEND=noninteractive apt-get remove -y "${pkgs[@]+"${pkgs[@]}"}" ;;
+    dnf) dnf remove -y "${pkgs[@]+"${pkgs[@]}"}" ;;
+    yum) yum remove -y "${pkgs[@]+"${pkgs[@]}"}" ;;
     *) echo_error "未检测到支持的包管理器。"; return 1 ;;
   esac
 }
@@ -347,25 +531,49 @@ ensure_command() {
 service_enable_now() {
   local svc="${1:-}"
   [ -n "$svc" ] || return 1
-  is_systemd_available || { echo_warn "当前环境没有可用 systemd，无法 enable/start $svc。"; return 1; }
-  systemctl enable --now "$svc"
+  if is_systemd_available; then
+    systemctl enable --now "$svc"
+    return $?
+  fi
+  if command -v service >/dev/null 2>&1; then
+    if command -v update-rc.d >/dev/null 2>&1; then update-rc.d "$svc" defaults >/dev/null 2>&1 || true; fi
+    if command -v chkconfig >/dev/null 2>&1; then chkconfig "$svc" on >/dev/null 2>&1 || true; fi
+    service "$svc" start
+    return $?
+  fi
+  echo_warn "当前环境没有可用的服务管理器，无法启动 $svc。"
+  return 1
 }
 
 service_restart_safe() {
   local svc="${1:-}"
   [ -n "$svc" ] || return 1
-  is_systemd_available || { echo_warn "当前环境没有可用 systemd，无法重启 $svc。"; return 1; }
-  systemctl restart "$svc" && systemctl is-active "$svc" >/dev/null 2>&1
+  if is_systemd_available; then
+    systemctl restart "$svc" && systemctl is-active "$svc" >/dev/null 2>&1
+    return $?
+  fi
+  if command -v service >/dev/null 2>&1; then
+    service "$svc" restart
+    return $?
+  fi
+  echo_warn "当前环境没有可用的服务管理器，无法重启 $svc。"
+  return 1
 }
 
 service_reload_or_restart() {
   local svc="${1:-}"
   [ -n "$svc" ] || return 1
-  is_systemd_available || { echo_warn "当前环境没有可用 systemd，无法 reload/restart $svc。"; return 1; }
-  if systemctl reload "$svc" 2>/dev/null; then
-    systemctl is-active "$svc" >/dev/null 2>&1 && return 0
+  if is_systemd_available; then
+    if systemctl reload "$svc" 2>/dev/null && systemctl is-active "$svc" >/dev/null 2>&1; then return 0; fi
+    systemctl restart "$svc" && systemctl is-active "$svc" >/dev/null 2>&1
+    return $?
   fi
-  systemctl restart "$svc" && systemctl is-active "$svc" >/dev/null 2>&1
+  if command -v service >/dev/null 2>&1; then
+    service "$svc" reload 2>/dev/null || service "$svc" restart
+    return $?
+  fi
+  echo_warn "当前环境没有可用的服务管理器，无法 reload/restart $svc。"
+  return 1
 }
 
 ensure_crontab() {
@@ -404,16 +612,17 @@ allow_port_firewall() {
     if ufw_active; then echo_color "ufw 已放行 ${port}/tcp。"; else echo_color "已预先写入 ufw 放行规则 ${port}/tcp（ufw 尚未启用）。"; fi
     return 0
   fi
-  if command -v nft >/dev/null 2>&1; then
-    echo_warn "检测到 nftables，但未识别到可安全持久化的规则管理方式；未自动改写规则集。"
-    return 2
-  fi
+  # 许多新系统的 iptables 实际使用 nft 后端；若命令存在，先安全追加运行时规则。
   if command -v iptables >/dev/null 2>&1; then
     if ! iptables -C INPUT -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1; then
       iptables -I INPUT -p tcp --dport "$port" -j ACCEPT || return 1
       echo_warn "iptables 已添加运行时规则放行 ${port}/tcp；重启后可能失效。"
     fi
     return 0
+  fi
+  if command -v nft >/dev/null 2>&1; then
+    echo_warn "检测到 nftables，但无法可靠识别现有表/链和持久化管理方式；未自动覆盖规则集。"
+    return 2
   fi
   echo_warn "未检测到本机防火墙工具。仍需确认云厂商安全组已放行端口 $port。"
   return 2
@@ -575,16 +784,16 @@ manage_selinux() {
         [ -f "$conf" ] || { echo_warn "未找到 $conf"; pause_return; continue; }
         echo_warn "从 Disabled 恢复 Enforcing 可能需要 relabel；建议先切 Permissive 并观察。"
         confirm_action "确认设置 SELinux Enforcing？" "2" || { pause_return; continue; }
-        backup_file "$conf"
-        sed -i 's/^SELINUX=.*/SELINUX=enforcing/' "$conf"
+        backup_file "$conf" || { echo_error "SELinux 配置备份失败，已中止。"; pause_return; continue; }
+        sed -i 's/^SELINUX=.*/SELINUX=enforcing/' "$conf" || { echo_error "SELinux 配置写入失败。"; pause_return; continue; }
         setenforce 1 2>/dev/null || echo_warn "当前会话未能立即切到 Enforcing，可能需重启。"
         echo_warn "如从 Disabled 恢复，必要时请评估 touch /.autorelabel 后重启。"
         pause_return
         ;;
       2)
         [ -f "$conf" ] || { echo_warn "未找到 $conf"; pause_return; continue; }
-        backup_file "$conf"
-        sed -i 's/^SELINUX=.*/SELINUX=permissive/' "$conf"
+        backup_file "$conf" || { echo_error "SELinux 配置备份失败，已中止。"; pause_return; continue; }
+        sed -i 's/^SELINUX=.*/SELINUX=permissive/' "$conf" || { echo_error "SELinux 配置写入失败。"; pause_return; continue; }
         setenforce 0 2>/dev/null || true
         echo_color "SELinux 已设置为 Permissive。"
         pause_return
@@ -592,8 +801,8 @@ manage_selinux() {
       3)
         [ -f "$conf" ] || { echo_warn "未找到 $conf"; pause_return; continue; }
         confirm_action "确认设置 SELinux Disabled？完全生效需要重启。" "2" || { pause_return; continue; }
-        backup_file "$conf"
-        sed -i 's/^SELINUX=.*/SELINUX=disabled/' "$conf"
+        backup_file "$conf" || { echo_error "SELinux 配置备份失败，已中止。"; pause_return; continue; }
+        sed -i 's/^SELINUX=.*/SELINUX=disabled/' "$conf" || { echo_error "SELinux 配置写入失败。"; pause_return; continue; }
         setenforce 0 2>/dev/null || true
         echo_warn "SELinux 已设置为 Disabled，需重启后完全生效。"
         pause_return
@@ -608,23 +817,18 @@ manage_selinux() {
 # ---------- SSH 管理 ----------
 ssh_service_name() {
   if is_systemd_available; then
-    if systemctl list-unit-files 2>/dev/null | grep -q '^ssh\.service'; then
-      echo "ssh"
-    else
-      echo "sshd"
-    fi
-  else
-    echo "sshd"
+    if systemctl list-unit-files 2>/dev/null | grep -q '^ssh\.service'; then echo "ssh"; else echo "sshd"; fi
+    return 0
   fi
+  if [ -x /etc/init.d/ssh ]; then echo "ssh"; else echo "sshd"; fi
 }
 
 sshd_main_config() { echo "/etc/ssh/sshd_config"; }
 sshd_toolkit_dropin() { echo "/etc/ssh/sshd_config.d/00-server-toolkit.conf"; }
 
 sshd_effective_config() {
-  if command -v sshd >/dev/null 2>&1; then
-    sshd -T 2>/dev/null || true
-  fi
+  command -v sshd >/dev/null 2>&1 || return 127
+  sshd -T 2>/dev/null
 }
 
 get_current_ssh_ports() {
@@ -669,45 +873,67 @@ port_in_use() {
 backup_ssh_tree() {
   local dir="${1:-}"
   [ -n "$dir" ] || return 1
-  backup_path_to_dir /etc/ssh/sshd_config "$dir"
-  [ -d /etc/ssh/sshd_config.d ] && backup_path_to_dir /etc/ssh/sshd_config.d "$dir"
+  backup_path_to_dir /etc/ssh/sshd_config "$dir" || return 1
+  if [ -d /etc/ssh/sshd_config.d ]; then
+    backup_path_to_dir /etc/ssh/sshd_config.d "$dir" || return 1
+  else
+    : > "$dir/.sshd_config_d_absent"
+  fi
 }
 
 restore_ssh_tree() {
-  local dir="${1:-}"
+  local dir="${1:-}" failed=0
   [ -n "$dir" ] || return 1
-  restore_path_from_dir /etc/ssh/sshd_config "$dir" || true
-  if [ -d "$dir/etc/ssh/sshd_config.d" ]; then
-    rm -rf /etc/ssh/sshd_config.d
-    cp -a "$dir/etc/ssh/sshd_config.d" /etc/ssh/sshd_config.d
+  restore_path_from_dir /etc/ssh/sshd_config "$dir" || failed=1
+  if [ -f "$dir/.sshd_config_d_absent" ]; then
+    rm -rf /etc/ssh/sshd_config.d || failed=1
+  elif [ -d "$dir/etc/ssh/sshd_config.d" ]; then
+    rm -rf /etc/ssh/sshd_config.d || failed=1
+    if [ "$failed" -eq 0 ]; then
+      cp -a "$dir/etc/ssh/sshd_config.d" /etc/ssh/sshd_config.d || failed=1
+    fi
   fi
-  echo_warn "已从 $dir 回滚 SSH 配置。"
+  if [ "$failed" -ne 0 ]; then
+    echo_error "SSH 配置自动回滚不完整：$dir。请保持当前会话并立即人工检查 /etc/ssh。"
+    return 1
+  fi
+  echo_warn "已从 $dir 完整回滚 SSH 配置。"
 }
 
 sshd_ensure_include() {
-  local main
+  local main tmp mode owner group
   main="$(sshd_main_config)"
   [ -f "$main" ] || { echo_error "找不到 $main"; return 1; }
-  mkdir -p /etc/ssh/sshd_config.d
-  if grep -Eqi '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf' "$main"; then
-    # OpenSSH 大多数单值项遵循 first value wins。为确保 drop-in 生效，把 include 调整到最前。
-    cp -a "$main" "${main}.tmp.$$"
-    {
-      echo "Include /etc/ssh/sshd_config.d/*.conf"
-      sed -E '/^[[:space:]]*Include[[:space:]]+\/etc\/ssh\/sshd_config\.d\/\*\.conf[[:space:]]*$/Id' "${main}.tmp.$$"
-    } > "$main"
-    rm -f "${main}.tmp.$$"
-  else
-    cp -a "$main" "${main}.tmp.$$"
-    { echo "Include /etc/ssh/sshd_config.d/*.conf"; cat "${main}.tmp.$$"; } > "$main"
-    rm -f "${main}.tmp.$$"
-  fi
+  mkdir -p /etc/ssh/sshd_config.d || return 1
+  tmp="$(mktemp "${main}.server-toolkit.XXXXXX")" || return 1
+  mode="$(stat -c '%a' "$main" 2>/dev/null || echo 600)"
+  owner="$(stat -c '%u' "$main" 2>/dev/null || echo 0)"
+  group="$(stat -c '%g' "$main" 2>/dev/null || echo 0)"
+  {
+    echo "Include /etc/ssh/sshd_config.d/*.conf"
+    sed -E '/^[[:space:]]*Include[[:space:]]+\/etc\/ssh\/sshd_config\.d\/\*\.conf[[:space:]]*$/Id' "$main"
+  } > "$tmp" || { rm -f "$tmp"; return 1; }
+  chmod "$mode" "$tmp" 2>/dev/null || true
+  chown "$owner:$group" "$tmp" 2>/dev/null || true
+  mv "$tmp" "$main" || { rm -f "$tmp"; return 1; }
 }
 
 sshd_comment_key_in_file() {
-  local file="${1:-}" key="${2:-}"
+  local file="${1:-}" key="${2:-}" tmp
   [ -n "$file" ] && [ -n "$key" ] && [ -f "$file" ] || return 0
-  sed -i -E "s/^([[:space:]]*)(${key})([[:space:]]+.*)$/# server-toolkit disabled duplicate: \2\3/I" "$file"
+  tmp="$(mktemp "${file}.server-toolkit.XXXXXX")" || return 1
+  awk -v key="$key" '
+    BEGIN { in_match=0; IGNORECASE=1 }
+    /^[[:space:]]*Match[[:space:]]+/ { in_match=1; print; next }
+    {
+      if (!in_match && $0 ~ "^[[:space:]]*" key "[[:space:]]+") {
+        sub(/^[[:space:]]*/, "")
+        print "# server-toolkit disabled duplicate: " $0
+      } else print
+    }
+  ' "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
+  cat "$tmp" > "$file" || { rm -f "$tmp"; return 1; }
+  rm -f "$tmp"
 }
 
 sshd_prepare_effective_key() {
@@ -715,36 +941,46 @@ sshd_prepare_effective_key() {
   [ -n "$key" ] || return 1
   toolkit="$(sshd_toolkit_dropin)"
   sshd_ensure_include || return 1
-  sshd_comment_key_in_file "$(sshd_main_config)" "$key"
+  sshd_comment_key_in_file "$(sshd_main_config)" "$key" || return 1
   if [ -d /etc/ssh/sshd_config.d ]; then
     for f in /etc/ssh/sshd_config.d/*.conf; do
       [ -f "$f" ] || continue
       [ "$f" = "$toolkit" ] && continue
-      sshd_comment_key_in_file "$f" "$key"
+      sshd_comment_key_in_file "$f" "$key" || return 1
     done
   fi
+  return 0
 }
 
 sshd_dropin_set_key() {
   local key="${1:-}" val="${2:-}" file
   [ -n "$key" ] || return 1
   file="$(sshd_toolkit_dropin)"
-  mkdir -p "$(dirname "$file")"
-  touch "$file"
-  sed -i -E "/^[[:space:]]*${key}[[:space:]]+/Id" "$file"
-  printf '%s %s\n' "$key" "$val" >> "$file"
+  mkdir -p "$(dirname "$file")" || return 1
+  touch "$file" || return 1
+  chmod 600 "$file" 2>/dev/null || true
+  sed -i -E "/^[[:space:]]*${key}[[:space:]]+/Id" "$file" || return 1
+  printf '%s %s\n' "$key" "$val" >> "$file" || return 1
 }
 
 sshd_set_ports_dropin() {
-  local ports="${1:-}" file p
+  local ports="${1:-}" file p wrote=0
   [ -n "$ports" ] || return 1
   file="$(sshd_toolkit_dropin)"
-  mkdir -p "$(dirname "$file")"
-  touch "$file"
-  sed -i -E '/^[[:space:]]*Port[[:space:]]+/Id' "$file"
+  mkdir -p "$(dirname "$file")" || return 1
+  touch "$file" || return 1
+  chmod 600 "$file" 2>/dev/null || true
+  sed -i -E '/^[[:space:]]*Port[[:space:]]+/Id' "$file" || return 1
   for p in ${ports//,/ }; do
-    [[ "$p" =~ ^[0-9]+$ ]] && printf 'Port %s\n' "$p" >> "$file"
+    if [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -ge 1 ] && [ "$p" -le 65535 ]; then
+      printf 'Port %s\n' "$p" >> "$file" || return 1
+      wrote=1
+    else
+      echo_error "拒绝写入非法 SSH 端口：${p:-空}"
+      return 1
+    fi
   done
+  [ "$wrote" -eq 1 ]
 }
 
 set_sshd_kv_effective() {
@@ -790,11 +1026,42 @@ sshd_check_listening_port() {
   return 1
 }
 
+ssh_verify_expectations() {
+  local item key expected actual expected_norm actual_norm
+  for item in "$@"; do
+    key="${item%%=*}"
+    expected="${item#*=}"
+    case "$(printf '%s' "$key" | tr 'A-Z' 'a-z')" in
+      port)
+        expected_norm="$(printf '%s' "$expected" | tr ',' '\n' | awk '/^[0-9]+$/{print}' | sort -n -u | paste -sd, -)"
+        actual_norm="$(sshd_effective_config | awk '$1=="port"{print $2}' | sort -n -u | paste -sd, -)"
+        [ "$actual_norm" = "$expected_norm" ] || { echo_error "sshd -T 端口验证失败：期望 $expected_norm，实际 ${actual_norm:-空}"; return 1; }
+        ;;
+      *)
+        actual="$(sshd_effective_config | awk -v k="$(printf '%s' "$key" | tr 'A-Z' 'a-z')" '$1==k{print $2; exit}')"
+        [ "$actual" = "$expected" ] || { echo_error "sshd -T 验证失败：$key 期望 $expected，实际 ${actual:-空}"; return 1; }
+        ;;
+    esac
+  done
+  return 0
+}
+
 ssh_apply_with_rollback() {
   local desc="${1:-SSH 配置}" backup_dir="${2:-}"
+  shift 2 || true
   [ -n "$backup_dir" ] || return 1
   if ! test_sshd_config; then
     echo_error "$desc：sshd -t 失败，开始回滚。"
+    restore_ssh_tree "$backup_dir" || true
+    return 1
+  fi
+  if ! sshd_effective_config >/dev/null 2>&1; then
+    echo_error "$desc：sshd -T 无法解析最终配置，开始回滚。"
+    restore_ssh_tree "$backup_dir" || true
+    return 1
+  fi
+  if [ "$#" -gt 0 ] && ! ssh_verify_expectations "$@"; then
+    echo_error "$desc：最终生效值不符合预期，开始回滚。"
     restore_ssh_tree "$backup_dir" || true
     return 1
   fi
@@ -804,7 +1071,14 @@ ssh_apply_with_rollback() {
     restart_ssh_service || true
     return 1
   fi
+  if [ "$#" -gt 0 ] && ! ssh_verify_expectations "$@"; then
+    echo_error "$desc：服务 reload/restart 后生效值异常，开始回滚。"
+    restore_ssh_tree "$backup_dir" || true
+    restart_ssh_service || true
+    return 1
+  fi
   echo_color "$desc 已应用。"
+  return 0
 }
 
 show_ssh_effective_config() {
@@ -857,18 +1131,20 @@ change_ssh_port_only() {
     cancel) echo_warn "已取消。"; return 0 ;;
     *) echo_warn "已取消。"; return 0 ;;
   esac
-  backup_dir="$(make_backup_dir ssh)"
-  backup_ssh_tree "$backup_dir"
+  backup_dir="$(make_backup_dir ssh)" || return 1
+  backup_ssh_tree "$backup_dir" || { echo_error "SSH 配置备份失败，已中止。"; return 1; }
   prepare_new_ssh_port_access "$new_port" || return 1
-  sshd_prepare_effective_key "Port" || return 1
-  sshd_set_ports_dropin "$final_ports"
-  if ssh_apply_with_rollback "SSH 端口配置" "$backup_dir"; then
+  sshd_prepare_effective_key "Port" || { restore_ssh_tree "$backup_dir" || true; return 1; }
+  sshd_set_ports_dropin "$final_ports" || { restore_ssh_tree "$backup_dir" || true; return 1; }
+  if ssh_apply_with_rollback "SSH 端口配置" "$backup_dir" "Port=$final_ports"; then
     sshd_effective_config | awk '$1=="port"{print "生效端口: "$2}'
     sshd_check_listening_port "$new_port" || true
     fail2ban_refresh_ssh_port_silent || true
     echo_warn "请不要关闭当前 SSH 连接。请另开终端测试：ssh -p ${new_port} root@你的服务器IP"
     echo_warn "如果回滚过 SSH 配置，防火墙/SELinux 中新增的端口规则可能仍保留；这通常安全，但可在确认后手动清理。"
+    return 0
   fi
+  return 1
 }
 
 get_root_password_hash() {
@@ -927,16 +1203,16 @@ change_ssh_port_and_password_together() {
     keep_both) keep_ports="$old_ports,$new_port"; final_ports="$(printf '%s\n' "$keep_ports" | awk -F, '{for(i=1;i<=NF;i++) if($i && !seen[$i]++) out=out (out? ",":"") $i; print out}')" ;;
     *) echo_warn "已取消；端口和密码均未修改。"; return 0 ;;
   esac
-  backup_dir="$(make_backup_dir ssh-port-pass)"
-  backup_ssh_tree "$backup_dir"
+  backup_dir="$(make_backup_dir ssh-port-pass)" || return 1
+  backup_ssh_tree "$backup_dir" || { echo_error "SSH 配置备份失败，已中止。"; return 1; }
   old_hash="$(get_root_password_hash)"
   [ -n "$old_hash" ] || { echo_error "无法读取 root 原密码哈希，已中止。"; return 1; }
   prepare_new_ssh_port_access "$new_port" || return 1
-  sshd_prepare_effective_key Port || return 1
-  sshd_set_ports_dropin "$final_ports" || return 1
+  sshd_prepare_effective_key Port || { restore_ssh_tree "$backup_dir" || true; return 1; }
+  sshd_set_ports_dropin "$final_ports" || { restore_ssh_tree "$backup_dir" || true; return 1; }
   if ! test_sshd_config; then restore_ssh_tree "$backup_dir"; echo_error "sshd -t 失败，密码尚未修改。"; return 1; fi
   printf 'root:%s\n' "$new_password" | chpasswd || { restore_ssh_tree "$backup_dir"; echo_error "root 密码修改失败，已恢复 SSH 配置。"; return 1; }
-  if ssh_apply_with_rollback "SSH 端口和 root 密码配置" "$backup_dir"; then
+  if ssh_apply_with_rollback "SSH 端口和 root 密码配置" "$backup_dir" "Port=$final_ports"; then
     sshd_check_listening_port "$new_port" || true
     fail2ban_refresh_ssh_port_silent || echo_warn "Fail2Ban 端口刷新失败，请进入菜单手动检查。"
     echo_color "SSH 端口与 root 密码已更新。"
@@ -948,60 +1224,90 @@ change_ssh_port_and_password_together() {
   return 1
 }
 
+restore_user_ssh_from_backup() {
+  local ssh_dir="${1:-}" backup_dir="${2:-}" existed="${3:-0}"
+  [ -n "$ssh_dir" ] && [ -n "$backup_dir" ] || return 1
+  if [ "$existed" -eq 1 ]; then
+    restore_path_from_dir "$ssh_dir" "$backup_dir" || { echo_error "用户 .ssh 自动回滚失败：$ssh_dir"; return 1; }
+  else
+    rm -rf "$ssh_dir" || return 1
+  fi
+}
+
 configure_key_login_existing() {
-  local user pubkey home_dir ssh_dir auth_file backup_dir
+  local user pubkey home_dir ssh_dir auth_file backup_dir ssh_dir_existed=0
   read -r -p "请输入要配置密钥的用户名（默认 root，输入 q 取消）: " user
   user="${user:-root}"
   [[ "$user" =~ ^[Qq]$ ]] && { echo_warn "已取消。"; return 0; }
   id "$user" >/dev/null 2>&1 || { echo_error "用户不存在：$user"; return 1; }
+  home_dir="$(getent passwd "$user" | cut -d: -f6)"
+  [ -n "$home_dir" ] && [ -d "$home_dir" ] || { echo_error "无法确定用户家目录。"; return 1; }
+  ssh_dir="${home_dir}/.ssh"
+  auth_file="${ssh_dir}/authorized_keys"
   echo_info "请粘贴一整行 SSH 公钥（ssh-rsa / ssh-ed25519 / ecdsa-sha2-* 开头），空内容取消："
   read -r pubkey
   [ -z "$pubkey" ] && { echo_warn "已取消。"; return 0; }
   case "$pubkey" in ssh-rsa\ *|ssh-ed25519\ *|ecdsa-sha2-*\ *) ;; *) echo_error "不像合法 SSH 公钥。"; return 1 ;; esac
-  backup_dir="$(make_backup_dir ssh-key)"
-  backup_ssh_tree "$backup_dir"
-  home_dir="$(getent passwd "$user" | cut -d: -f6)"
-  ssh_dir="${home_dir}/.ssh"
-  auth_file="${ssh_dir}/authorized_keys"
-  mkdir -p "$ssh_dir"
-  touch "$auth_file"
-  grep -qxF "$pubkey" "$auth_file" || echo "$pubkey" >> "$auth_file"
-  chown -R "$user:$(id -gn "$user")" "$ssh_dir"
-  chmod 700 "$ssh_dir"
-  chmod 600 "$auth_file"
-  set_sshd_kv_effective "PubkeyAuthentication" "yes"
-  if ssh_apply_with_rollback "密钥登录配置" "$backup_dir"; then
+  backup_dir="$(make_backup_dir ssh-key)" || return 1
+  backup_ssh_tree "$backup_dir" || { echo_error "SSH 配置备份失败，已中止。"; return 1; }
+  if [ -d "$ssh_dir" ]; then ssh_dir_existed=1; backup_path_to_dir "$ssh_dir" "$backup_dir" || return 1; fi
+  mkdir -p "$ssh_dir" || { restore_user_ssh_from_backup "$ssh_dir" "$backup_dir" "$ssh_dir_existed" || true; return 1; }
+  touch "$auth_file" || { restore_user_ssh_from_backup "$ssh_dir" "$backup_dir" "$ssh_dir_existed" || true; return 1; }
+  if ! grep -qxF "$pubkey" "$auth_file"; then
+    printf '%s\n' "$pubkey" >> "$auth_file" || { restore_user_ssh_from_backup "$ssh_dir" "$backup_dir" "$ssh_dir_existed" || true; return 1; }
+  fi
+  chown -R "$user:$(id -gn "$user")" "$ssh_dir" || { restore_user_ssh_from_backup "$ssh_dir" "$backup_dir" "$ssh_dir_existed" || true; return 1; }
+  chmod 700 "$ssh_dir" || { restore_user_ssh_from_backup "$ssh_dir" "$backup_dir" "$ssh_dir_existed" || true; return 1; }
+  chmod 600 "$auth_file" || { restore_user_ssh_from_backup "$ssh_dir" "$backup_dir" "$ssh_dir_existed" || true; return 1; }
+  if ! set_sshd_kv_effective "PubkeyAuthentication" "yes"; then
+    restore_ssh_tree "$backup_dir" || true
+    restore_user_ssh_from_backup "$ssh_dir" "$backup_dir" "$ssh_dir_existed" || true
+    return 1
+  fi
+  if ssh_apply_with_rollback "密钥登录配置" "$backup_dir" "PubkeyAuthentication=yes"; then
     sshd_check_effective_key PubkeyAuthentication yes || true
     echo_warn "请另开终端测试密钥登录成功后，再考虑关闭密码登录。"
+    return 0
   fi
+  restore_user_ssh_from_backup "$ssh_dir" "$backup_dir" "$ssh_dir_existed" || true
+  return 1
 }
 
 generate_key_login_and_output_private() {
-  local user home_dir ssh_dir key_name key_path pub_path auth_file comment backup_dir ans
+  local user home_dir ssh_dir key_name key_path pub_path auth_file comment backup_dir ans ssh_dir_existed=0
   read -r -p "请输入要生成密钥的用户名（默认 root，输入 q 取消）: " user
   user="${user:-root}"
   [[ "$user" =~ ^[Qq]$ ]] && { echo_warn "已取消。"; return 0; }
   id "$user" >/dev/null 2>&1 || { echo_error "用户不存在：$user"; return 1; }
   ensure_command ssh-keygen openssh-client || return 1
-  backup_dir="$(make_backup_dir ssh-keygen)"
-  backup_ssh_tree "$backup_dir"
   home_dir="$(getent passwd "$user" | cut -d: -f6)"
+  [ -n "$home_dir" ] && [ -d "$home_dir" ] || { echo_error "无法确定用户家目录。"; return 1; }
   ssh_dir="${home_dir}/.ssh"
   key_name="server-toolkit_${user}_ed25519_$(date +%Y%m%d_%H%M%S)"
   key_path="${ssh_dir}/${key_name}"
   pub_path="${key_path}.pub"
   auth_file="${ssh_dir}/authorized_keys"
   comment="server-toolkit-${user}-$(hostname 2>/dev/null)-$(date +%F)"
-  mkdir -p "$ssh_dir"
-  chmod 700 "$ssh_dir"
-  ssh-keygen -t ed25519 -N "" -C "$comment" -f "$key_path" || { echo_error "生成密钥失败。"; return 1; }
-  touch "$auth_file"
-  cat "$pub_path" >> "$auth_file"
-  chown -R "$user:$(id -gn "$user")" "$ssh_dir"
-  chmod 600 "$auth_file" "$key_path"
-  chmod 644 "$pub_path"
-  set_sshd_kv_effective "PubkeyAuthentication" "yes"
-  ssh_apply_with_rollback "自动生成密钥" "$backup_dir" || return 1
+  backup_dir="$(make_backup_dir ssh-keygen)" || return 1
+  backup_ssh_tree "$backup_dir" || { echo_error "SSH 配置备份失败，已中止。"; return 1; }
+  if [ -d "$ssh_dir" ]; then ssh_dir_existed=1; backup_path_to_dir "$ssh_dir" "$backup_dir" || return 1; fi
+  mkdir -p "$ssh_dir" || { restore_user_ssh_from_backup "$ssh_dir" "$backup_dir" "$ssh_dir_existed" || true; return 1; }
+  chmod 700 "$ssh_dir" || { restore_user_ssh_from_backup "$ssh_dir" "$backup_dir" "$ssh_dir_existed" || true; return 1; }
+  ssh-keygen -t ed25519 -N "" -C "$comment" -f "$key_path" || { echo_error "生成密钥失败。"; restore_user_ssh_from_backup "$ssh_dir" "$backup_dir" "$ssh_dir_existed" || true; return 1; }
+  touch "$auth_file" || { restore_user_ssh_from_backup "$ssh_dir" "$backup_dir" "$ssh_dir_existed" || true; return 1; }
+  cat "$pub_path" >> "$auth_file" || { restore_user_ssh_from_backup "$ssh_dir" "$backup_dir" "$ssh_dir_existed" || true; return 1; }
+  chown -R "$user:$(id -gn "$user")" "$ssh_dir" || { restore_user_ssh_from_backup "$ssh_dir" "$backup_dir" "$ssh_dir_existed" || true; return 1; }
+  chmod 600 "$auth_file" "$key_path" || { restore_user_ssh_from_backup "$ssh_dir" "$backup_dir" "$ssh_dir_existed" || true; return 1; }
+  chmod 644 "$pub_path" || { restore_user_ssh_from_backup "$ssh_dir" "$backup_dir" "$ssh_dir_existed" || true; return 1; }
+  if ! set_sshd_kv_effective "PubkeyAuthentication" "yes"; then
+    restore_ssh_tree "$backup_dir" || true
+    restore_user_ssh_from_backup "$ssh_dir" "$backup_dir" "$ssh_dir_existed" || true
+    return 1
+  fi
+  if ! ssh_apply_with_rollback "自动生成密钥" "$backup_dir" "PubkeyAuthentication=yes"; then
+    restore_user_ssh_from_backup "$ssh_dir" "$backup_dir" "$ssh_dir_existed" || true
+    return 1
+  fi
   echo_color "已为用户 $user 生成密钥，并写入 authorized_keys。"
   echo_info "私钥保存路径：$key_path"
   echo_info "公钥内容："
@@ -1019,7 +1325,7 @@ generate_key_login_and_output_private() {
       2) echo_info "已保留私钥在服务器路径：$key_path"; return 0 ;;
       3)
         confirm_action "删除服务器上的私钥文件前，请确认你已经把私钥安全保存到本地。" "2" || continue
-        rm -f "$key_path"
+        rm -f "$key_path" || { echo_error "删除私钥失败：$key_path"; return 1; }
         echo_warn "已删除服务器上的私钥文件：$key_path"
         return 0
         ;;
@@ -1052,22 +1358,22 @@ toggle_password_login() {
   ui_prompt opt
   case "$opt" in
     1)
-      backup_dir="$(make_backup_dir ssh-passwd-on)"; backup_ssh_tree "$backup_dir"
+      backup_dir="$(make_backup_dir ssh-passwd-on)" || return 1; backup_ssh_tree "$backup_dir" || return 1
       set_sshd_kv_effective "PasswordAuthentication" "yes"
       set_sshd_kv_effective "KbdInteractiveAuthentication" "yes"
       set_sshd_kv_effective "ChallengeResponseAuthentication" "yes"
-      ssh_apply_with_rollback "开启密码登录" "$backup_dir" && sshd_check_effective_key PasswordAuthentication yes || true
+      ssh_apply_with_rollback "开启密码登录" "$backup_dir" "PasswordAuthentication=yes" "KbdInteractiveAuthentication=yes" "ChallengeResponseAuthentication=yes"
       ;;
     2)
       read -r -p "请输入已确认可用密钥登录的用户名（默认 root）: " user
       user="${user:-root}"
       check_authorized_keys_safe "$user" || return 1
       confirm_action "关闭密码登录可能导致无法登录。确认已经另开终端测试密钥登录成功？" "2" || { echo_warn "已取消。"; return 0; }
-      backup_dir="$(make_backup_dir ssh-passwd-off)"; backup_ssh_tree "$backup_dir"
+      backup_dir="$(make_backup_dir ssh-passwd-off)" || return 1; backup_ssh_tree "$backup_dir" || return 1
       set_sshd_kv_effective "PasswordAuthentication" "no"
       set_sshd_kv_effective "KbdInteractiveAuthentication" "no"
       set_sshd_kv_effective "ChallengeResponseAuthentication" "no"
-      ssh_apply_with_rollback "关闭密码登录" "$backup_dir" && sshd_check_effective_key PasswordAuthentication no || true
+      ssh_apply_with_rollback "关闭密码登录" "$backup_dir" "PasswordAuthentication=no" "KbdInteractiveAuthentication=no" "ChallengeResponseAuthentication=no"
       ;;
     0) return 0 ;;
     *) echo_error "无效选项" ;;
@@ -1085,9 +1391,9 @@ ensure_sudo_for_user() {
   id -nG "$user" | tr ' ' '\n' | grep -qx "$group" || { echo_error "用户 $user 未能加入 $group 组。"; return 1; }
   mkdir -p /etc/sudoers.d
   sudoers_file="/etc/sudoers.d/99-server-toolkit-${group}"
-  backup_dir="$(make_backup_dir sudoers)"
-  backup_path_to_dir /etc/sudoers "$backup_dir"
-  backup_path_to_dir /etc/sudoers.d "$backup_dir"
+  backup_dir="$(make_backup_dir sudoers)" || return 1
+  backup_path_to_dir /etc/sudoers "$backup_dir" || return 1
+  backup_path_to_dir /etc/sudoers.d "$backup_dir" || return 1
   if ! grep -RqsE "^%${group}[[:space:]]+ALL=" /etc/sudoers /etc/sudoers.d 2>/dev/null; then
     printf '%%%s ALL=(ALL:ALL) ALL\n' "$group" > "$sudoers_file"
     chmod 440 "$sudoers_file"
@@ -1117,7 +1423,10 @@ manage_root_login_user() {
     1)
       read -r -p "请输入新用户名（输入 q 取消）: " user
       [[ "$user" =~ ^[Qq]$ || -z "$user" ]] && { echo_warn "已取消。"; return 0; }
-      if ! id "$user" >/dev/null 2>&1; then
+      [[ "$user" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || { echo_error "用户名格式无效。"; return 1; }
+      if id "$user" >/dev/null 2>&1; then
+        confirm_action "用户 $user 已存在。是否继续修改其密码并配置 sudo？" "2" || return 0
+      else
         useradd -m -s /bin/bash "$user" || return 1
       fi
       read -r -s -p "请输入新用户密码: " pass; echo
@@ -1126,14 +1435,14 @@ manage_root_login_user() {
       ensure_sudo_for_user "$user" || return 1
       echo_warn "请另开终端测试该用户可登录并可执行 sudo。"
       confirm_action "确认继续关闭 root SSH 登录？" "2" || return 0
-      backup_dir="$(make_backup_dir ssh-root-off)"; backup_ssh_tree "$backup_dir"
+      backup_dir="$(make_backup_dir ssh-root-off)" || return 1; backup_ssh_tree "$backup_dir" || return 1
       set_sshd_kv_effective "PermitRootLogin" "no"
-      ssh_apply_with_rollback "关闭 root SSH 登录" "$backup_dir" && echo_warn "请再次确认 ${user} 的 SSH/sudo 可用。"
+      ssh_apply_with_rollback "关闭 root SSH 登录" "$backup_dir" "PermitRootLogin=no" && echo_warn "请再次确认 ${user} 的 SSH/sudo 可用。"
       ;;
     2)
-      backup_dir="$(make_backup_dir ssh-root-on)"; backup_ssh_tree "$backup_dir"
+      backup_dir="$(make_backup_dir ssh-root-on)" || return 1; backup_ssh_tree "$backup_dir" || return 1
       set_sshd_kv_effective "PermitRootLogin" "yes"
-      ssh_apply_with_rollback "恢复 root SSH 登录" "$backup_dir"
+      ssh_apply_with_rollback "恢复 root SSH 登录" "$backup_dir" "PermitRootLogin=yes"
       ;;
     0) return 0 ;;
     *) echo_error "无效选项" ;;
@@ -1142,8 +1451,8 @@ manage_root_login_user() {
 
 ssh_security_recommended() {
   local backup_dir
-  backup_dir="$(make_backup_dir ssh-secure)"
-  backup_ssh_tree "$backup_dir"
+  backup_dir="$(make_backup_dir ssh-secure)" || return 1
+  backup_ssh_tree "$backup_dir" || return 1
   echo_info "应用保守推荐配置：不禁用 root、不禁用密码、不改端口。"
   set_sshd_kv_effective "LoginGraceTime" "30"
   set_sshd_kv_effective "MaxAuthTries" "3"
@@ -1153,13 +1462,13 @@ ssh_security_recommended() {
   set_sshd_kv_effective "PermitUserEnvironment" "no"
   set_sshd_kv_effective "ClientAliveInterval" "300"
   set_sshd_kv_effective "ClientAliveCountMax" "2"
-  ssh_apply_with_rollback "SSH 保守增强" "$backup_dir"
+  ssh_apply_with_rollback "SSH 保守增强" "$backup_dir" "LoginGraceTime=30" "MaxAuthTries=3" "PermitEmptyPasswords=no"
 }
 
 ssh_security_custom() {
   local opt v a b backup_dir rc
-  backup_dir="$(make_backup_dir ssh-custom)"
-  backup_ssh_tree "$backup_dir"
+  backup_dir="$(make_backup_dir ssh-custom)" || return 1
+  backup_ssh_tree "$backup_dir" || return 1
   while true; do
     ui_title "SSH 安全性增强 · 逐项配置"
     ui_option 1 "MaxAuthTries：最大认证失败次数"
@@ -1278,6 +1587,12 @@ show_timesync_diagnostics() {
   chronyc sources -v 2>/dev/null || true
 }
 
+time_sync_can_set_clock() {
+  if is_container_env; then echo_warn "检测到容器环境，长期时间同步应由宿主机管理。"; return 1; fi
+  if ! has_cap_sys_time; then echo_warn "当前进程缺少 CAP_SYS_TIME，无法安全修改系统时钟。"; return 1; fi
+  return 0
+}
+
 TIME_SYNC_STOPPED_SERVICES=""
 
 time_sync_restore_stopped_clients() {
@@ -1314,38 +1629,41 @@ time_sync_configure_timesyncd() {
   local ntp="${1:-}"
   local conf_dir="/etc/systemd/timesyncd.conf.d"
   local conf="${conf_dir}/server-toolkit.conf"
-  local backup_dir
+  local backup_dir existed=0
   validate_ntp_servers "$ntp" || return 1
   if ! is_systemd_available; then echo_warn "当前环境没有可用 systemd，无法配置 systemd-timesyncd。"; return 1; fi
-  if is_container_env || ! has_cap_sys_time; then
-    echo_warn "检测到容器环境或缺少 CAP_SYS_TIME，不写入长期 NTP 服务配置；请由宿主机负责校时。"
-    return 1
-  fi
+  time_sync_can_set_clock || return 2
   command -v timedatectl >/dev/null 2>&1 || { echo_warn "未检测到 timedatectl。"; return 1; }
   if ! systemctl list-unit-files 2>/dev/null | grep -q '^systemd-timesyncd\.service'; then pkg_install systemd-timesyncd || return 1; fi
   systemctl list-unit-files 2>/dev/null | grep -q '^systemd-timesyncd\.service' || { echo_warn "未检测到 systemd-timesyncd.service。"; return 1; }
+  [ -f "$conf" ] && existed=1
+  backup_dir="$(make_backup_dir timesyncd)" || return 1
+  [ "$existed" -eq 1 ] && backup_path_to_dir "$conf" "$backup_dir" || true
   time_sync_stop_conflicting_clients timesyncd || return 1
-  backup_dir="$(make_backup_dir timesyncd)"
-  backup_path_to_dir "$conf" "$backup_dir"
-  mkdir -p "$conf_dir"
-  cat > "$conf" <<EOF_TS
-# server-toolkit v2.4: systemd-timesyncd NTP
+  mkdir -p "$conf_dir" || { time_sync_restore_stopped_clients; return 1; }
+  if ! cat > "$conf" <<EOF_TS
+# server-toolkit v2.5: systemd-timesyncd NTP
 [Time]
 NTP=$ntp
 FallbackNTP=time.google.com time.cloudflare.com
 EOF_TS
+  then
+    echo_error "systemd-timesyncd 配置写入失败，开始回滚。"
+    if [ "$existed" -eq 1 ]; then restore_path_from_dir "$conf" "$backup_dir" || true; else rm -f "$conf"; fi
+    time_sync_restore_stopped_clients
+    return 1
+  fi
   timedatectl set-ntp true >/dev/null 2>&1 || echo_warn "timedatectl set-ntp true 失败，继续尝试启动服务。"
   if ! systemctl enable --now systemd-timesyncd || ! systemctl restart systemd-timesyncd; then
     echo_error "systemd-timesyncd 启动/重启失败，回滚配置。"
-    rm -f "$conf"
-    restore_path_from_dir "$conf" "$backup_dir" || true
+    if [ "$existed" -eq 1 ]; then restore_path_from_dir "$conf" "$backup_dir" || true; else rm -f "$conf"; fi
     systemctl restart systemd-timesyncd >/dev/null 2>&1 || true
     time_sync_restore_stopped_clients
     return 1
   fi
   if ! systemctl is-active systemd-timesyncd >/dev/null 2>&1; then
     echo_error "systemd-timesyncd 未处于 active，回滚配置。"
-    rm -f "$conf"; restore_path_from_dir "$conf" "$backup_dir" || true
+    if [ "$existed" -eq 1 ]; then restore_path_from_dir "$conf" "$backup_dir" || true; else rm -f "$conf"; fi
     time_sync_restore_stopped_clients
     return 1
   fi
@@ -1367,37 +1685,37 @@ chrony_service_name() {
 
 time_sync_configure_chrony() {
   local ntp="${1:-}"
-  local conf service line tmp backup_dir
+  local conf service line tmp backup_dir existed=0
   validate_ntp_servers "$ntp" || return 1
-  if is_container_env || ! has_cap_sys_time; then echo_warn "容器或缺少 CAP_SYS_TIME，chrony 可能只能查询而不能校时。"; fi
+  time_sync_can_set_clock || return 2
   command -v chronyd >/dev/null 2>&1 || pkg_install chrony || return 1
   conf="$(chrony_config_path)"
   service="$(chrony_service_name)"
-  mkdir -p "$(dirname "$conf")"
-  [ -f "$conf" ] || touch "$conf"
+  mkdir -p "$(dirname "$conf")" || return 1
+  [ -f "$conf" ] && existed=1
+  backup_dir="$(make_backup_dir chrony)" || return 1
+  [ "$existed" -eq 1 ] && backup_path_to_dir "$conf" "$backup_dir"
   time_sync_stop_conflicting_clients chrony || return 1
-  backup_dir="$(make_backup_dir chrony)"
-  backup_path_to_dir "$conf" "$backup_dir"
-  tmp="$(mktemp /tmp/server-toolkit-chrony.XXXXXX)" || return 1
-  sed '/server-toolkit v2\.[234] BEGIN/,/server-toolkit v2\.[234] END/d' "$conf" > "$tmp"
+  tmp="$(mktemp /tmp/server-toolkit-chrony.XXXXXX)" || { time_sync_restore_stopped_clients; return 1; }
+  [ -f "$conf" ] && sed '/server-toolkit v[0-9.]* BEGIN/,/server-toolkit v[0-9.]* END/d' "$conf" > "$tmp" || : > "$tmp"
   {
     cat "$tmp"
     echo
-    echo "# server-toolkit v2.4 BEGIN"
+    echo "# server-toolkit v2.5 BEGIN"
     for line in $ntp; do printf 'server %s iburst\n' "$line"; done
     echo "makestep 1.0 3"
-    echo "# server-toolkit v2.4 END"
-  } > "$conf"
+    echo "# server-toolkit v2.5 END"
+  } > "$conf" || { rm -f "$tmp"; time_sync_restore_stopped_clients; return 1; }
   rm -f "$tmp"
-  if command -v chronyd >/dev/null 2>&1 && ! chronyd -p -f "$conf" >/tmp/server-toolkit-chrony-test.log 2>&1; then
+  if ! chronyd -p -f "$conf" >/tmp/server-toolkit-chrony-test.log 2>&1; then
     echo_error "chrony 配置检测失败，开始回滚：/tmp/server-toolkit-chrony-test.log"
-    restore_path_from_dir "$conf" "$backup_dir" || true
+    if [ "$existed" -eq 1 ]; then restore_path_from_dir "$conf" "$backup_dir" || true; else rm -f "$conf"; fi
     time_sync_restore_stopped_clients
     return 1
   fi
   if ! service_enable_now "$service" || ! service_restart_safe "$service"; then
     echo_error "chrony 服务启动/重启失败，开始回滚。"
-    restore_path_from_dir "$conf" "$backup_dir" || true
+    if [ "$existed" -eq 1 ]; then restore_path_from_dir "$conf" "$backup_dir" || true; else rm -f "$conf"; fi
     service_restart_safe "$service" >/dev/null 2>&1 || true
     time_sync_restore_stopped_clients
     return 1
@@ -1410,6 +1728,7 @@ time_sync_configure_chrony() {
 time_sync_one_shot_fallback() {
   local ntp="${1:-}" s first
   validate_ntp_servers "$ntp" || return 1
+  time_sync_can_set_clock || { echo_warn "已跳过一次性校时，只显示当前时间状态。"; show_timesync_diagnostics; return 2; }
   first="$(printf '%s\n' "$ntp" | awk '{print $1}')"
   if command -v chronyd >/dev/null 2>&1; then
     echo_info "尝试 chronyd -q 一次性校时..."
@@ -1495,25 +1814,36 @@ apt_signed_by_line() {
 apt_backup_all() {
   local dir="${1:-}" path manifest
   [ -n "$dir" ] || return 1
-  mkdir -p "$dir"
+  mkdir -p "$dir" || return 1
   manifest="$dir/.absent-paths"
-  : > "$manifest"
+  : > "$manifest" || return 1
   for path in /etc/apt/sources.list /etc/apt/sources.list.d /etc/apt/apt.conf.d; do
-    if [ -e "$path" ]; then backup_path_to_dir "$path" "$dir" || return 1; else echo "$path" >> "$manifest"; fi
+    if [ -e "$path" ]; then
+      backup_path_to_dir "$path" "$dir" || return 1
+    else
+      printf '%s\n' "$path" >> "$manifest" || return 1
+    fi
   done
 }
 
 apt_restore_all() {
-  local dir="${1:-}" path
+  local dir="${1:-}" path failed=0
   [ -n "$dir" ] || return 1
   for path in /etc/apt/sources.list /etc/apt/sources.list.d /etc/apt/apt.conf.d; do
-    rm -rf "$path"
+    if ! rm -rf "$path"; then
+      echo_error "无法清理待恢复路径：$path"
+      failed=1
+      continue
+    fi
     if [ -e "$dir$path" ]; then
-      mkdir -p "$(dirname "$path")"
-      cp -a "$dir$path" "$path"
+      if ! mkdir -p "$(dirname "$path")" || ! cp -a "$dir$path" "$path"; then
+        echo_error "无法从备份恢复：$path"
+        failed=1
+      fi
     fi
   done
-  mkdir -p /etc/apt/sources.list.d /etc/apt/apt.conf.d
+  mkdir -p /etc/apt/sources.list.d /etc/apt/apt.conf.d || failed=1
+  [ "$failed" -eq 0 ]
 }
 
 apt_is_distribution_source_file() {
@@ -1528,7 +1858,7 @@ apt_is_distribution_source_file() {
 apt_disable_conflicting_distro_sources() {
   local f stamp main_backup
   stamp="$(date +%F_%H-%M-%S)"
-  mkdir -p /etc/apt/sources.list.d
+  mkdir -p /etc/apt/sources.list.d || return 1
   for f in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
     [ -f "$f" ] || continue
     case "$f" in *server-toolkit*|*/debian.sources|*/ubuntu.sources) continue ;; esac
@@ -1544,17 +1874,18 @@ apt_disable_conflicting_distro_sources() {
     cp -a /etc/apt/sources.list "$main_backup" || return 1
     echo_warn "传统 sources.list 已原样保留为：$main_backup"
   fi
-  : > /etc/apt/sources.list
+  : > /etc/apt/sources.list || return 1
 }
 
 apt_set_archive_mode() {
   local mode="${1:-normal}" conf="/etc/apt/apt.conf.d/99-server-toolkit-archive"
+  mkdir -p /etc/apt/apt.conf.d || return 1
   if [ "$mode" = "archive" ]; then
     cat > "$conf" <<'EOF_ARCH'
 Acquire::Check-Valid-Until "false";
 EOF_ARCH
   else
-    rm -f "$conf"
+    rm -f "$conf" || return 1
   fi
 }
 
@@ -1567,16 +1898,14 @@ apt_suite_available() {
 apt_collect_suites() {
   local base="${1:-}" code="${2:-}" kind="${3:-base}" out="" candidate
   [ -n "$base" ] && [ -n "$code" ] || return 1
-  case "$code" in
-    sid|unstable) printf '%s\n' "$code"; return 0 ;;
-  esac
+  case "$code" in sid|unstable) printf '%s\n' "$code"; return 0 ;; esac
   if [ "$kind" = "base" ]; then
     out="$code"
     for candidate in "${code}-updates" "${code}-backports"; do
       apt_suite_available "$base" "$candidate" && out="$out $candidate"
     done
   else
-    candidate="${code}-security"
+    case "$code" in buster) candidate="buster/updates" ;; *) candidate="${code}-security" ;; esac
     apt_suite_available "$base" "$candidate" && out="$candidate"
   fi
   printf '%s\n' "$out"
@@ -1605,8 +1934,9 @@ write_debian_sources() {
       echo "Components: $components"
       [ -n "$signed" ] && echo "$signed"
     fi
-  } > "$file"
-  apt_set_archive_mode "$archive_mode"
+  } > "$file" || return 1
+  chmod 644 "$file" 2>/dev/null || true
+  apt_set_archive_mode "$archive_mode" || return 1
 }
 
 write_ubuntu_sources() {
@@ -1631,8 +1961,9 @@ write_ubuntu_sources() {
       echo "Components: main restricted universe multiverse"
       [ -n "$signed" ] && echo "$signed"
     fi
-  } > "$file"
-  apt_set_archive_mode "$archive_mode"
+  } > "$file" || return 1
+  chmod 644 "$file" 2>/dev/null || true
+  apt_set_archive_mode "$archive_mode" || return 1
 }
 
 apt_source_candidates() {
@@ -1678,17 +2009,26 @@ curl_has_release() {
 
 apt_update_with_log() {
   local log="${1:-/tmp/server-toolkit-apt-update.log}"
-  DEBIAN_FRONTEND=noninteractive apt-get update -y >"$log" 2>&1
+  DEBIAN_FRONTEND=noninteractive apt-get update >"$log" 2>&1
 }
 
 apt_apply_source_profile() {
   local os="${1:-}" code="${2:-}" label="${3:-}" base="${4:-}" secbase="${5:-}" archive_mode="${6:-normal}" backup_dir log
   [ -n "$os" ] && [ -n "$code" ] && [ -n "$base" ] && [ -n "$secbase" ] || return 1
-  backup_dir="$(make_backup_dir apt-source)"
-  apt_backup_all "$backup_dir"
+  backup_dir="$(make_backup_dir apt-source)" || return 1
+  apt_backup_all "$backup_dir" || { echo_error "APT 配置完整备份失败，未进行改源。"; return 1; }
   log="/tmp/server-toolkit-apt-update.$(date +%s).log"
   echo_info "准备写入 APT 源：$label"
-  if [ "$os" = "ubuntu" ]; then write_ubuntu_sources "$base" "$secbase" "$code" "$archive_mode"; else write_debian_sources "$base" "$secbase" "$code" "$archive_mode"; fi
+  if [ "$os" = "ubuntu" ]; then
+    write_ubuntu_sources "$base" "$secbase" "$code" "$archive_mode"
+  else
+    write_debian_sources "$base" "$secbase" "$code" "$archive_mode"
+  fi
+  if [ "$?" -ne 0 ]; then
+    echo_error "APT 源文件写入失败，开始回滚。"
+    apt_restore_all "$backup_dir"
+    return 1
+  fi
   apt-get clean >/dev/null 2>&1 || true
   if apt_update_with_log "$log"; then
     echo_color "APT 源已修复/切换成功：$label"
@@ -1698,7 +2038,7 @@ apt_apply_source_profile() {
   echo_error "apt-get update 失败，日志：$log"
   tail -n 30 "$log" 2>/dev/null || true
   echo_warn "开始回滚 APT 源配置。"
-  apt_restore_all "$backup_dir"
+  apt_restore_all "$backup_dir" || { echo_error "APT 配置自动回滚失败，备份位于：$backup_dir"; return 1; }
   apt_update_with_log "$log.rollback" || echo_warn "回滚后 apt-get update 仍失败，请手动检查日志：$log.rollback"
   return 1
 }
@@ -1800,21 +2140,28 @@ rpm_check_repos() {
 rpm_enable_crb_like() {
   parse_os_release
   if is_rhel_subscription_os; then
-    echo_warn "RHEL 请用 subscription-manager 启用仓库，本脚本不强改订阅源。"
-    return 0
+    echo_warn "RHEL 请用 subscription-manager 启用 CodeReady Builder，本脚本不修改 redhat.repo。"
+    return 2
   fi
   if command -v dnf >/dev/null 2>&1; then
-    dnf install -y dnf-plugins-core >/dev/null 2>&1 || true
+    pkg_install dnf-plugins-core >/dev/null 2>&1 || echo_warn "dnf-plugins-core 安装失败，继续尝试现有 config-manager。"
     case "$OS_ID" in
       rocky|almalinux|ol|centos)
-        dnf config-manager --set-enabled crb >/dev/null 2>&1 || dnf config-manager --set-enabled powertools >/dev/null 2>&1 || true
+        if dnf config-manager --set-enabled crb >/dev/null 2>&1 || dnf config-manager --set-enabled powertools >/dev/null 2>&1; then
+          echo_color "已启用 CRB/PowerTools 类仓库。"; return 0
+        fi
+        echo_warn "未能启用 CRB/PowerTools，可能该版本不需要或仓库名称不同。"; return 1
         ;;
-      fedora) echo_info "Fedora 通常不需要 CRB。" ;;
-      amzn|amazon) echo_info "Amazon Linux 使用 amazon-linux-extras 或 dnf/yum 官方源，未启用 CRB。" ;;
+      fedora) echo_info "Fedora 通常不需要 CRB。"; return 0 ;;
+      amzn|amazon) echo_info "Amazon Linux 不使用 CRB。"; return 0 ;;
+      *) echo_warn "当前发行版未定义 CRB 自动启用规则。"; return 2 ;;
     esac
   elif command -v yum-config-manager >/dev/null 2>&1; then
-    yum-config-manager --enable extras >/dev/null 2>&1 || true
+    yum-config-manager --enable extras >/dev/null 2>&1 && { echo_color "已启用 extras 仓库。"; return 0; }
+    echo_warn "extras 仓库启用失败。"; return 1
   fi
+  echo_warn "未检测到 dnf config-manager/yum-config-manager。"
+  return 1
 }
 
 rpm_install_epel_safely() {
@@ -1889,7 +2236,7 @@ fail2ban_backend_config() {
     fi
   fi
   if is_redhat_like; then logpath="/var/log/secure"; else logpath="/var/log/auth.log"; fi
-  if [ -s "$logpath" ]; then
+  if [ -r "$logpath" ]; then
     echo "backend = auto"
     echo "logpath = $logpath"
     return 0
@@ -1901,8 +2248,8 @@ fail2ban_backend_config() {
 fail2ban_banaction() {
   local dir="/etc/fail2ban/action.d"
   if firewalld_active && [ -f "$dir/firewallcmd-ipset.conf" ]; then echo "firewallcmd-ipset"; return; fi
-  if command -v nft >/dev/null 2>&1 && [ -f "$dir/nftables-multiport.conf" ]; then echo "nftables-multiport"; return; fi
-  if command -v ufw >/dev/null 2>&1 && ufw_active && [ -f "$dir/ufw.conf" ]; then echo "ufw"; return; fi
+  if ufw_active && [ -f "$dir/ufw.conf" ]; then echo "ufw"; return; fi
+  if command -v nft >/dev/null 2>&1 && nft list ruleset >/dev/null 2>&1 && [ -f "$dir/nftables-multiport.conf" ]; then echo "nftables-multiport"; return; fi
   if [ -f "$dir/iptables-multiport.conf" ]; then echo "iptables-multiport"; return; fi
   echo "iptables-multiport"
 }
@@ -1911,7 +2258,7 @@ fail2ban_write_global_dropin() {
   local level="${1:-INFO}" file="/etc/fail2ban/fail2ban.d/server-toolkit.conf"
   mkdir -p /etc/fail2ban/fail2ban.d
   cat > "$file" <<EOF_F2B_GLOBAL
-# server-toolkit v2.4: global drop-in, does not overwrite fail2ban.local
+# server-toolkit v2.5: global drop-in, does not overwrite fail2ban.local
 [Definition]
 allowipv6 = auto
 loglevel = $level
@@ -1941,7 +2288,7 @@ fail2ban_write_sshd_jail() {
   backend="$(fail2ban_backend_config)" || return 1
   mkdir -p /etc/fail2ban/jail.d
   cat > "$file" <<EOF_F2B_JAIL
-# server-toolkit v2.4: sshd jail, does not overwrite jail.local
+# server-toolkit v2.5: sshd jail, does not overwrite jail.local
 [sshd]
 enabled = true
 port = $ssh_ports
@@ -1955,37 +2302,50 @@ EOF_F2B_JAIL
 }
 
 fail2ban_validate_and_restart() {
+  local test_log="/tmp/server-toolkit-fail2ban-test.$$.log"
   command -v fail2ban-server >/dev/null 2>&1 || { echo_error "fail2ban-server 不存在。"; return 1; }
-  if ! fail2ban-server -t >/tmp/server-toolkit-fail2ban-test.log 2>&1; then
-    echo_error "Fail2Ban 配置检测失败："
-    cat /tmp/server-toolkit-fail2ban-test.log 2>/dev/null || true
+  if ! fail2ban-server -t >"$test_log" 2>&1; then
+    echo_error "Fail2Ban 配置检测失败，日志：$test_log"
+    cat "$test_log" 2>/dev/null || true
     return 1
   fi
-  service_enable_now fail2ban || true
+  if ! service_enable_now fail2ban; then
+    echo_error "Fail2Ban 服务启动/开机启用失败。"
+    return 1
+  fi
   service_restart_safe fail2ban || { journalctl -u fail2ban -n 50 --no-pager 2>/dev/null || true; return 1; }
+  rm -f "$test_log"
 }
 
 fail2ban_restore_from_backup() {
-  local backup_dir="${1:-}"
+  local backup_dir="${1:-}" restart_failed=0
   [ -n "$backup_dir" ] || return 1
   if [ -d "$backup_dir/etc/fail2ban" ]; then
-    rm -rf /etc/fail2ban
-    cp -a "$backup_dir/etc/fail2ban" /etc/fail2ban
-    service_restart_safe fail2ban >/dev/null 2>&1 || true
-    return 0
+    rm -rf /etc/fail2ban || return 1
+    cp -a "$backup_dir/etc/fail2ban" /etc/fail2ban || return 1
+  else
+    rm -f /etc/fail2ban/jail.d/server-toolkit-sshd.conf || return 1
+    rm -f /etc/fail2ban/fail2ban.d/server-toolkit.conf || return 1
   fi
-  return 1
+  if command -v fail2ban-server >/dev/null 2>&1; then
+    service_restart_safe fail2ban >/dev/null 2>&1 || restart_failed=1
+  fi
+  if [ "$restart_failed" -ne 0 ]; then
+    echo_error "Fail2Ban 配置已回滚，但服务未能重新启动。请执行 fail2ban-server -t 并检查服务日志。"
+    return 1
+  fi
+  return 0
 }
 
 setup_fail2ban_default() {
   ui_title "安装/配置 Fail2Ban"
   pkg_install fail2ban python3-systemd || pkg_install fail2ban || return 1
   local backup_dir ssh_ports
-  backup_dir="$(make_backup_dir fail2ban)"
-  backup_path_to_dir /etc/fail2ban "$backup_dir"
+  backup_dir="$(make_backup_dir fail2ban)" || return 1
+  backup_path_to_dir /etc/fail2ban "$backup_dir" || return 1
   ssh_ports="$(get_current_ssh_ports)"
-  fail2ban_write_global_dropin INFO
-  fail2ban_write_sshd_jail "$ssh_ports" 3600 600 3 ""
+  fail2ban_write_global_dropin INFO || { fail2ban_restore_from_backup "$backup_dir"; return 1; }
+  fail2ban_write_sshd_jail "$ssh_ports" 3600 600 3 "" || { fail2ban_restore_from_backup "$backup_dir"; return 1; }
   if fail2ban_validate_and_restart; then
     echo_color "Fail2Ban 已配置完成，SSH 端口：$ssh_ports"
   else
@@ -1999,12 +2359,12 @@ fail2ban_refresh_ssh_port_silent() {
   command -v fail2ban-server >/dev/null 2>&1 || return 0
   local file="/etc/fail2ban/jail.d/server-toolkit-sshd.conf" backup_dir ssh_ports tmp
   [ -f "$file" ] || return 0
-  backup_dir="$(make_backup_dir fail2ban-port)"
-  backup_path_to_dir /etc/fail2ban "$backup_dir"
+  backup_dir="$(make_backup_dir fail2ban-port)" || return 1
+  backup_path_to_dir /etc/fail2ban "$backup_dir" || return 1
   ssh_ports="$(get_current_ssh_ports)"
   tmp="$(mktemp /tmp/server-toolkit-f2b-port.XXXXXX)" || return 1
-  awk -v p="$ssh_ports" 'BEGIN{done=0} /^[[:space:]]*port[[:space:]]*=/{if(!done){print "port = " p; done=1}; next} {print} END{if(!done) print "port = " p}' "$file" > "$tmp"
-  mv "$tmp" "$file"
+  awk -v p="$ssh_ports" 'BEGIN{done=0} /^[[:space:]]*port[[:space:]]*=/{if(!done){print "port = " p; done=1}; next} {print} END{if(!done) print "port = " p}' "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
+  mv "$tmp" "$file" || { rm -f "$tmp"; fail2ban_restore_from_backup "$backup_dir"; return 1; }
   fail2ban_validate_and_restart || { fail2ban_restore_from_backup "$backup_dir"; return 1; }
 }
 
@@ -2019,8 +2379,8 @@ fail2ban_set_loglevel() {
   read -r -p "请输入日志等级（默认 INFO）: " level
   level="${level:-INFO}"
   case "$level" in CRITICAL|ERROR|WARNING|NOTICE|INFO|DEBUG) ;; *) echo_error "日志等级无效。"; return 1 ;; esac
-  backup_dir="$(make_backup_dir fail2ban-loglevel)"
-  backup_path_to_dir /etc/fail2ban "$backup_dir"
+  backup_dir="$(make_backup_dir fail2ban-loglevel)" || return 1
+  backup_path_to_dir /etc/fail2ban "$backup_dir" || return 1
   fail2ban_write_global_dropin "$level"
   fail2ban_validate_and_restart || { fail2ban_restore_from_backup "$backup_dir"; return 1; }
   echo_color "Fail2Ban 日志等级已设置为：$level"
@@ -2034,22 +2394,30 @@ fail2ban_unban_ip() {
   fail2ban-client set sshd unbanip "$ip" 2>/dev/null && echo_color "已尝试解封：$ip" || echo_error "解封失败，请确认 sshd jail 是否存在。"
 }
 
+fail2ban_validate_ports() {
+  local ports="${1:-}" p
+  [[ "$ports" =~ ^[0-9]+(,[0-9]+)*$ ]] || return 1
+  for p in ${ports//,/ }; do
+    [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -ge 1 ] && [ "$p" -le 65535 ] || return 1
+  done
+}
+
 fail2ban_config_jail() {
   local ssh_ports custom_ports bantime findtime maxretry ignoreip backup_dir
   ssh_ports="$(get_current_ssh_ports)"
   echo_info "自动识别 SSH 端口：$ssh_ports"
   read -r -p "手动覆盖端口？回车使用自动识别，示例 22,2222: " custom_ports
   [ -n "$custom_ports" ] && ssh_ports="$custom_ports"
-  [[ "$ssh_ports" =~ ^[0-9]+(,[0-9]+)*$ ]] || { echo_error "端口格式无效。"; return 1; }
+  fail2ban_validate_ports "$ssh_ports" || { echo_error "端口格式或范围无效。"; return 1; }
   read -r -p "bantime 秒（默认 3600）: " bantime
   read -r -p "findtime 秒（默认 600）: " findtime
   read -r -p "maxretry（默认 3）: " maxretry
   read -r -p "ignoreip 白名单，可空: " ignoreip
   bantime="${bantime:-3600}"; findtime="${findtime:-600}"; maxretry="${maxretry:-3}"
   [[ "$bantime" =~ ^[0-9]+$ && "$findtime" =~ ^[0-9]+$ && "$maxretry" =~ ^[0-9]+$ ]] || { echo_error "参数必须是数字。"; return 1; }
-  backup_dir="$(make_backup_dir fail2ban-config)"
-  backup_path_to_dir /etc/fail2ban "$backup_dir"
-  fail2ban_write_sshd_jail "$ssh_ports" "$bantime" "$findtime" "$maxretry" "$ignoreip"
+  backup_dir="$(make_backup_dir fail2ban-config)" || return 1
+  backup_path_to_dir /etc/fail2ban "$backup_dir" || return 1
+  fail2ban_write_sshd_jail "$ssh_ports" "$bantime" "$findtime" "$maxretry" "$ignoreip" || { fail2ban_restore_from_backup "$backup_dir"; return 1; }
   fail2ban_validate_and_restart || { echo_error "配置失败，开始回滚。"; fail2ban_restore_from_backup "$backup_dir"; return 1; }
   echo_color "Fail2Ban jail 配置已更新。"
 }
@@ -2089,12 +2457,11 @@ sysctl_key_exists() { local key="${1:-}"; [ -n "$key" ] && sysctl -n "$key" >/de
 grub_file_detect() { [ -f /etc/default/grub ] && echo "/etc/default/grub" || echo ""; }
 
 grub_cmdline_remove_param() {
-  local file="${1:-}" param="${2:-}"
+  local file="${1:-}" param="${2:-}" tmp escaped
   [ -n "$file" ] && [ -n "$param" ] && [ -f "$file" ] || return 0
-  local tmp
+  escaped="$(printf '%s' "$param" | sed 's/[][\\.^$*+?{}|()]/\\\\&/g')"
   tmp="$(mktemp /tmp/server-toolkit-grub.XXXXXX)" || return 1
-  awk -v param="$param" '
-    BEGIN{changed=0}
+  awk -v param="$escaped" '
     /^GRUB_CMDLINE_LINUX=/ {
       line=$0
       gsub(param "=[^ \" ]+ ?", "", line)
@@ -2102,18 +2469,19 @@ grub_cmdline_remove_param() {
       gsub(/  +/, " ", line)
       gsub(/=\" /, "=\"", line)
       print line
-      changed=1
       next
     }
     {print}
   ' "$file" > "$tmp" && cat "$tmp" > "$file"
+  local rc=$?
   rm -f "$tmp"
+  return "$rc"
 }
 
 grub_cmdline_add_param() {
   local file="${1:-}" param="${2:-}"
   [ -n "$file" ] && [ -n "$param" ] && [ -f "$file" ] || return 0
-  grep -q "${param}" "$file" && return 0
+  grep -Fq "$param" "$file" && return 0
   if grep -q '^GRUB_CMDLINE_LINUX=' "$file"; then
     sed -i -E "s/^GRUB_CMDLINE_LINUX=\"/GRUB_CMDLINE_LINUX=\"${param} /" "$file"
   else
@@ -2122,14 +2490,18 @@ grub_cmdline_add_param() {
 }
 
 update_grub_ipv6_param() {
-  local mode="${1:-}" file original rc=0
-  file="$(grub_file_detect)"
+  local mode="${1:-}" file original="" rc=0
   if is_container_env; then echo_warn "检测到容器环境，跳过 GRUB 修改。"; return 0; fi
-  [ -n "$file" ] || { echo_warn "未找到 /etc/default/grub，跳过 GRUB 修改。"; return 0; }
-  original="$(mktemp /tmp/server-toolkit-grub.XXXXXX)" || return 1
-  cp -a "$file" "$original" || { rm -f "$original"; return 1; }
-  backup_file "$file"
-  if [ "$mode" = "disable" ]; then grub_cmdline_add_param "$file" "ipv6.disable=1"; else grub_cmdline_remove_param "$file" "ipv6.disable"; fi
+  file="$(grub_file_detect)"
+  if [ -n "$file" ]; then
+    original="$(mktemp /tmp/server-toolkit-grub.XXXXXX)" || return 1
+    cp -a "$file" "$original" || { rm -f "$original"; return 1; }
+    backup_file "$file" || { rm -f "$original"; return 1; }
+    if [ "$mode" = "disable" ]; then grub_cmdline_add_param "$file" "ipv6.disable=1"; else grub_cmdline_remove_param "$file" "ipv6.disable"; fi
+  elif ! command -v grubby >/dev/null 2>&1; then
+    echo_warn "未找到 /etc/default/grub 或 grubby，跳过 GRUB 修改。"
+    return 0
+  fi
   if command -v grubby >/dev/null 2>&1; then
     if [ "$mode" = "disable" ]; then grubby --update-kernel=ALL --args="ipv6.disable=1" || rc=1; else grubby --update-kernel=ALL --remove-args="ipv6.disable=1" || rc=1; fi
   elif command -v update-grub >/dev/null 2>&1; then
@@ -2139,16 +2511,17 @@ update_grub_ipv6_param() {
     elif [ -f /boot/grub/grub.cfg ] || [ -d /boot/grub ]; then grub2-mkconfig -o /boot/grub/grub.cfg || rc=1
     else echo_warn "未找到标准 grub.cfg；为避免破坏 UEFI vendor stub，未执行。"; rc=1; fi
   else
-    echo_warn "未检测到 update-grub/grub2-mkconfig/grubby，未保留未生效的 GRUB 修改。"
+    echo_warn "未检测到 update-grub/grub2-mkconfig/grubby。"
     rc=1
   fi
   if [ "$rc" -ne 0 ]; then
-    cp -a "$original" "$file"
-    echo_error "GRUB 生成失败，已恢复 $file。"
-    rm -f "$original"
+    [ -n "$file" ] && [ -n "$original" ] && cp -a "$original" "$file"
+    echo_error "GRUB 更新失败，已恢复可恢复的配置文件。"
+    [ -n "$original" ] && rm -f "$original"
     return 1
   fi
-  rm -f "$original"
+  [ -n "$original" ] && rm -f "$original"
+  return 0
 }
 
 show_ipv6_status() {
@@ -2170,9 +2543,9 @@ manage_ipv6() {
   ui_prompt opt
   case "$opt" in
     1)
-      backup_dir="$(make_backup_dir ipv6-enable)"; backup_path_to_dir "$conf" "$backup_dir"
+      backup_dir="$(make_backup_dir ipv6-enable)" || return 1; backup_path_to_dir "$conf" "$backup_dir" || return 1
       {
-        echo "# server-toolkit v2.4: ipv6 enable"
+        echo "# server-toolkit v2.5: ipv6 enable"
         sysctl_key_exists net.ipv6.conf.all.disable_ipv6 && echo "net.ipv6.conf.all.disable_ipv6=0"
         sysctl_key_exists net.ipv6.conf.default.disable_ipv6 && echo "net.ipv6.conf.default.disable_ipv6=0"
         sysctl_key_exists net.ipv6.conf.lo.disable_ipv6 && echo "net.ipv6.conf.lo.disable_ipv6=0"
@@ -2183,9 +2556,9 @@ manage_ipv6() {
       ;;
     2)
       confirm_action "确认关闭 IPv6？此操作可能影响业务网络。" "2" || { echo_warn "已取消。"; return 0; }
-      backup_dir="$(make_backup_dir ipv6-disable)"; backup_path_to_dir "$conf" "$backup_dir"
+      backup_dir="$(make_backup_dir ipv6-disable)" || return 1; backup_path_to_dir "$conf" "$backup_dir" || return 1
       {
-        echo "# server-toolkit v2.4: ipv6 disable"
+        echo "# server-toolkit v2.5: ipv6 disable"
         sysctl_key_exists net.ipv6.conf.all.disable_ipv6 && echo "net.ipv6.conf.all.disable_ipv6=1"
         sysctl_key_exists net.ipv6.conf.default.disable_ipv6 && echo "net.ipv6.conf.default.disable_ipv6=1"
         sysctl_key_exists net.ipv6.conf.lo.disable_ipv6 && echo "net.ipv6.conf.lo.disable_ipv6=1"
@@ -2247,24 +2620,24 @@ show_system_info() {
   dns="$(grep -E '^nameserver ' /etc/resolv.conf 2>/dev/null | awk '{print $2}' | paste -sd' ' -)"; [ -n "$dns" ] || dns="-"
   uptime_sec="$(awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 0)"; [[ "$uptime_sec" =~ ^[0-9]+$ ]] || uptime_sec=0
   days=$((uptime_sec/86400)); hours=$((uptime_sec%86400/3600)); mins=$((uptime_sec%3600/60)); pub="$(public_ip_detect)"
-  printf "%-18s %s\n" "主机名:" "$hostname"
-  printf "%-18s %s\n" "系统版本:" "$osver"
-  printf "%-18s %s\n" "Linux内核:" "$kernel"
-  printf "%-18s %s\n" "CPU架构:" "$arch"
-  printf "%-18s %s\n" "CPU型号:" "${cpu_model:-未知}"
-  printf "%-18s %s / %s\n" "CPU核心/频率:" "$cpu_cores" "$cpu_freq"
-  printf "%-18s %s\n" "系统负载:" "$loadavg"
-  printf "%-18s %s/%s (%s%%)\n" "物理内存:" "$(awk -v k="$mem_used" 'BEGIN{printf "%.2fM",k/1024}')" "$(awk -v k="$mem_total" 'BEGIN{printf "%.2fM",k/1024}')" "$mem_pct"
-  printf "%-18s %s/%s (%s%%)\n" "Swap:" "$(awk -v k="$swap_used" 'BEGIN{printf "%.0fM",k/1024}')" "$(awk -v k="$swap_total" 'BEGIN{printf "%.0fM",k/1024}')" "$swap_pct"
-  printf "%-18s %s/%s (%s)\n" "硬盘占用:" "${disk_used:-未知}" "${disk_total:-未知}" "${disk_pct:-未知}"
-  printf "%-18s %s / %s\n" "总接收/发送:" "$(format_bytes "$rx")" "$(format_bytes "$tx")"
-  printf "%-18s %s %s\n" "网络算法:" "$algo" "$qdisc"
-  printf "%-18s %s\n" "DNS地址:" "$dns"
-  printf "%-18s %s\n" "公网地址:" "$pub"
-  printf "%-18s %s天 %s时 %s分\n" "运行时长:" "$days" "$hours" "$mins"
+  ui_kv host "主机名" "$hostname"
+  ui_kv linux "系统版本" "$osver"
+  ui_kv kernel "Linux 内核" "$kernel"
+  ui_kv arch "CPU 架构" "$arch"
+  ui_kv cpu "CPU 型号" "${cpu_model:-未知}"
+  ui_kv cores "CPU 核心/频率" "$cpu_cores / $cpu_freq"
+  ui_kv load "系统负载" "$loadavg"
+  ui_kv memory "物理内存" "$(awk -v k="$mem_used" 'BEGIN{printf "%.2fM",k/1024}') / $(awk -v k="$mem_total" 'BEGIN{printf "%.2fM",k/1024}') (${mem_pct}%)"
+  ui_kv swap "Swap" "$(awk -v k="$swap_used" 'BEGIN{printf "%.0fM",k/1024}') / $(awk -v k="$swap_total" 'BEGIN{printf "%.0fM",k/1024}') (${swap_pct}%)"
+  ui_kv disk "硬盘占用" "${disk_used:-未知} / ${disk_total:-未知} (${disk_pct:-未知})"
+  ui_kv network "默认网卡" "${iface:-未知}"
+  ui_kv receive "接收 / 发送" "$(format_bytes "$rx") / $(format_bytes "$tx")"
+  ui_kv speed "网络算法" "$algo / $qdisc"
+  ui_kv dns "DNS" "$dns"
+  ui_kv world "公网地址" "$pub"
+  ui_kv uptime "运行时长" "${days}天 ${hours}时 ${mins}分"
 }
 
-# ---------- 外部脚本安全执行 ----------
 download_url_to_file() {
   local url="${1:-}" dest="${2:-}"
   [ -n "$url" ] && [ -n "$dest" ] || return 1
@@ -2287,7 +2660,7 @@ download_shell_script_with_fallback() {
   for url in "$@"; do
     [ -n "$url" ] || continue
     echo_info "尝试下载：$url"
-    : > "$dest"
+    : > "$dest" || { echo_error "无法创建下载目标文件：$dest"; return 1; }
     if download_url_to_file "$url" "$dest"; then
       if [ ! -s "$dest" ] || [ "$(wc -c < "$dest")" -lt 200 ]; then echo_warn "下载内容过短，尝试备用地址。"; continue; fi
       if head -n 5 "$dest" | grep -Eqi '<!DOCTYPE|<html|Access Denied|Bad Gateway'; then echo_warn "下载到网页/错误页，尝试备用地址。"; continue; fi
@@ -2295,7 +2668,7 @@ download_shell_script_with_fallback() {
         echo_warn "$name 下载完成但 Bash 语法检测失败，尝试备用地址。"
         continue
       fi
-      chmod 600 "$dest"
+      chmod 600 "$dest" || { echo_warn "无法设置临时脚本权限，尝试备用地址。"; continue; }
       echo_color "下载并通过 bash -n：$url"
       return 0
     fi
@@ -2328,8 +2701,13 @@ run_remote_script_confirm() {
         confirm_action "确认执行 $name？" "2" || continue
         (cd "$workdir" && bash "$tmp")
         rc=$?
-        if [ "$rc" -eq 0 ]; then echo_color "$name 执行完成。"; else echo_error "$name 执行失败，退出码：$rc"; fi
-        rm -rf "$workdir"
+        if [ "$rc" -eq 0 ]; then
+          echo_color "$name 执行完成。"
+          rm -rf "$workdir"
+        else
+          echo_error "$name 执行失败，退出码：$rc"
+          echo_info "失败现场已保留：$workdir"
+        fi
         return "$rc"
         ;;
       3) echo_info "已保留脚本及工作目录：$workdir"; return 0 ;;
@@ -2364,10 +2742,12 @@ apply_sysctl_if_exists() {
 }
 
 apply_conservative_sysctl_hardening() {
-  local conf="/etc/sysctl.d/98-server-toolkit-hardening.conf" tmp
-  backup_file "$conf"
+  local conf="/etc/sysctl.d/98-server-toolkit-hardening.conf" tmp backup_dir existed=0
+  [ -f "$conf" ] && existed=1
+  backup_dir="$(make_backup_dir sysctl-hardening)" || return 1
+  [ "$existed" -eq 1 ] && backup_path_to_dir "$conf" "$backup_dir"
   tmp="$(mktemp /tmp/server-toolkit-sysctl.XXXXXX)" || return 1
-  echo "# server-toolkit v2.4: conservative hardening" > "$tmp"
+  echo "# server-toolkit v2.5: conservative hardening" > "$tmp"
   apply_sysctl_if_exists net.ipv4.tcp_syncookies 1 "$tmp"
   apply_sysctl_if_exists net.ipv4.conf.all.accept_redirects 0 "$tmp"
   apply_sysctl_if_exists net.ipv4.conf.default.accept_redirects 0 "$tmp"
@@ -2383,25 +2763,38 @@ apply_conservative_sysctl_hardening() {
   apply_sysctl_if_exists kernel.dmesg_restrict 1 "$tmp"
   apply_sysctl_if_exists fs.protected_hardlinks 1 "$tmp"
   apply_sysctl_if_exists fs.protected_symlinks 1 "$tmp"
-  mv "$tmp" "$conf"
-  sysctl --system >/dev/null 2>&1 || sysctl -p "$conf" || true
+  mv "$tmp" "$conf" || { rm -f "$tmp"; return 1; }
+  if ! sysctl -p "$conf"; then
+    echo_error "sysctl 加固应用失败，开始恢复原配置。"
+    if [ "$existed" -eq 1 ]; then restore_path_from_dir "$conf" "$backup_dir" || true; else rm -f "$conf"; fi
+    return 1
+  fi
   echo_color "保守 sysctl 加固已应用。"
 }
 
 toggle_unpriv_userns() {
-  local conf="/etc/sysctl.d/97-server-toolkit-userns.conf" opt
+  local conf="/etc/sysctl.d/97-server-toolkit-userns.conf" opt backup_dir existed=0 value
   ui_title "非特权 user namespace"
+  if ! sysctl_key_exists kernel.unprivileged_userns_clone; then
+    echo_warn "当前内核不存在 kernel.unprivileged_userns_clone，已安全跳过。"
+    return 0
+  fi
   echo_warn "关闭 unprivileged user namespace 可能影响 rootless Docker、Chrome、Snap、部分容器。"
   ui_option 1 "关闭（降低部分本地提权攻击面）"
   ui_option 2 "恢复开启"
   ui_back
   ui_prompt opt
-  case "$opt" in
-    1) confirm_action "确认关闭？" "2" || return 0; backup_file "$conf"; echo 'kernel.unprivileged_userns_clone=0' > "$conf"; sysctl -p "$conf" || true ;;
-    2) backup_file "$conf"; echo 'kernel.unprivileged_userns_clone=1' > "$conf"; sysctl -p "$conf" || true ;;
-    0) return 0 ;;
-    *) echo_error "无效选项" ;;
-  esac
+  case "$opt" in 1) confirm_action "确认关闭？" "2" || return 0; value=0 ;; 2) value=1 ;; 0) return 0 ;; *) echo_error "无效选项"; return 1 ;; esac
+  [ -f "$conf" ] && existed=1
+  backup_dir="$(make_backup_dir userns)" || return 1
+  [ "$existed" -eq 1 ] && backup_path_to_dir "$conf" "$backup_dir" || true
+  printf 'kernel.unprivileged_userns_clone=%s
+' "$value" > "$conf" || return 1
+  if ! sysctl -p "$conf"; then
+    echo_error "user namespace sysctl 应用失败，开始回滚。"
+    if [ "$existed" -eq 1 ]; then restore_path_from_dir "$conf" "$backup_dir" || true; else rm -f "$conf"; fi
+    return 1
+  fi
 }
 
 apply_regresshion_mitigation() {
@@ -2409,18 +2802,18 @@ apply_regresshion_mitigation() {
   echo_warn "正式修复应升级 OpenSSH 包；临时缓解只调整 sshd 登录窗口与并发，不替代升级。"
   confirm_action "确认应用临时缓解 LoginGraceTime=0 MaxStartups=10:30:60？" "2" || return 0
   local backup_dir
-  backup_dir="$(make_backup_dir ssh-regresshion)"; backup_ssh_tree "$backup_dir"
+  backup_dir="$(make_backup_dir ssh-regresshion)" || return 1; backup_ssh_tree "$backup_dir" || return 1
   set_sshd_kv_effective LoginGraceTime 0
   set_sshd_kv_effective MaxStartups "10:30:60"
-  ssh_apply_with_rollback "regreSSHion 临时缓解" "$backup_dir"
+  ssh_apply_with_rollback "regreSSHion 临时缓解" "$backup_dir" "LoginGraceTime=0" "MaxStartups=10:30:60"
 }
 
 restore_regresshion_mitigation() {
   local backup_dir
-  backup_dir="$(make_backup_dir ssh-regresshion-restore)"; backup_ssh_tree "$backup_dir"
+  backup_dir="$(make_backup_dir ssh-regresshion-restore)" || return 1; backup_ssh_tree "$backup_dir" || return 1
   set_sshd_kv_effective LoginGraceTime 30
   set_sshd_kv_effective MaxStartups "10:30:100"
-  ssh_apply_with_rollback "regreSSHion 缓解恢复" "$backup_dir"
+  ssh_apply_with_rollback "regreSSHion 缓解恢复" "$backup_dir" "LoginGraceTime=30" "MaxStartups=10:30:100"
 }
 
 apply_copy_fail_mitigation() {
@@ -2430,15 +2823,16 @@ apply_copy_fail_mitigation() {
   lsmod 2>/dev/null | grep -E '^(algif_aead|authencesn)' || echo_info "当前未看到 algif_aead/authencesn 模块已加载。"
   confirm_action "确认写入临时禁用 algif_aead/authencesn 规则？" "2" || return 0
   local conf="/etc/modprobe.d/server-toolkit-copy-fail.conf"
-  backup_file "$conf"
+  backup_file "$conf" || { echo_error "临时缓解配置备份失败，已中止。"; return 1; }
   cat > "$conf" <<'EOF_CF'
-# server-toolkit v2.4: CVE-2026-31431 temporary mitigation
+# server-toolkit v2.5: CVE-2026-31431 temporary mitigation
 # 临时缓解不能替代升级内核；如使用 IPsec/AF_ALG 相关功能，启用前必须评估影响。
 install algif_aead /bin/false
 blacklist algif_aead
 install authencesn /bin/false
 blacklist authencesn
 EOF_CF
+  [ -s "$conf" ] || { echo_error "临时缓解配置写入失败。"; return 1; }
   modprobe -r algif_aead 2>/dev/null || true
   modprobe -r authencesn 2>/dev/null || true
   echo_color "已写入临时缓解。请尽快升级内核并重启。"
@@ -2447,8 +2841,8 @@ EOF_CF
 remove_copy_fail_mitigation() {
   local conf="/etc/modprobe.d/server-toolkit-copy-fail.conf"
   [ -f "$conf" ] || { echo_warn "未找到临时缓解文件。"; return 0; }
-  backup_file "$conf"
-  rm -f "$conf"
+  backup_file "$conf" || { echo_error "临时缓解配置备份失败，未删除。"; return 1; }
+  rm -f "$conf" || return 1
   echo_color "已移除 Copy Fail 临时缓解文件。"
 }
 
@@ -2463,19 +2857,20 @@ show_vulnerability_status() {
 
 one_click_safe_hardening() {
   ui_title "一键保守加固"
-  echo_warn "将应用保守 sysctl 加固 + SSH 保守增强；不会禁 root、不会禁密码、不会改端口；不包含 Copy Fail 临时缓解。"
+  echo_warn "将依次应用保守 sysctl 加固 + SSH 保守增强；不会禁 root、不会禁密码、不会改端口；不包含 Copy Fail 临时缓解。"
   confirm_action "确认继续？" "2" || return 0
-  apply_conservative_sysctl_hardening
-  ssh_security_recommended
+  apply_conservative_sysctl_hardening || { echo_error "sysctl 加固失败，已停止后续 SSH 修改。"; return 1; }
+  ssh_security_recommended || { echo_error "SSH 保守增强失败，sysctl 已保持成功状态，可通过加固状态菜单查看。"; return 1; }
 }
 
 security_update_core_packages() {
   ui_title "安全更新核心包"
-  echo_warn "生产环境建议先做快照/备份；软件包升级可能触发服务重启或内核更新。"
-  confirm_action "确认执行核心包安全更新？" "2" || return 0
+  echo_warn "生产环境建议先做快照/备份；OpenSSH、sudo、证书包升级可能触发服务重载。"
+  confirm_action "确认执行核心包定向安全更新？" "2" || return 0
   pkg_makecache || return 1
-  pkg_install openssh-server openssh-client sudo curl ca-certificates || true
-  pkg_upgrade || true
+  pkg_install openssh-server openssh-client sudo curl ca-certificates || return 1
+  pkg_upgrade_packages openssh-server openssh-client sudo ca-certificates || return 1
+  echo_color "核心包定向更新完成。"
 }
 
 server_hardening() {
@@ -2511,11 +2906,12 @@ server_hardening() {
 
 # ---------- 新服务器初始化 / 更新 ----------
 openssh_security_upgrade() {
-  echo_info "正在尝试升级/安装 OpenSSH 安全更新..."
+  echo_info "正在尝试定向升级/安装 OpenSSH 安全更新..."
   pkg_makecache || return 1
-  pkg_install openssh-server openssh-client || true
-  pkg_upgrade || true
-  echo_color "OpenSSH 安全更新流程已执行。"
+  pkg_install openssh-server openssh-client || return 1
+  pkg_upgrade_packages openssh-server openssh-client || return 1
+  test_sshd_config || { echo_error "OpenSSH 更新后 sshd -t 检测失败，请立即检查。"; return 1; }
+  echo_color "OpenSSH 定向安全更新流程已完成。"
 }
 
 new_server_basic_update() {
@@ -2523,8 +2919,8 @@ new_server_basic_update() {
   confirm_action "确认执行保守更新？" "2" || { echo_warn "已取消。"; return 0; }
   repair_sources_menu || true
   pkg_makecache || return 1
-  pkg_install wget curl sudo vim git unzip openssh-server openssh-client ca-certificates
-  openssh_security_upgrade || true
+  pkg_install wget curl sudo vim git unzip openssh-server openssh-client ca-certificates || return 1
+  openssh_security_upgrade || return 1
 }
 
 new_server_full_update() {
@@ -2532,8 +2928,8 @@ new_server_full_update() {
   confirm_action "确认执行全量更新？" "2" || { echo_warn "已取消。"; return 0; }
   repair_sources_menu || true
   pkg_makecache || return 1
-  pkg_full_upgrade
-  openssh_security_upgrade || true
+  pkg_full_upgrade || return 1
+  openssh_security_upgrade || return 1
 }
 
 new_server_init_menu() {
@@ -2604,13 +3000,54 @@ setup_cron_reboot() {
   if crontab "$tmpcron"; then rm -f "$tmpcron"; echo_color "已设置每 $interval 小时重启；使用每小时守护检查，支持 24-720 小时间隔。"; else rm -f "$tmpcron"; return 1; fi
 }
 
+show_cron_reboot_status() {
+  ui_title "定时重启状态"
+  crontab -l 2>/dev/null | grep -F '# server-toolkit: reboot' || echo_info "未配置 server-toolkit 定时重启任务。"
+  [ -f /usr/local/sbin/server-toolkit-periodic-reboot-guard ] && sed -n '1,80p' /usr/local/sbin/server-toolkit-periodic-reboot-guard || true
+}
+
+remove_cron_reboot() {
+  local marker="# server-toolkit: reboot" tmpcron
+  ensure_crontab || return 1
+  confirm_action "确认移除 server-toolkit 定时重启任务？" "2" || return 0
+  tmpcron="$(mktemp /tmp/server-toolkit-cron.XXXXXX)" || return 1
+  crontab -l 2>/dev/null | grep -vF "$marker" > "$tmpcron" || true
+  if crontab "$tmpcron"; then
+    rm -f "$tmpcron" /usr/local/sbin/server-toolkit-periodic-reboot-guard /var/lib/server-toolkit/periodic-reboot.last
+    echo_color "已移除定时重启任务。"
+  else
+    rm -f "$tmpcron"
+    echo_error "移除定时重启任务失败。"
+    return 1
+  fi
+}
+
+manage_cron_reboot() {
+  while true; do
+    ui_title "定时重启管理"
+    ui_option 1 "设置/更新定时重启"
+    ui_option 2 "查看当前任务"
+    ui_option 3 "移除定时重启任务"
+    ui_back
+    local opt
+    ui_prompt opt
+    case "$opt" in
+      1) setup_cron_reboot; pause_return ;;
+      2) show_cron_reboot_status; pause_return ;;
+      3) remove_cron_reboot; pause_return ;;
+      0) return 0 ;;
+      *) echo_error "无效选项"; pause_return ;;
+    esac
+  done
+}
+
 setup_nezha_agent_restart_cron() {
   local interval marker tmpcron guard
   read -r -p "请输入每隔多少小时重启 nezha-agent（1-720，输入 q 取消）: " interval
   [[ "$interval" =~ ^[Qq]$ ]] && { echo_warn "已取消。"; return 0; }
   [[ "$interval" =~ ^[0-9]+$ ]] && [ "$interval" -ge 1 ] && [ "$interval" -le 720 ] || { echo_error "请输入 1-720 的有效小时数。"; return 1; }
   ensure_crontab || return 1
-  guard="$(write_interval_guard_script nezha-agent-restart "$interval" 'systemctl restart nezha-agent')" || return 1
+  guard="$(write_interval_guard_script nezha-agent-restart "$interval" 'if command -v systemctl >/dev/null 2>&1; then systemctl restart nezha-agent; else service nezha-agent restart; fi')" || return 1
   marker="# server-toolkit: nezha-agent-restart"
   tmpcron="$(mktemp /tmp/server-toolkit-cron.XXXXXX)" || return 1
   crontab -l 2>/dev/null | grep -vF "$marker" > "$tmpcron" || true
@@ -2625,7 +3062,8 @@ remove_nezha_agent_restart_cron() {
   tmpcron="$(mktemp /tmp/server-toolkit-cron.XXXXXX)" || { echo_error "创建临时 crontab 文件失败。"; return 1; }
   crontab -l 2>/dev/null | grep -v "$marker" > "$tmpcron" || true
   crontab "$tmpcron" && rm -f "$tmpcron" || { rm -f "$tmpcron"; echo_error "写入 crontab 失败。"; return 1; }
-  echo_color "已移除 nezha-agent 定期重启任务。"
+  rm -f /usr/local/sbin/server-toolkit-nezha-agent-restart-guard /var/lib/server-toolkit/nezha-agent-restart.last
+  echo_color "已移除 nezha-agent 定期重启任务及守护文件。"
 }
 
 manage_nezha() {
@@ -2648,9 +3086,14 @@ manage_nezha() {
       5) remove_nezha_agent_restart_cron; pause_return ;;
       6)
         echo_warn "此操作会删除 /opt/nezha /etc/nezha /var/log/nezha。"
-        confirm_action "确认卸载哪吒面板/探针？" "2" || { echo_warn "已取消。"; pause_return; continue; }
-        systemctl stop nezha-agent 2>/dev/null || true; systemctl stop nezha-dashboard 2>/dev/null || true
-        systemctl disable nezha-agent 2>/dev/null || true; systemctl disable nezha-dashboard 2>/dev/null || true
+        confirm_action "第一重确认：卸载哪吒面板/探针？" "2" || { echo_warn "已取消。"; pause_return; continue; }
+        confirm_action "第二重确认：继续将删除哪吒目录及服务文件。" "2" || { echo_warn "已取消。"; pause_return; continue; }
+        if is_systemd_available; then
+          systemctl stop nezha-agent 2>/dev/null || true; systemctl stop nezha-dashboard 2>/dev/null || true
+          systemctl disable nezha-agent 2>/dev/null || true; systemctl disable nezha-dashboard 2>/dev/null || true
+        else
+          service nezha-agent stop 2>/dev/null || true; service nezha-dashboard stop 2>/dev/null || true
+        fi
         rm -f /etc/systemd/system/nezha-agent.service /etc/systemd/system/nezha-dashboard.service
         rm -rf /opt/nezha /etc/nezha /var/log/nezha
         systemctl daemon-reload 2>/dev/null || true
@@ -2731,7 +3174,7 @@ reinstall_current_arch() {
 }
 
 reinstall_collect_plan() {
-  local arch port password password2 hostname mirror timezone network_choice ip prefix gate dns ipv6 fail2ban_choice current_port
+  local arch port password password2 hostname mirror timezone network_choice ip prefix gate dns ipv6 fail2ban_choice current_port win_lang
   REINSTALL_ARGS=(); REINSTALL_PASSWORD_SET=0; REINSTALL_PLAN_READY=0
   reinstall_choose_distro || return 1
   if [ "$REINSTALL_DISTRO_FLAG" = "-dd" ]; then REINSTALL_ARGS+=("-dd" "$REINSTALL_VERSION"); else REINSTALL_ARGS+=("$REINSTALL_DISTRO_FLAG" "$REINSTALL_VERSION"); fi
@@ -2739,12 +3182,21 @@ reinstall_collect_plan() {
   arch="${arch:-$(reinstall_current_arch)}"
   case "$arch" in amd64|arm64|i386) REINSTALL_ARGS+=("-architecture" "$arch") ;; *) echo_error "架构无效。"; return 1 ;; esac
   current_port="$(get_current_ssh_ports | cut -d, -f1)"
-  read -r -p "重装后 SSH/RDP 端口 [默认 ${current_port:-22}]: " port
-  port="${port:-${current_port:-22}}"
-  [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || { echo_error "端口无效。"; return 1; }
-  REINSTALL_ARGS+=("-port" "$port")
   if [ "$REINSTALL_TARGET_KIND" = "windows" ]; then
-    echo_warn "上游文档说明 -port 对 Windows 无效，Windows 默认 RDP 端口通常为 3389；仍保留参数供上游处理。"
+    echo_warn "上游文档说明 -port 对 Windows 无效，本向导不会传递该参数；请在重装后通过系统设置修改 RDP 端口。"
+  else
+    read -r -p "重装后 SSH 端口 [默认 ${current_port:-22}]: " port
+    port="${port:-${current_port:-22}}"
+    [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || { echo_error "端口无效。"; return 1; }
+    REINSTALL_ARGS+=("-port" "$port")
+  fi
+  if [ "$REINSTALL_TARGET_KIND" = "windows" ]; then
+    ui_option 1 "简体中文（cn）"
+    ui_option 2 "英文（en，默认）"
+    ui_option 3 "日文（jp）"
+    ui_prompt win_lang "请选择 Windows 语言 [默认 2]"
+    win_lang="${win_lang:-2}"
+    case "$win_lang" in 1) REINSTALL_ARGS+=("-lang" "cn") ;; 2) REINSTALL_ARGS+=("-lang" "en") ;; 3) REINSTALL_ARGS+=("-lang" "jp") ;; *) echo_error "Windows 语言选项无效。"; return 1 ;; esac
   fi
   if [ "$REINSTALL_TARGET_KIND" = "dd-like" ] || [ "$REINSTALL_TARGET_KIND" = "windows" ]; then
     echo_warn "上游文档说明 -pwd 对 Ubuntu、Windows、Alpine 或其他 DD 模式可能不生效。请务必准备 VNC/串口控制台并阅读上游最终输出。"
@@ -2784,8 +3236,17 @@ reinstall_collect_plan() {
   read -r -p "请选择 [默认 1]: " ipv6
   ipv6="${ipv6:-1}"
   case "$ipv6" in 1) ;; 2) REINSTALL_ARGS+=("--setipv6" "0") ;; 0) return 1 ;; *) echo_error "IPv6 选项无效。"; return 1 ;; esac
-  read -r -p "安装后启用 Fail2Ban？1=启用，2=不指定（默认）: " fail2ban_choice
-  [ "$fail2ban_choice" = "1" ] && REINSTALL_ARGS+=("--fail2ban" "1")
+  ui_option 1 "强制启用 Fail2Ban"
+  ui_option 2 "交给上游自动决定（默认）"
+  ui_back
+  ui_prompt fail2ban_choice "请选择 [默认 2]"
+  fail2ban_choice="${fail2ban_choice:-2}"
+  case "$fail2ban_choice" in
+    1) REINSTALL_ARGS+=("--fail2ban" "1") ;;
+    2) ;;
+    0) return 1 ;;
+    *) echo_error "Fail2Ban 选项无效。"; return 1 ;;
+  esac
   REINSTALL_PLAN_READY=1
 }
 
@@ -2854,8 +3315,8 @@ manage_system_reinstall() {
         confirm_action "确认执行上游 InstallNET.sh？" "2" || { echo_warn "已取消。"; pause_return; continue; }
         mkdir -p /root/server-toolkit-reinstall
         chmod 700 /root/server-toolkit-reinstall
-        workdir="/root/server-toolkit-reinstall/$(date +%F_%H-%M-%S)"
-        mkdir -p "$workdir"; chmod 700 "$workdir"
+        workdir="$(mktemp -d "/root/server-toolkit-reinstall/$(date +%F_%H-%M-%S).XXXXXX")" || { echo_error "创建重装工作目录失败。"; pause_return; continue; }
+        chmod 700 "$workdir"
         script="$workdir/InstallNET.sh"
         reinstall_download_script "$script" || { pause_return; continue; }
         echo_info "上游脚本已保存：$script"
@@ -2870,26 +3331,28 @@ manage_system_reinstall() {
   done
 }
 
-menu_row() { printf "  %-38s %s\n" "${1:-}" "${2:-}"; }
-
 print_menu() {
-  [ -n "${TERM:-}" ] && clear 2>/dev/null || true
-  printf "\n"
-  printf "\e[1;36m──────────────────────────────────────────────────────────────────────────────\e[0m\n"
-  printf "  \e[1;35mserver-toolkit %s · Linux 服务器工具箱\e[0m\n" "$SERVER_TOOLKIT_VERSION"
-  printf "\e[1;36m──────────────────────────────────────────────────────────────────────────────\e[0m\n"
-  printf "\e[1;36m功能菜单\e[0m\n"
-  printf "\e[2m──────────────────────────────────────────────────────────────────────────────\e[0m\n"
-  menu_row "1)  时间同步（timesyncd/chrony）" "9)  YABS 测试"
-  menu_row "2)  防火墙开启/关闭"              "10) 设置定时重启"
-  menu_row "3)  SELinux 开启/关闭"             "11) 哪吒面板管理"
-  menu_row "4)  SSH 安全性增强向导"            "12) IP 质量检测"
-  menu_row "5)  Fail2Ban 管理"                 "13) IPv6 一键开启/关闭"
-  menu_row "6)  SSH 端口/密码/密钥/root 管理"  "14) 服务器加固"
-  menu_row "7)  流媒体解锁检测"                "15) 新服务器初始化/源修复"
-  menu_row "8)  显示服务器基本信息"            "16) 系统重装"
-  menu_row ""                                  "0)  退出"
-  printf "\e[2m──────────────────────────────────────────────────────────────────────────────\e[0m\n"
+  local menu_symbol
+  ui_clear
+  printf '\n'
+  ui_hr
+  printf '%s  ' "$UI_MAGENTA"
+  ui_icon title
+  printf '  server-toolkit %s · Linux 服务器工具箱%s\n' "$SERVER_TOOLKIT_VERSION" "$UI_RESET"
+  ui_hr
+  menu_symbol="$(ui_symbol menu)"
+  if [ -n "$menu_symbol" ]; then printf '%s  %s  功能菜单%s\n' "$UI_CYAN" "$menu_symbol" "$UI_RESET"; else printf '%s  功能菜单%s\n' "$UI_CYAN" "$UI_RESET"; fi
+  printf '%s' "$UI_DIM"; ui_repeat "$UI_HR_CHAR" "$(ui_terminal_columns)"; printf '%s\n' "$UI_RESET"
+  ui_main_row "$(ui_menu_label time 1 '时间同步')"               "$(ui_menu_label benchmark 9 'YABS 测试')"
+  ui_main_row "$(ui_menu_label firewall 2 '防火墙管理')"        "$(ui_menu_label reboot 10 '定时重启管理')"
+  ui_main_row "$(ui_menu_label selinux 3 'SELinux 管理')"       "$(ui_menu_label nezha 11 '哪吒面板管理')"
+  ui_main_row "$(ui_menu_label ssh 4 'SSH 安全增强')"           "$(ui_menu_label world 12 'IP 质量检测')"
+  ui_main_row "$(ui_menu_label ban 5 'Fail2Ban 管理')"          "$(ui_menu_label ipv6 13 'IPv6 开启/关闭')"
+  ui_main_row "$(ui_menu_label key 6 'SSH 端口/密码/密钥/root')" "$(ui_menu_label harden 14 '服务器加固')"
+  ui_main_row "$(ui_menu_label media 7 '流媒体解锁检测')"       "$(ui_menu_label package 15 '初始化/软件源修复')"
+  ui_main_row "$(ui_menu_label info 8 '显示服务器信息')"        "$(ui_menu_label reinstall 16 '系统重装（高风险）')"
+  ui_main_row ""                                                 "$(ui_menu_label exit 0 '退出')"
+  printf '%s' "$UI_DIM"; ui_repeat "$UI_HR_CHAR" "$(ui_terminal_columns)"; printf '%s\n' "$UI_RESET"
 }
 
 main() {
@@ -2898,7 +3361,7 @@ main() {
   while true; do
     print_menu
     local option
-    read -r -p "请选择一个操作: " option
+    ui_prompt option "请选择一个操作"
     case "$option" in
       1) time_sync; pause_return ;;
       2) manage_firewall ;;
@@ -2909,14 +3372,14 @@ main() {
       7) check_media_unlock; pause_return ;;
       8) show_system_info; pause_return ;;
       9) yabs_test; pause_return ;;
-      10) setup_cron_reboot; pause_return ;;
+      10) manage_cron_reboot ;;
       11) manage_nezha ;;
       12) check_ip_quality; pause_return ;;
       13) manage_ipv6; pause_return ;;
       14) server_hardening ;;
       15) new_server_init_menu ;;
       16) manage_system_reinstall ;;
-      0) echo_color "退出"; exit 0 ;;
+      0) echo_color "已退出 server-toolkit。"; exit 0 ;;
       *) echo_error "无效的选项，请重新输入"; pause_return ;;
     esac
   done

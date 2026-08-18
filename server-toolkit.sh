@@ -1,18 +1,17 @@
 #!/bin/bash
 set -u
 
-SERVER_TOOLKIT_VERSION="v2.6"
+SERVER_TOOLKIT_VERSION="v2.7"
 
 # ============================================================
-# server-toolkit.sh v2.6
+# server-toolkit.sh v2.7
 # 适用：Debian 10/11/12/13/testing/sid、Ubuntu 20.04/22.04/24.04/26.04、
 #      CentOS 7/Stream 8/9/10、RHEL 8/9/10、Alma/Rocky/Oracle、
 #      Fedora、Amazon Linux 2/2023。
 # 原则：先备份、先检测、尽量不破坏当前 SSH 会话；危险操作默认取消并使用数字确认。
-# v2.6 摘要：修复 SSH 端口策略/私钥菜单因命令替换捕获 UI 输出而永远取消的问题；增强当前 SSH
-#            端口识别与 Ubuntu 24.04 ssh.socket 刷新/监听验证，降低防火墙误封和改端口不生效风险；
-#            强化 SSH 端口+密码原子回滚、时间同步/加固配置备份、Fail2Ban banaction 兼容、IPv6/GRUB
-#            写入失败回滚、sudoers 与定时任务创建检查，并继续保留 v2.5 全部功能。
+# v2.7 摘要：重构菜单信息架构与交互逻辑，主菜单按 1→16 顺序分组显示；所有管理子菜单统一“状态优先、配置其次、危险操作靠后、0 返回”。
+#            时间同步与 IPv6 改为持续管理子菜单；系统更新不再无条件套娃进入源修复；新增 SSH/哪吒状态总览并拆分 sudo 用户与 root 登录操作。
+#            同时修复 APT/RPM 返回码、SSH 写入失败回滚、防火墙探测优先级、Fail2Ban 可读性和部分错误吞没问题，保留 v2.6 全部功能与防断连保护。
 # ============================================================
 
 # ---------- 彩色输出 / UI ----------
@@ -197,6 +196,22 @@ ui_menu_label() {
     printf '%2s) %s' "$num" "$text"
   fi
 }
+ui_menu_section() {
+  local title="${1:-}" kind="${2:-menu}" symbol=""
+  [ -n "$title" ] || return 0
+  symbol="$(ui_symbol "$kind")"
+  printf '\n%s  %s%s%s\n' "$UI_CYAN" "${symbol:+${symbol}  }" "$title" "$UI_RESET"
+}
+
+ui_menu_note() {
+  printf '%s  · %s%s\n' "$UI_DIM" "${1:-}" "$UI_RESET"
+}
+
+ui_action_pause() {
+  # 子菜单动作结束后统一停留一次，再重新绘制当前子菜单。
+  pause_return
+}
+
 confirm_action() {
   local msg="${1:-确认继续？}"
   local default="${2:-2}"
@@ -604,35 +619,50 @@ allow_port_firewall() {
   local port="${1:-}"
   [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || return 1
   echo_info "尝试放行 TCP 端口：$port"
+
+  # 先处理真正处于 active 状态的防火墙，避免“工具已安装但未启用”造成错误安全判断。
   if firewalld_active; then
     firewall-cmd --permanent --add-port="${port}/tcp" || return 1
     firewall-cmd --reload || return 1
     echo_color "firewalld 已放行 ${port}/tcp。"
     return 0
   fi
+  if ufw_active; then
+    ufw allow "${port}/tcp" || return 1
+    echo_color "ufw 已放行 ${port}/tcp。"
+    return 0
+  fi
+
+  # iptables 可能是 legacy，也可能是 nft 后端；命令可用时追加 ACCEPT 是比猜测 nft 表/链更稳妥的运行时保护。
+  if command -v iptables >/dev/null 2>&1; then
+    if ! iptables -C INPUT -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1; then
+      iptables -I INPUT -p tcp --dport "$port" -j ACCEPT || return 1
+      echo_warn "iptables 已添加运行时规则放行 ${port}/tcp；是否持久化取决于发行版防火墙管理方式。"
+    else
+      echo_color "iptables 已存在 ${port}/tcp 放行规则。"
+    fi
+    return 0
+  fi
+
+  # 纯 nftables 环境无法可靠猜测用户的 table/chain/hook/priority，要求用户明确人工确认。
+  if command -v nft >/dev/null 2>&1 && nft list ruleset 2>/dev/null | grep -q '[^[:space:]]'; then
+    echo_warn "检测到活动 nftables 规则，但无法安全推断应修改的 input chain；未自动改写规则集。"
+    return 2
+  fi
+
+  # 没有活动过滤器时，可提前写入未来可能启用的工具配置。
   if command -v firewall-offline-cmd >/dev/null 2>&1 && command -v firewall-cmd >/dev/null 2>&1; then
     firewall-offline-cmd --add-port="${port}/tcp" >/dev/null 2>&1 || return 1
-    echo_color "已在未启动的 firewalld 永久配置中放行 ${port}/tcp。"
+    echo_color "已在未启动的 firewalld 永久配置中预放行 ${port}/tcp。"
     return 0
   fi
   if command -v ufw >/dev/null 2>&1; then
     ufw allow "${port}/tcp" || return 1
-    if ufw_active; then echo_color "ufw 已放行 ${port}/tcp。"; else echo_color "已预先写入 ufw 放行规则 ${port}/tcp（ufw 尚未启用）。"; fi
+    echo_color "已预先写入 ufw 放行规则 ${port}/tcp（ufw 当前未启用）。"
     return 0
   fi
-  # 许多新系统的 iptables 实际使用 nft 后端；若命令存在，先安全追加运行时规则。
-  if command -v iptables >/dev/null 2>&1; then
-    if ! iptables -C INPUT -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1; then
-      iptables -I INPUT -p tcp --dport "$port" -j ACCEPT || return 1
-      echo_warn "iptables 已添加运行时规则放行 ${port}/tcp；重启后可能失效。"
-    fi
-    return 0
-  fi
-  if command -v nft >/dev/null 2>&1; then
-    echo_warn "检测到 nftables，但无法可靠识别现有表/链和持久化管理方式；未自动覆盖规则集。"
-    return 2
-  fi
-  echo_warn "未检测到本机防火墙工具。仍需确认云厂商安全组已放行端口 $port。"
+
+  echo_warn "未检测到可安全自动处理的本机防火墙。仍需确认云厂商安全组和本机规则已放行端口 $port。"
   return 2
 }
 
@@ -678,51 +708,52 @@ firewall_status() {
 manage_firewall() {
   while true; do
     ui_title "防火墙管理"
-    ui_option 1 "查看防火墙状态"
-    ui_option 2 "开启防火墙（先永久放行当前 SSH 端口）"
-    ui_option 3 "关闭本机 firewalld/ufw"
+    ui_menu_note "逻辑：先查看状态；开启时先保护 SSH；关闭属于高风险操作。"
+    ui_option 1 "查看当前状态与规则"
+    ui_option 2 "安全开启防火墙（先放行当前 SSH 端口）"
+    ui_option 3 "关闭本机防火墙（高风险）"
     ui_back
     local opt ports p
     ui_prompt opt
     case "$opt" in
-      1) firewall_status; pause_return ;;
+      1) firewall_status; ui_action_pause ;;
       2)
         ports="$(get_current_ssh_ports 2>/dev/null || echo 22)"
         echo_warn "开启前必须先放行当前 SSH 端口：$ports"
         echo_warn "云厂商安全组不受本脚本控制。"
-        confirm_action "确认开启本机防火墙？" "2" || { echo_warn "已取消。"; pause_return; continue; }
+        confirm_action "确认安全开启本机防火墙？" "2" || { echo_warn "已取消。"; ui_action_pause; continue; }
         if is_redhat_like; then
-          pkg_install firewalld || { echo_error "firewalld 安装失败。"; pause_return; continue; }
+          pkg_install firewalld || { echo_error "firewalld 安装失败。"; ui_action_pause; continue; }
           if ! command -v firewall-offline-cmd >/dev/null 2>&1 && ! firewalld_active; then
             echo_error "firewalld 尚未运行且缺少 firewall-offline-cmd，无法在启动前安全放行 SSH，已中止。"
-            pause_return; continue
+            ui_action_pause; continue
           fi
           for p in ${ports//,/ }; do
             [[ "$p" =~ ^[0-9]+$ ]] || continue
-            allow_port_firewall "$p" || { echo_error "无法在启动前放行 SSH 端口 $p，已中止。"; pause_return; continue 2; }
+            allow_port_firewall "$p" || { echo_error "无法在启动前放行 SSH 端口 $p，已中止。"; ui_action_pause; continue 2; }
           done
-          service_enable_now firewalld || { echo_error "firewalld 启动失败。"; pause_return; continue; }
-          firewall-cmd --reload >/dev/null 2>&1 || { echo_error "firewalld reload 失败。"; pause_return; continue; }
+          service_enable_now firewalld || { echo_error "firewalld 启动失败。"; ui_action_pause; continue; }
+          firewall-cmd --reload >/dev/null 2>&1 || { echo_error "firewalld reload 失败。"; ui_action_pause; continue; }
           echo_color "firewalld 已安全开启。"
         elif is_debian_like; then
           if ! command -v ufw >/dev/null 2>&1; then
-            confirm_action "未安装 ufw，是否安装？" "2" || { echo_warn "已取消。"; pause_return; continue; }
-            pkg_install ufw || { echo_error "ufw 安装失败。"; pause_return; continue; }
+            confirm_action "当前未安装 ufw。是否安装后继续？" "2" || { echo_warn "已取消。"; ui_action_pause; continue; }
+            pkg_install ufw || { echo_error "ufw 安装失败。"; ui_action_pause; continue; }
           fi
           for p in ${ports//,/ }; do
             [[ "$p" =~ ^[0-9]+$ ]] || continue
-            ufw allow "${p}/tcp" || { echo_error "无法在启用前写入 SSH 端口 $p 放行规则，已中止。"; pause_return; continue 2; }
+            ufw allow "${p}/tcp" || { echo_error "无法在启用前写入 SSH 端口 $p 放行规则，已中止。"; ui_action_pause; continue 2; }
           done
-          ufw --force enable || { echo_error "ufw enable 失败。"; pause_return; continue; }
+          ufw --force enable || { echo_error "ufw enable 失败。"; ui_action_pause; continue; }
           echo_color "ufw 已安全开启。"
         else
           echo_warn "当前系统未识别，未自动开启防火墙。"
         fi
-        pause_return
+        ui_action_pause
         ;;
       3)
-        echo_warn "此操作只关闭本机 firewalld/ufw，不影响云厂商安全组。"
-        confirm_action "确认关闭本机防火墙服务？" "2" || { echo_warn "已取消。"; pause_return; continue; }
+        echo_warn "关闭本机防火墙会减少网络访问控制；云厂商安全组不受影响。"
+        confirm_action "确认关闭本机 firewalld/ufw？" "2" || { echo_warn "已取消。"; ui_action_pause; continue; }
         if is_systemd_available; then
           systemctl stop firewalld 2>/dev/null || true
           systemctl disable firewalld 2>/dev/null || true
@@ -731,10 +762,10 @@ manage_firewall() {
         fi
         command -v ufw >/dev/null 2>&1 && ufw disable >/dev/null 2>&1 || true
         echo_color "防火墙服务已尝试关闭。"
-        pause_return
+        ui_action_pause
         ;;
       0) return 0 ;;
-      *) echo_error "无效选项"; pause_return ;;
+      *) echo_error "无效选项"; ui_action_pause ;;
     esac
   done
 }
@@ -775,54 +806,60 @@ manage_selinux() {
     ui_title "SELinux 管理"
     if command -v getenforce >/dev/null 2>&1; then
       echo_info "当前状态：$(getenforce 2>/dev/null || echo unknown)"
-      command -v sestatus >/dev/null 2>&1 && sestatus 2>/dev/null | sed -n '1,12p' || true
     else
       echo_warn "未检测到 SELinux 工具；Debian/Ubuntu 通常不启用 SELinux。"
     fi
-    ui_option 1 "设置 Enforcing（如从 Disabled 恢复，建议先 Permissive 并重启检查）"
-    ui_option 2 "设置 Permissive"
-    ui_option 3 "设置 Disabled（需重启完全生效）"
-    ui_option 4 "查看 ssh_port_t 端口"
+    ui_option 1 "查看 SELinux 完整状态"
+    ui_option 2 "设置 Permissive（排障/过渡）"
+    ui_option 3 "设置 Enforcing（推荐正常状态）"
+    ui_option 4 "设置 Disabled（高风险，重启后生效）"
+    ui_option 5 "查看 SSH 的 SELinux 端口策略 ssh_port_t"
     ui_back
     local opt conf
     conf="/etc/selinux/config"
     ui_prompt opt
     case "$opt" in
       1)
-        [ -f "$conf" ] || { echo_warn "未找到 $conf"; pause_return; continue; }
-        echo_warn "从 Disabled 恢复 Enforcing 可能需要 relabel；建议先切 Permissive 并观察。"
-        confirm_action "确认设置 SELinux Enforcing？" "2" || { pause_return; continue; }
-        backup_file "$conf" || { echo_error "SELinux 配置备份失败，已中止。"; pause_return; continue; }
-        sed -i 's/^SELINUX=.*/SELINUX=enforcing/' "$conf" || { echo_error "SELinux 配置写入失败。"; pause_return; continue; }
-        setenforce 1 2>/dev/null || echo_warn "当前会话未能立即切到 Enforcing，可能需重启。"
-        echo_warn "如从 Disabled 恢复，必要时请评估 touch /.autorelabel 后重启。"
-        pause_return
+        if command -v sestatus >/dev/null 2>&1; then sestatus; elif command -v getenforce >/dev/null 2>&1; then getenforce; else echo_warn "当前系统没有 SELinux 管理工具。"; fi
+        ui_action_pause
         ;;
       2)
-        [ -f "$conf" ] || { echo_warn "未找到 $conf"; pause_return; continue; }
-        backup_file "$conf" || { echo_error "SELinux 配置备份失败，已中止。"; pause_return; continue; }
-        sed -i 's/^SELINUX=.*/SELINUX=permissive/' "$conf" || { echo_error "SELinux 配置写入失败。"; pause_return; continue; }
-        setenforce 0 2>/dev/null || true
+        [ -f "$conf" ] || { echo_warn "未找到 $conf"; ui_action_pause; continue; }
+        backup_file "$conf" || { echo_error "SELinux 配置备份失败，已中止。"; ui_action_pause; continue; }
+        sed -i 's/^SELINUX=.*/SELINUX=permissive/' "$conf" || { echo_error "SELinux 配置写入失败。"; ui_action_pause; continue; }
+        setenforce 0 2>/dev/null || echo_warn "当前会话未能立即切换，可能需要重启。"
         echo_color "SELinux 已设置为 Permissive。"
-        pause_return
+        ui_action_pause
         ;;
       3)
-        [ -f "$conf" ] || { echo_warn "未找到 $conf"; pause_return; continue; }
-        confirm_action "确认设置 SELinux Disabled？完全生效需要重启。" "2" || { pause_return; continue; }
-        backup_file "$conf" || { echo_error "SELinux 配置备份失败，已中止。"; pause_return; continue; }
-        sed -i 's/^SELINUX=.*/SELINUX=disabled/' "$conf" || { echo_error "SELinux 配置写入失败。"; pause_return; continue; }
+        [ -f "$conf" ] || { echo_warn "未找到 $conf"; ui_action_pause; continue; }
+        echo_warn "若系统当前为 Disabled，直接恢复 Enforcing 可能需要文件系统 relabel。建议先使用 Permissive 验证。"
+        confirm_action "确认设置 SELinux Enforcing？" "2" || { ui_action_pause; continue; }
+        backup_file "$conf" || { echo_error "SELinux 配置备份失败，已中止。"; ui_action_pause; continue; }
+        sed -i 's/^SELINUX=.*/SELINUX=enforcing/' "$conf" || { echo_error "SELinux 配置写入失败。"; ui_action_pause; continue; }
+        setenforce 1 2>/dev/null || echo_warn "当前会话未能立即切到 Enforcing，可能需重启。"
+        echo_warn "若从 Disabled 恢复，请根据发行版文档评估 relabel，再安排维护窗口重启。"
+        ui_action_pause
+        ;;
+      4)
+        [ -f "$conf" ] || { echo_warn "未找到 $conf"; ui_action_pause; continue; }
+        confirm_action "确认设置 SELinux Disabled？完全生效需要重启。" "2" || { ui_action_pause; continue; }
+        backup_file "$conf" || { echo_error "SELinux 配置备份失败，已中止。"; ui_action_pause; continue; }
+        sed -i 's/^SELINUX=.*/SELINUX=disabled/' "$conf" || { echo_error "SELinux 配置写入失败。"; ui_action_pause; continue; }
         setenforce 0 2>/dev/null || true
         echo_warn "SELinux 已设置为 Disabled，需重启后完全生效。"
-        pause_return
+        ui_action_pause
         ;;
-      4) command -v semanage >/dev/null 2>&1 && semanage port -l | grep '^ssh_port_t' || echo_warn "未检测到 semanage 或无输出。"; pause_return ;;
+      5)
+        command -v semanage >/dev/null 2>&1 && semanage port -l | grep '^ssh_port_t' || echo_warn "未检测到 semanage 或无 ssh_port_t 输出。"
+        ui_action_pause
+        ;;
       0) return 0 ;;
-      *) echo_error "无效选项"; pause_return ;;
+      *) echo_error "无效选项"; ui_action_pause ;;
     esac
   done
 }
 
-# ---------- SSH 管理 ----------
 ssh_service_name() {
   if is_systemd_available; then
     if systemctl list-unit-files 2>/dev/null | grep -q '^ssh\.service'; then echo "ssh"; else echo "sshd"; fi
@@ -1168,6 +1205,26 @@ prepare_new_ssh_port_access() {
   selinux_allow_ssh_port "$port" || { echo_error "SELinux ssh_port_t 配置失败，已中止 SSH 修改。"; return 1; }
 }
 
+show_ssh_connection_summary() {
+  local session_port configured_ports listening_ports rootlogin passlogin pubkey socket_mode
+  ui_title "SSH 连接与登录状态"
+  session_port="$(get_current_session_ssh_port 2>/dev/null || true)"
+  configured_ports="$(sshd_effective_config 2>/dev/null | awk '$1=="port"{print $2}' | sort -n -u | paste -sd, - || true)"
+  listening_ports="$(get_listening_sshd_ports 2>/dev/null | sort -n -u | paste -sd, - || true)"
+  rootlogin="$(sshd_effective_config 2>/dev/null | awk '$1=="permitrootlogin"{print $2; exit}' || true)"
+  passlogin="$(sshd_effective_config 2>/dev/null | awk '$1=="passwordauthentication"{print $2; exit}' || true)"
+  pubkey="$(sshd_effective_config 2>/dev/null | awk '$1=="pubkeyauthentication"{print $2; exit}' || true)"
+  if ssh_socket_activation_present; then socket_mode="ssh.socket 可用"; else socket_mode="传统 ssh/sshd service"; fi
+  ui_kv ssh "当前会话服务端口" "${session_port:-非 SSH 会话/无法识别}"
+  ui_kv network "sshd -T 配置端口" "${configured_ports:-无法识别}"
+  ui_kv network "当前 sshd 监听端口" "${listening_ports:-无法识别}"
+  ui_kv ssh "PermitRootLogin" "${rootlogin:-无法识别}"
+  ui_kv key "PasswordAuthentication" "${passlogin:-无法识别}"
+  ui_kv key "PubkeyAuthentication" "${pubkey:-无法识别}"
+  ui_kv info "启动模式" "$socket_mode"
+  echo_warn "云厂商安全组不会被 sshd_config 自动修改；改端口前仍需确认云后台已放行新端口。"
+}
+
 change_ssh_port_only() {
   local new_port old_ports keep_ports backup_dir final_ports ans
   read -r -p "请输入新的 SSH 端口 (1-65535，输入 q 取消): " new_port
@@ -1449,10 +1506,11 @@ toggle_password_login() {
   ui_prompt opt
   case "$opt" in
     1)
-      backup_dir="$(make_backup_dir ssh-passwd-on)" || return 1; backup_ssh_tree "$backup_dir" || return 1
-      set_sshd_kv_effective "PasswordAuthentication" "yes"
-      set_sshd_kv_effective "KbdInteractiveAuthentication" "yes"
-      set_sshd_kv_effective "ChallengeResponseAuthentication" "yes"
+      backup_dir="$(make_backup_dir ssh-passwd-on)" || return 1
+      backup_ssh_tree "$backup_dir" || return 1
+      set_sshd_kv_effective "PasswordAuthentication" "yes" || { restore_ssh_tree "$backup_dir" || true; return 1; }
+      set_sshd_kv_effective "KbdInteractiveAuthentication" "yes" || { restore_ssh_tree "$backup_dir" || true; return 1; }
+      set_sshd_kv_effective "ChallengeResponseAuthentication" "yes" || { restore_ssh_tree "$backup_dir" || true; return 1; }
       ssh_apply_with_rollback "开启密码登录" "$backup_dir" "PasswordAuthentication=yes" "KbdInteractiveAuthentication=yes" "ChallengeResponseAuthentication=yes"
       ;;
     2)
@@ -1460,14 +1518,15 @@ toggle_password_login() {
       user="${user:-root}"
       check_authorized_keys_safe "$user" || return 1
       confirm_action "关闭密码登录可能导致无法登录。确认已经另开终端测试密钥登录成功？" "2" || { echo_warn "已取消。"; return 0; }
-      backup_dir="$(make_backup_dir ssh-passwd-off)" || return 1; backup_ssh_tree "$backup_dir" || return 1
-      set_sshd_kv_effective "PasswordAuthentication" "no"
-      set_sshd_kv_effective "KbdInteractiveAuthentication" "no"
-      set_sshd_kv_effective "ChallengeResponseAuthentication" "no"
+      backup_dir="$(make_backup_dir ssh-passwd-off)" || return 1
+      backup_ssh_tree "$backup_dir" || return 1
+      set_sshd_kv_effective "PasswordAuthentication" "no" || { restore_ssh_tree "$backup_dir" || true; return 1; }
+      set_sshd_kv_effective "KbdInteractiveAuthentication" "no" || { restore_ssh_tree "$backup_dir" || true; return 1; }
+      set_sshd_kv_effective "ChallengeResponseAuthentication" "no" || { restore_ssh_tree "$backup_dir" || true; return 1; }
       ssh_apply_with_rollback "关闭密码登录" "$backup_dir" "PasswordAuthentication=no" "KbdInteractiveAuthentication=no" "ChallengeResponseAuthentication=no"
       ;;
     0) return 0 ;;
-    *) echo_error "无效选项" ;;
+    *) echo_error "无效选项"; return 1 ;;
   esac
 }
 
@@ -1507,42 +1566,82 @@ ensure_sudo_for_user() {
   fi
 }
 
+create_or_configure_sudo_user() {
+  local user pass pass2 existed=0
+  ui_title "创建 / 配置 sudo 用户"
+  read -r -p "请输入用户名（输入 q 取消）: " user
+  [[ "$user" =~ ^[Qq]$ || -z "$user" ]] && { echo_warn "已取消。"; return 0; }
+  [[ "$user" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || { echo_error "用户名格式无效。"; return 1; }
+  if id "$user" >/dev/null 2>&1; then
+    existed=1
+    confirm_action "用户 $user 已存在。是否继续更新其密码并确保 sudo 权限？" "2" || return 0
+  else
+    useradd -m -s /bin/bash "$user" || { echo_error "创建用户失败：$user"; return 1; }
+  fi
+  echo_info "输入密码时终端不会显示字符或星号。"
+  read -r -s -p "请输入用户密码: " pass; echo
+  [ -n "$pass" ] || { echo_error "密码不能为空。"; [ "$existed" -eq 0 ] && echo_warn "用户 $user 已创建但尚未设置有效密码，请人工检查。"; return 1; }
+  read -r -s -p "请再次输入用户密码: " pass2; echo
+  [ "$pass" = "$pass2" ] || { echo_error "两次密码不一致，未修改密码。"; return 1; }
+  printf '%s:%s\n' "$user" "$pass" | chpasswd || { echo_error "修改用户密码失败。"; return 1; }
+  ensure_sudo_for_user "$user" || return 1
+  echo_color "sudo 用户 $user 已配置。"
+  echo_warn "请另开终端测试：ssh ${user}@服务器IP，然后执行 sudo -v。"
+}
+
+disable_root_ssh_login() {
+  local user group backup_dir passlogin has_key=0
+  ui_title "关闭 root SSH 登录"
+  read -r -p "请输入已验证可登录且可 sudo 的替代用户名: " user
+  [ -n "$user" ] || { echo_warn "已取消。"; return 0; }
+  id "$user" >/dev/null 2>&1 || { echo_error "用户不存在：$user"; return 1; }
+  if id -nG "$user" 2>/dev/null | tr ' ' '\n' | grep -Eq '^(sudo|wheel)$'; then
+    group="sudo/wheel"
+  else
+    echo_error "用户 $user 当前不在 sudo/wheel 组，拒绝关闭 root SSH 登录。"
+    return 1
+  fi
+  check_authorized_keys_safe "$user" >/dev/null 2>&1 && has_key=1 || true
+  passlogin="$(sshd_effective_config 2>/dev/null | awk '$1=="passwordauthentication"{print $2; exit}' || true)"
+  if [ "$has_key" -eq 0 ] && [ "$passlogin" != "yes" ]; then
+    echo_error "用户 $user 没有可验证的 authorized_keys，且 PasswordAuthentication 不是 yes；拒绝关闭 root。"
+    return 1
+  fi
+  echo_info "替代管理员：$user（组检查：$group；密钥文件检查：$([ "$has_key" -eq 1 ] && echo 通过 || echo 未通过/依赖密码登录)）"
+  confirm_action "确认你已经在另一个终端实际测试 $user 可以登录并执行 sudo？" "2" || return 0
+  backup_dir="$(make_backup_dir ssh-root-off)" || return 1
+  backup_ssh_tree "$backup_dir" || return 1
+  set_sshd_kv_effective "PermitRootLogin" "no" || { restore_ssh_tree "$backup_dir" || true; return 1; }
+  ssh_apply_with_rollback "关闭 root SSH 登录" "$backup_dir" "PermitRootLogin=no" || return 1
+  echo_warn "root SSH 登录已关闭。请保持当前会话，直到再次确认 $user 登录和 sudo 正常。"
+}
+
+enable_root_ssh_login() {
+  local backup_dir
+  backup_dir="$(make_backup_dir ssh-root-on)" || return 1
+  backup_ssh_tree "$backup_dir" || return 1
+  set_sshd_kv_effective "PermitRootLogin" "yes" || { restore_ssh_tree "$backup_dir" || true; return 1; }
+  ssh_apply_with_rollback "恢复 root SSH 登录" "$backup_dir" "PermitRootLogin=yes"
+}
+
 manage_root_login_user() {
-  ui_title "root 登录 / sudo 用户管理"
-  echo_warn "关闭 root 登录前必须确认普通 sudo 用户可登录。"
-  ui_option 1 "新增 sudo 用户，并关闭 root SSH 登录"
-  ui_option 2 "恢复 root SSH 登录"
-  ui_back
-  local opt user pass backup_dir
-  ui_prompt opt
-  case "$opt" in
-    1)
-      read -r -p "请输入新用户名（输入 q 取消）: " user
-      [[ "$user" =~ ^[Qq]$ || -z "$user" ]] && { echo_warn "已取消。"; return 0; }
-      [[ "$user" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || { echo_error "用户名格式无效。"; return 1; }
-      if id "$user" >/dev/null 2>&1; then
-        confirm_action "用户 $user 已存在。是否继续修改其密码并配置 sudo？" "2" || return 0
-      else
-        useradd -m -s /bin/bash "$user" || return 1
-      fi
-      read -r -s -p "请输入新用户密码: " pass; echo
-      [ -z "$pass" ] && { echo_error "密码不能为空。"; return 1; }
-      echo "${user}:${pass}" | chpasswd || return 1
-      ensure_sudo_for_user "$user" || return 1
-      echo_warn "请另开终端测试该用户可登录并可执行 sudo。"
-      confirm_action "确认继续关闭 root SSH 登录？" "2" || return 0
-      backup_dir="$(make_backup_dir ssh-root-off)" || return 1; backup_ssh_tree "$backup_dir" || return 1
-      set_sshd_kv_effective "PermitRootLogin" "no"
-      ssh_apply_with_rollback "关闭 root SSH 登录" "$backup_dir" "PermitRootLogin=no" && echo_warn "请再次确认 ${user} 的 SSH/sudo 可用。"
-      ;;
-    2)
-      backup_dir="$(make_backup_dir ssh-root-on)" || return 1; backup_ssh_tree "$backup_dir" || return 1
-      set_sshd_kv_effective "PermitRootLogin" "yes"
-      ssh_apply_with_rollback "恢复 root SSH 登录" "$backup_dir" "PermitRootLogin=yes"
-      ;;
-    0) return 0 ;;
-    *) echo_error "无效选项" ;;
-  esac
+  while true; do
+    ui_title "sudo 用户 / root SSH 登录管理"
+    ui_menu_note "创建管理员账号和关闭 root 是两个独立动作，避免中途取消时产生半完成状态。"
+    ui_option 1 "创建 / 配置 sudo 用户（不修改 root SSH 登录）"
+    ui_option 2 "关闭 root SSH 登录（要求先验证替代 sudo 用户）"
+    ui_option 3 "恢复 root SSH 登录"
+    ui_back
+    local opt
+    ui_prompt opt
+    case "$opt" in
+      1) create_or_configure_sudo_user; ui_action_pause ;;
+      2) disable_root_ssh_login; ui_action_pause ;;
+      3) enable_root_ssh_login; ui_action_pause ;;
+      0) return 0 ;;
+      *) echo_error "无效选项"; ui_action_pause ;;
+    esac
+  done
 }
 
 ssh_security_recommended() {
@@ -1562,33 +1661,72 @@ ssh_security_recommended() {
 }
 
 ssh_security_custom() {
+  # v2.7：逐项选择只保存在内存，直到“应用”才写配置；避免用户中途 Ctrl+C 后留下未 reload 但会在未来重启生效的半成品文件。
   local opt v a b backup_dir rc
-  backup_dir="$(make_backup_dir ssh-custom)" || return 1
-  backup_ssh_tree "$backup_dir" || return 1
+  local max_auth="" grace="" empty_pass="" use_dns="" x11="" tcp_forward="" alive_interval="" alive_count=""
+  local expectations=()
   while true; do
-    ui_title "SSH 安全性增强 · 逐项配置"
-    ui_option 1 "MaxAuthTries：最大认证失败次数"
-    ui_option 2 "LoginGraceTime：登录认证窗口"
-    ui_option 3 "PermitEmptyPasswords：禁止空密码"
-    ui_option 4 "UseDNS：关闭反向 DNS 查询"
-    ui_option 5 "X11Forwarding：关闭 X11 转发"
-    ui_option 6 "AllowTcpForwarding：SSH 隧道开关"
-    ui_option 7 "ClientAliveInterval/CountMax：空闲连接策略"
+    ui_title "SSH 安全策略 · 逐项配置"
+    ui_menu_note "当前选择只暂存在内存；选 9 才会备份、写入、sshd -t/sshd -T 验证并应用；0 直接放弃。"
+    ui_option 1 "MaxAuthTries：${max_auth:-未修改}"
+    ui_option 2 "LoginGraceTime：${grace:-未修改}"
+    ui_option 3 "PermitEmptyPasswords：${empty_pass:-未修改}"
+    ui_option 4 "UseDNS：${use_dns:-未修改}"
+    ui_option 5 "X11Forwarding：${x11:-未修改}"
+    ui_option 6 "AllowTcpForwarding：${tcp_forward:-未修改}"
+    ui_option 7 "ClientAlive：${alive_interval:-未修改}/${alive_count:-未修改}"
     ui_option 8 "查看当前 SSH 生效配置"
-    ui_option 9 "检测并应用"
+    ui_option 9 "检测并应用以上暂存修改"
     ui_back
     ui_prompt opt
     case "$opt" in
-      1) read -r -p "MaxAuthTries（建议 3）: " v; [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -gt 0 ] && set_sshd_kv_effective MaxAuthTries "$v" || echo_error "输入无效" ;;
-      2) read -r -p "LoginGraceTime 秒数（建议 30）: " v; [[ "$v" =~ ^[0-9]+$ ]] && set_sshd_kv_effective LoginGraceTime "$v" || echo_error "输入无效" ;;
-      3) set_sshd_kv_effective PermitEmptyPasswords no ;;
-      4) set_sshd_kv_effective UseDNS no ;;
-      5) set_sshd_kv_effective X11Forwarding no ;;
-      6) read -r -p "AllowTcpForwarding 设置为 yes/no: " v; case "$v" in yes|no) set_sshd_kv_effective AllowTcpForwarding "$v" ;; *) echo_error "只能输入 yes 或 no" ;; esac ;;
-      7) read -r -p "ClientAliveInterval（建议 300）: " a; read -r -p "ClientAliveCountMax（建议 2）: " b; [[ "$a" =~ ^[0-9]+$ && "$b" =~ ^[0-9]+$ ]] && { set_sshd_kv_effective ClientAliveInterval "$a"; set_sshd_kv_effective ClientAliveCountMax "$b"; } || echo_error "输入无效" ;;
-      8) show_ssh_effective_config; pause_return ;;
-      9) ssh_apply_with_rollback "SSH 逐项配置" "$backup_dir"; rc=$?; return "$rc" ;;
-      0) restore_ssh_tree "$backup_dir"; echo_warn "已取消并恢复本轮开始前的 SSH 配置。"; return 0 ;;
+      1)
+        read -r -p "MaxAuthTries（建议 3）: " v
+        [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -gt 0 ] && [ "$v" -le 100 ] && max_auth="$v" || echo_error "请输入 1-100 的整数。"
+        ;;
+      2)
+        read -r -p "LoginGraceTime 秒数（建议 30）: " v
+        [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -le 3600 ] && grace="$v" || echo_error "请输入 0-3600 的整数。"
+        ;;
+      3) empty_pass="no"; echo_info "已暂存：PermitEmptyPasswords=no" ;;
+      4) use_dns="no"; echo_info "已暂存：UseDNS=no" ;;
+      5) x11="no"; echo_info "已暂存：X11Forwarding=no" ;;
+      6)
+        read -r -p "AllowTcpForwarding 设置为 yes/no: " v
+        case "$v" in yes|no) tcp_forward="$v" ;; *) echo_error "只能输入 yes 或 no" ;; esac
+        ;;
+      7)
+        read -r -p "ClientAliveInterval（建议 300）: " a
+        read -r -p "ClientAliveCountMax（建议 2）: " b
+        if [[ "$a" =~ ^[0-9]+$ && "$b" =~ ^[0-9]+$ ]] && [ "$a" -le 86400 ] && [ "$b" -le 100 ]; then
+          alive_interval="$a"; alive_count="$b"
+        else
+          echo_error "请输入合理的非负整数。"
+        fi
+        ;;
+      8) show_ssh_effective_config; ui_action_pause ;;
+      9)
+        if [ -z "$max_auth$grace$empty_pass$use_dns$x11$tcp_forward$alive_interval$alive_count" ]; then
+          echo_warn "尚未选择任何修改。"
+          ui_action_pause
+          continue
+        fi
+        backup_dir="$(make_backup_dir ssh-custom)" || return 1
+        backup_ssh_tree "$backup_dir" || return 1
+        expectations=()
+        if [ -n "$max_auth" ]; then set_sshd_kv_effective MaxAuthTries "$max_auth" || { restore_ssh_tree "$backup_dir" || true; return 1; }; expectations+=("MaxAuthTries=$max_auth"); fi
+        if [ -n "$grace" ]; then set_sshd_kv_effective LoginGraceTime "$grace" || { restore_ssh_tree "$backup_dir" || true; return 1; }; expectations+=("LoginGraceTime=$grace"); fi
+        if [ -n "$empty_pass" ]; then set_sshd_kv_effective PermitEmptyPasswords "$empty_pass" || { restore_ssh_tree "$backup_dir" || true; return 1; }; expectations+=("PermitEmptyPasswords=$empty_pass"); fi
+        if [ -n "$use_dns" ]; then set_sshd_kv_effective UseDNS "$use_dns" || { restore_ssh_tree "$backup_dir" || true; return 1; }; expectations+=("UseDNS=$use_dns"); fi
+        if [ -n "$x11" ]; then set_sshd_kv_effective X11Forwarding "$x11" || { restore_ssh_tree "$backup_dir" || true; return 1; }; expectations+=("X11Forwarding=$x11"); fi
+        if [ -n "$tcp_forward" ]; then set_sshd_kv_effective AllowTcpForwarding "$tcp_forward" || { restore_ssh_tree "$backup_dir" || true; return 1; }; expectations+=("AllowTcpForwarding=$tcp_forward"); fi
+        if [ -n "$alive_interval" ]; then set_sshd_kv_effective ClientAliveInterval "$alive_interval" || { restore_ssh_tree "$backup_dir" || true; return 1; }; expectations+=("ClientAliveInterval=$alive_interval"); fi
+        if [ -n "$alive_count" ]; then set_sshd_kv_effective ClientAliveCountMax "$alive_count" || { restore_ssh_tree "$backup_dir" || true; return 1; }; expectations+=("ClientAliveCountMax=$alive_count"); fi
+        ssh_apply_with_rollback "SSH 逐项安全配置" "$backup_dir" "${expectations[@]+"${expectations[@]}"}"
+        rc=$?
+        return "$rc"
+        ;;
+      0) echo_info "已放弃本轮暂存修改；磁盘配置未发生变化。"; return 0 ;;
       *) echo_error "无效选项" ;;
     esac
   done
@@ -1614,19 +1752,20 @@ configure_key_login() {
 secure_ssh() {
   [ -f /etc/ssh/sshd_config ] || { echo_error "找不到 /etc/ssh/sshd_config"; return 1; }
   while true; do
-    ui_title "SSH 安全性增强向导"
-    ui_option 1 "查看当前 SSH 关键配置"
+    ui_title "SSH 安全策略"
+    ui_menu_note "这里只调整安全参数；端口、密码、密钥和 root/sudo 用户请使用主菜单 6。"
+    ui_option 1 "查看当前 SSH 安全配置"
     ui_option 2 "一键保守增强（不禁 root、不禁密码、不改端口）"
-    ui_option 3 "逐项配置（带说明）"
+    ui_option 3 "逐项调整安全参数并统一检测应用"
     ui_back
     local opt
     ui_prompt opt
     case "$opt" in
-      1) show_ssh_effective_config; pause_return ;;
-      2) ssh_security_recommended; pause_return ;;
-      3) ssh_security_custom; pause_return ;;
+      1) show_ssh_effective_config; ui_action_pause ;;
+      2) ssh_security_recommended; ui_action_pause ;;
+      3) ssh_security_custom; ui_action_pause ;;
       0) return 0 ;;
-      *) echo_error "无效选项"; pause_return ;;
+      *) echo_error "无效选项"; ui_action_pause ;;
     esac
   done
 }
@@ -1634,33 +1773,32 @@ secure_ssh() {
 change_ssh_port_password() {
   [ -f /etc/ssh/sshd_config ] || { echo_error "找不到 /etc/ssh/sshd_config"; return 1; }
   while true; do
-    ui_title "SSH 端口 / 密码 / 密钥 / root 管理"
-    echo_color "请不要关闭当前 SSH 连接，另开终端测试新连接是否成功。"
-    ui_option 1 "只修改 SSH 端口"
-    ui_option 2 "只修改 root 密码"
-    ui_option 3 "同时修改 SSH 端口和 root 密码"
-    ui_option 4 "配置密钥登录 / 自动生成密钥"
-    ui_option 5 "开启/关闭密码登录"
-    ui_option 6 "关闭 root 登录并新增 sudo 用户 / 恢复 root 登录"
-    ui_option 7 "查看当前 SSH 关键配置"
+    ui_title "SSH 连接 / 登录 / 账号管理"
+    ui_menu_note "逻辑：先看状态，再改连接参数，再管理认证方式与账号。所有 SSH 配置修改均先备份并检测。"
+    ui_option 1 "查看当前连接、端口与登录状态"
+    ui_option 2 "修改 SSH 端口"
+    ui_option 3 "修改 root 密码"
+    ui_option 4 "同时修改 SSH 端口和 root 密码"
+    ui_option 5 "管理 SSH 密钥登录"
+    ui_option 6 "开启 / 关闭密码登录"
+    ui_option 7 "管理 sudo 用户与 root SSH 登录"
     ui_back
     local mode
     ui_prompt mode
     case "$mode" in
-      1) change_ssh_port_only; pause_return ;;
-      2) change_root_password_only; pause_return ;;
-      3) change_ssh_port_and_password_together; pause_return ;;
-      4) configure_key_login ;;
-      5) toggle_password_login; pause_return ;;
-      6) manage_root_login_user; pause_return ;;
-      7) show_ssh_effective_config; pause_return ;;
+      1) show_ssh_connection_summary; ui_action_pause ;;
+      2) change_ssh_port_only; ui_action_pause ;;
+      3) change_root_password_only; ui_action_pause ;;
+      4) change_ssh_port_and_password_together; ui_action_pause ;;
+      5) configure_key_login ;;
+      6) toggle_password_login; ui_action_pause ;;
+      7) manage_root_login_user; ui_action_pause ;;
       0) return 0 ;;
-      *) echo_error "无效选项"; pause_return ;;
+      *) echo_error "无效选项"; ui_action_pause ;;
     esac
   done
 }
 
-# ---------- 时间同步 ----------
 validate_ntp_servers() {
   local input="${1:-}" item
   [ -n "$input" ] || return 1
@@ -1740,7 +1878,7 @@ time_sync_configure_timesyncd() {
   time_sync_stop_conflicting_clients timesyncd || return 1
   mkdir -p "$conf_dir" || { time_sync_restore_stopped_clients; return 1; }
   if ! cat > "$conf" <<EOF_TS
-# server-toolkit v2.6: systemd-timesyncd NTP
+# server-toolkit v2.7: systemd-timesyncd NTP
 [Time]
 NTP=$ntp
 FallbackNTP=time.google.com time.cloudflare.com
@@ -1801,10 +1939,10 @@ time_sync_configure_chrony() {
   {
     cat "$tmp"
     echo
-    echo "# server-toolkit v2.6 BEGIN"
+    echo "# server-toolkit v2.7 BEGIN"
     for line in $ntp; do printf 'server %s iburst\n' "$line"; done
     echo "makestep 1.0 3"
-    echo "# server-toolkit v2.6 END"
+    echo "# server-toolkit v2.7 END"
   } > "$conf" || { rm -f "$tmp"; time_sync_restore_stopped_clients; return 1; }
   rm -f "$tmp"
   if ! chronyd -p -f "$conf" >/tmp/server-toolkit-chrony-test.log 2>&1; then
@@ -1844,37 +1982,64 @@ time_sync_one_shot_fallback() {
   return 1
 }
 
-time_sync() {
-  ui_title "时间同步 · systemd-timesyncd / chrony"
-  show_os_detected
-  local ntp custom method
-  ntp="time.google.com time.cloudflare.com"
-  read -r -p "NTP 源，直接回车使用默认 [$ntp]，或输入自定义多个域名/IP: " custom
-  if [ -n "$custom" ]; then
-    if validate_ntp_servers "$custom"; then ntp="$custom"; else echo_error "自定义 NTP 源未通过校验。"; return 1; fi
-  fi
-  if is_debian_like; then method="timesyncd"; else method="chrony"; fi
-  echo_info "默认策略：Debian/Ubuntu 优先 timesyncd；RedHat/Fedora/Amazon 优先 chrony。"
-  ui_option 1 "按默认策略配置（推荐：$method）"
-  ui_option 2 "强制使用 systemd-timesyncd"
-  ui_option 3 "强制使用 chrony"
-  ui_option 4 "只执行一次性校时 fallback"
-  ui_option 5 "查看时间同步状态"
-  ui_back
-  local opt
-  ui_prompt opt
-  case "$opt" in
-    1) if [ "$method" = "timesyncd" ]; then time_sync_configure_timesyncd "$ntp" || time_sync_configure_chrony "$ntp" || time_sync_one_shot_fallback "$ntp"; else time_sync_configure_chrony "$ntp" || time_sync_configure_timesyncd "$ntp" || time_sync_one_shot_fallback "$ntp"; fi ;;
-    2) time_sync_configure_timesyncd "$ntp" || time_sync_one_shot_fallback "$ntp" ;;
-    3) time_sync_configure_chrony "$ntp" || time_sync_one_shot_fallback "$ntp" ;;
-    4) time_sync_one_shot_fallback "$ntp" ;;
-    5) show_timesync_diagnostics ;;
-    0) return 0 ;;
-    *) echo_error "无效选项" ;;
-  esac
+time_sync_prompt_ntp() {
+  local outvar="${1:-}" custom defaults="time.google.com time.cloudflare.com"
+  [ -n "$outvar" ] || return 1
+  read -r -p "NTP 源 [直接回车使用默认：$defaults]: " custom
+  custom="${custom:-$defaults}"
+  validate_ntp_servers "$custom" || { echo_error "NTP 源格式无效，只允许域名/IP及空格分隔。"; return 1; }
+  printf -v "$outvar" '%s' "$custom"
 }
 
-# ---------- APT / RPM 源修复 ----------
+time_sync_apply_recommended() {
+  local ntp="${1:-}" method
+  [ -n "$ntp" ] || return 1
+  if is_debian_like; then method="timesyncd"; else method="chrony"; fi
+  echo_info "推荐策略：$(is_debian_like && echo 'Debian/Ubuntu → systemd-timesyncd 优先' || echo 'RedHat/Fedora/Amazon → chrony 优先')"
+  if [ "$method" = "timesyncd" ]; then
+    time_sync_configure_timesyncd "$ntp" || time_sync_configure_chrony "$ntp" || time_sync_one_shot_fallback "$ntp"
+  else
+    time_sync_configure_chrony "$ntp" || time_sync_configure_timesyncd "$ntp" || time_sync_one_shot_fallback "$ntp"
+  fi
+}
+
+time_sync() {
+  local opt ntp
+  while true; do
+    ui_title "时间同步管理"
+    show_os_detected
+    ui_menu_note "默认 NTP：time.google.com + time.cloudflare.com；自定义源只在执行配置时询问。"
+    ui_option 1 "查看当前同步状态"
+    ui_option 2 "按发行版推荐策略配置（推荐）"
+    ui_option 3 "强制配置 systemd-timesyncd"
+    ui_option 4 "强制配置 chrony / chronyd"
+    ui_option 5 "只执行一次性校时 fallback"
+    ui_back
+    ui_prompt opt
+    case "$opt" in
+      1) show_timesync_diagnostics; ui_action_pause ;;
+      2)
+        time_sync_prompt_ntp ntp && time_sync_apply_recommended "$ntp"
+        ui_action_pause
+        ;;
+      3)
+        time_sync_prompt_ntp ntp && { time_sync_configure_timesyncd "$ntp" || time_sync_one_shot_fallback "$ntp"; }
+        ui_action_pause
+        ;;
+      4)
+        time_sync_prompt_ntp ntp && { time_sync_configure_chrony "$ntp" || time_sync_one_shot_fallback "$ntp"; }
+        ui_action_pause
+        ;;
+      5)
+        time_sync_prompt_ntp ntp && time_sync_one_shot_fallback "$ntp"
+        ui_action_pause
+        ;;
+      0) return 0 ;;
+      *) echo_error "无效选项"; ui_action_pause ;;
+    esac
+  done
+}
+
 get_os_id() { parse_os_release; echo "$OS_ID"; }
 
 get_os_codename() {
@@ -2208,7 +2373,7 @@ show_apt_sources_current() {
 }
 
 repair_apt_sources_auto() {
-  local os code log_file
+  local os code log_file rc
   is_debian_like || { echo_warn "当前不是 Debian/Ubuntu 系，跳过 APT 源修复。"; return 0; }
   os="$(get_os_id)"; [ "$os" = "ubuntu" ] || os="debian"
   code="$(get_os_codename)"
@@ -2217,8 +2382,13 @@ repair_apt_sources_auto() {
   ui_title "自动检测并修复 APT 源"
   echo_info "系统识别：$os / $code"
   if apt_update_with_log "$log_file"; then
-    echo_color "当前 APT 源可正常 update，未强制改写。"
-    if confirm_action "是否继续检测并切换到官方/Google/Cloudflare/Yandex/归档源？" "2"; then apt_source_interactive_chooser; else echo_warn "已保留当前 APT 源。"; fi
+    echo_color "当前 APT 源可正常 update，不需要修复。"
+    if confirm_action "当前源正常。是否仍要检测并手动切换镜像？" "2"; then
+      apt_source_interactive_chooser
+      rc=$?
+      return "$rc"
+    fi
+    echo_info "已保留当前 APT 源。"
     return 0
   fi
   echo_warn "当前 APT 源 update 失败，日志：$log_file"
@@ -2240,11 +2410,13 @@ rpm_check_repos() {
 rpm_enable_crb_like() {
   parse_os_release
   if is_rhel_subscription_os; then
-    echo_warn "RHEL 请用 subscription-manager 启用 CodeReady Builder，本脚本不修改 redhat.repo。"
+    echo_warn "RHEL 请使用 subscription-manager 管理 CodeReady Builder；本脚本不会修改 redhat.repo。"
     return 2
   fi
   if command -v dnf >/dev/null 2>&1; then
-    pkg_install dnf-plugins-core >/dev/null 2>&1 || echo_warn "dnf-plugins-core 安装失败，继续尝试现有 config-manager。"
+    if ! dnf config-manager --help >/dev/null 2>&1; then
+      pkg_install dnf-plugins-core >/dev/null 2>&1 || { echo_warn "dnf-plugins-core 安装失败，无法使用 config-manager。"; return 1; }
+    fi
     case "$OS_ID" in
       rocky|almalinux|ol|centos)
         if dnf config-manager --set-enabled crb >/dev/null 2>&1 || dnf config-manager --set-enabled powertools >/dev/null 2>&1; then
@@ -2256,43 +2428,60 @@ rpm_enable_crb_like() {
       amzn|amazon) echo_info "Amazon Linux 不使用 CRB。"; return 0 ;;
       *) echo_warn "当前发行版未定义 CRB 自动启用规则。"; return 2 ;;
     esac
-  elif command -v yum-config-manager >/dev/null 2>&1; then
-    yum-config-manager --enable extras >/dev/null 2>&1 && { echo_color "已启用 extras 仓库。"; return 0; }
-    echo_warn "extras 仓库启用失败。"; return 1
   fi
-  echo_warn "未检测到 dnf config-manager/yum-config-manager。"
+  if command -v yum >/dev/null 2>&1; then
+    if ! command -v yum-config-manager >/dev/null 2>&1; then
+      pkg_install yum-utils >/dev/null 2>&1 || { echo_warn "yum-utils 安装失败，无法使用 yum-config-manager。"; return 1; }
+    fi
+    if yum-config-manager --enable extras >/dev/null 2>&1; then
+      echo_color "已启用 extras 仓库。"
+      return 0
+    fi
+    echo_warn "extras 仓库启用失败。"
+    return 1
+  fi
+  echo_warn "未检测到可用的 DNF/YUM config-manager。"
   return 1
 }
 
 rpm_install_epel_safely() {
   parse_os_release
   if is_rhel_subscription_os; then
-    echo_warn "RHEL 安装 EPEL 前请确认订阅与 CodeReady Builder 状态。"
+    echo_warn "RHEL 安装 EPEL 前请确认 subscription-manager 与 CodeReady Builder 状态；本脚本不会修改 redhat.repo。"
   fi
   case "$OS_ID" in
     fedora|amzn|amazon)
-      echo_warn "当前系统不使用传统 EPEL 安装流程，跳过。"; return 0 ;;
+      echo_info "当前系统不使用传统 EPEL 安装流程，已安全跳过。"; return 0 ;;
   esac
   confirm_action "确认安装/启用 EPEL？" "2" || return 0
-  rpm_enable_crb_like || true
-  pkg_install epel-release || echo_warn "epel-release 安装失败，请按发行版官方文档手动处理。"
+  rpm_enable_crb_like || echo_warn "CRB/PowerTools/Extras 未能自动启用，将继续尝试 EPEL，但稍后会验证缓存。"
+  if ! pkg_install epel-release; then
+    echo_error "epel-release 安装失败。"
+    return 1
+  fi
+  pkg_makecache || { echo_error "EPEL 安装后软件源缓存刷新失败，请检查仓库配置。"; return 1; }
+  echo_color "EPEL 已安装/启用并通过 makecache 检查。"
 }
 
 rpm_repair_repos() {
   while true; do
-    ui_title "DNF/YUM 源检测与修复"
-    ui_option 1 "只检测源可用性（makecache）"
-    ui_option 2 "启用 CRB/PowerTools/Extras 类仓库（兼容发行版）"
-    ui_option 3 "安全安装/启用 EPEL"
+    ui_title "DNF / YUM 软件源管理"
+    ui_menu_note "RHEL 仅检测 subscription-manager，不会强行修改 redhat.repo。"
+    ui_option 1 "查看 / 检测当前仓库可用性（makecache）"
+    ui_option 2 "启用 CRB / PowerTools / Extras 类仓库"
+    ui_option 3 "安全安装 / 启用 EPEL"
     ui_back
     local opt
     ui_prompt opt
     case "$opt" in
-      1) rpm_check_repos; pause_return ;;
-      2) rpm_enable_crb_like; pkg_makecache || true; pause_return ;;
-      3) rpm_install_epel_safely; pause_return ;;
+      1) rpm_check_repos; ui_action_pause ;;
+      2)
+        if rpm_enable_crb_like; then pkg_makecache || echo_error "仓库启用后 makecache 失败。"; else echo_warn "仓库启用未完成，请根据上方提示检查。"; fi
+        ui_action_pause
+        ;;
+      3) rpm_install_epel_safely; ui_action_pause ;;
       0) return 0 ;;
-      *) echo_error "无效选项"; pause_return ;;
+      *) echo_error "无效选项"; ui_action_pause ;;
     esac
   done
 }
@@ -2300,29 +2489,30 @@ rpm_repair_repos() {
 repair_sources_menu() {
   if is_debian_like; then
     while true; do
-      ui_title "APT 源修复"
+      ui_title "APT 软件源管理"
+      ui_menu_note "先查看/检测；只有明确选择修复或切换时才会写入配置，失败自动回滚。"
       ui_option 1 "查看当前 APT 源"
-      ui_option 2 "自动检测并修复 APT 源"
-      ui_option 3 "手动选择官方/Google/Cloudflare/Yandex/归档源"
+      ui_option 2 "检测当前源；失败时自动修复"
+      ui_option 3 "手动检测并选择镜像源"
       ui_back
       local opt
       ui_prompt opt
       case "$opt" in
-        1) show_apt_sources_current; pause_return ;;
-        2) repair_apt_sources_auto; pause_return ;;
-        3) apt_source_interactive_chooser; pause_return ;;
+        1) show_apt_sources_current; ui_action_pause ;;
+        2) repair_apt_sources_auto; ui_action_pause ;;
+        3) apt_source_interactive_chooser; ui_action_pause ;;
         0) return 0 ;;
-        *) echo_error "无效选项"; pause_return ;;
+        *) echo_error "无效选项"; ui_action_pause ;;
       esac
     done
   elif is_redhat_like; then
     rpm_repair_repos
   else
     echo_warn "当前系统暂不支持自动源修复。"
+    ui_action_pause
   fi
 }
 
-# ---------- Fail2Ban ----------
 fail2ban_backend_config() {
   local logpath
   if command -v journalctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
@@ -2357,9 +2547,10 @@ fail2ban_banaction() {
 
 fail2ban_write_global_dropin() {
   local level="${1:-INFO}" file="/etc/fail2ban/fail2ban.d/server-toolkit.conf"
-  mkdir -p /etc/fail2ban/fail2ban.d
+  case "$level" in CRITICAL|ERROR|WARNING|NOTICE|INFO|DEBUG) ;; *) echo_error "Fail2Ban 日志等级无效：$level"; return 1 ;; esac
+  mkdir -p /etc/fail2ban/fail2ban.d || return 1
   cat > "$file" <<EOF_F2B_GLOBAL
-# server-toolkit v2.6: global drop-in, does not overwrite fail2ban.local
+# server-toolkit v2.7: global drop-in, does not overwrite fail2ban.local
 [Definition]
 allowipv6 = auto
 loglevel = $level
@@ -2390,7 +2581,7 @@ fail2ban_write_sshd_jail() {
   banaction="$(fail2ban_banaction 2>/dev/null || true)"
   mkdir -p /etc/fail2ban/jail.d || return 1
   {
-    echo "# server-toolkit v2.6: sshd jail, does not overwrite jail.local"
+    echo "# server-toolkit v2.7: sshd jail, does not overwrite jail.local"
     echo "[sshd]"
     echo "enabled = true"
     echo "port = $ssh_ports"
@@ -2399,8 +2590,7 @@ fail2ban_write_sshd_jail() {
     echo "maxretry = $maxretry"
     echo "ignoreip = 127.0.0.1/8 ::1 $ignoreip"
     [ -n "$banaction" ] && echo "banaction = $banaction"
-    printf '%s
-' "$backend"
+    printf '%s\n' "$backend"
   } > "$file" || return 1
 }
 
@@ -2528,33 +2718,35 @@ fail2ban_config_jail() {
 manage_fail2ban() {
   while true; do
     ui_title "Fail2Ban 管理"
-    ui_option 1 "安装/写入默认 SSH 防护配置（jail.d，不覆盖 jail.local）"
-    ui_option 2 "自动识别当前 SSH 端口并刷新配置"
-    ui_option 3 "查看 Fail2Ban 服务状态"
-    ui_option 4 "查看 sshd jail / banned IP"
-    ui_option 5 "查看最近 80 条日志"
-    ui_option 6 "设置 Fail2Ban 日志等级（drop-in，不覆盖 fail2ban.local）"
-    ui_option 7 "配置 sshd 防护参数"
+    ui_menu_note "状态与日志放在前面；安装、同步和修改配置放在后面。server-toolkit 不覆盖 jail.local。"
+    ui_menu_section "状态 / 排障" ban
+    ui_option 1 "查看服务与 jail 总览"
+    ui_option 2 "查看 sshd jail 与 banned IP"
+    ui_option 3 "查看最近 80 条日志"
+    ui_menu_section "配置 / 操作" key
+    ui_option 4 "安装或写入默认 SSH 防护配置"
+    ui_option 5 "同步当前 SSH 端口到 Fail2Ban"
+    ui_option 6 "配置 sshd 防护参数"
+    ui_option 7 "设置 Fail2Ban 日志等级"
     ui_option 8 "解封指定 IP"
     ui_back
     local opt
     ui_prompt opt
     case "$opt" in
-      1) setup_fail2ban_default; pause_return ;;
-      2) fail2ban_refresh_ssh_port; pause_return ;;
-      3) fail2ban_status; pause_return ;;
-      4) fail2ban_show_banned; pause_return ;;
-      5) fail2ban_recent_logs; pause_return ;;
-      6) fail2ban_set_loglevel; pause_return ;;
-      7) fail2ban_config_jail; pause_return ;;
-      8) fail2ban_unban_ip; pause_return ;;
+      1) fail2ban_status; ui_action_pause ;;
+      2) fail2ban_show_banned; ui_action_pause ;;
+      3) fail2ban_recent_logs; ui_action_pause ;;
+      4) setup_fail2ban_default; ui_action_pause ;;
+      5) fail2ban_refresh_ssh_port; ui_action_pause ;;
+      6) fail2ban_config_jail; ui_action_pause ;;
+      7) fail2ban_set_loglevel; ui_action_pause ;;
+      8) fail2ban_unban_ip; ui_action_pause ;;
       0) return 0 ;;
-      *) echo_error "无效选项"; pause_return ;;
+      *) echo_error "无效选项"; ui_action_pause ;;
     esac
   done
 }
 
-# ---------- IPv6 / GRUB ----------
 sysctl_key_exists() { local key="${1:-}"; [ -n "$key" ] && sysctl -n "$key" >/dev/null 2>&1; }
 
 grub_file_detect() { [ -f /etc/default/grub ] && echo "/etc/default/grub" || echo ""; }
@@ -2647,53 +2839,60 @@ show_ipv6_status() {
 }
 
 manage_ipv6() {
-  ui_title "IPv6 一键开启/关闭"
   local conf="/etc/sysctl.d/99-server-toolkit-ipv6.conf" opt backup_dir
-  ui_option 1 "一键开启 IPv6"
-  ui_option 2 "一键关闭 IPv6（默认取消，可能影响网络）"
-  ui_option 3 "查看 IPv6 状态"
-  ui_back
-  ui_prompt opt
-  case "$opt" in
-    1)
-      backup_dir="$(make_backup_dir ipv6-enable)" || return 1; backup_path_to_dir "$conf" "$backup_dir" || return 1
-      if ! {
-        echo "# server-toolkit v2.6: ipv6 enable"
-        sysctl_key_exists net.ipv6.conf.all.disable_ipv6 && echo "net.ipv6.conf.all.disable_ipv6=0"
-        sysctl_key_exists net.ipv6.conf.default.disable_ipv6 && echo "net.ipv6.conf.default.disable_ipv6=0"
-        sysctl_key_exists net.ipv6.conf.lo.disable_ipv6 && echo "net.ipv6.conf.lo.disable_ipv6=0"
-      } > "$conf"; then
-        echo_error "IPv6 sysctl 配置写入失败，已中止。"
-        rm -f "$conf"
-        restore_path_from_dir "$conf" "$backup_dir" >/dev/null 2>&1 || true
-        return 1
-      fi
-      if ! update_grub_ipv6_param enable; then rm -f "$conf"; restore_path_from_dir "$conf" "$backup_dir" || true; return 1; fi
-      sysctl -p "$conf" || echo_warn "部分运行时 sysctl 未能应用，可能需要重启。"
-      show_ipv6_status
-      ;;
-    2)
-      confirm_action "确认关闭 IPv6？此操作可能影响业务网络。" "2" || { echo_warn "已取消。"; return 0; }
-      backup_dir="$(make_backup_dir ipv6-disable)" || return 1; backup_path_to_dir "$conf" "$backup_dir" || return 1
-      if ! {
-        echo "# server-toolkit v2.6: ipv6 disable"
-        sysctl_key_exists net.ipv6.conf.all.disable_ipv6 && echo "net.ipv6.conf.all.disable_ipv6=1"
-        sysctl_key_exists net.ipv6.conf.default.disable_ipv6 && echo "net.ipv6.conf.default.disable_ipv6=1"
-        sysctl_key_exists net.ipv6.conf.lo.disable_ipv6 && echo "net.ipv6.conf.lo.disable_ipv6=1"
-      } > "$conf"; then
-        echo_error "IPv6 sysctl 配置写入失败，已中止。"
-        rm -f "$conf"
-        restore_path_from_dir "$conf" "$backup_dir" >/dev/null 2>&1 || true
-        return 1
-      fi
-      if ! update_grub_ipv6_param disable; then rm -f "$conf"; restore_path_from_dir "$conf" "$backup_dir" || true; return 1; fi
-      sysctl -p "$conf" || echo_warn "部分运行时 sysctl 未能应用，可能需要重启。"
-      show_ipv6_status
-      ;;
-    3) show_ipv6_status ;;
-    0) return 0 ;;
-    *) echo_error "无效选项" ;;
-  esac
+  while true; do
+    ui_title "IPv6 管理"
+    ui_menu_note "先查看状态；开启/关闭会修改 sysctl，非容器环境还会安全更新 GRUB 参数。"
+    ui_option 1 "查看 IPv6 当前状态"
+    ui_option 2 "开启 IPv6"
+    ui_option 3 "关闭 IPv6（高风险，默认取消）"
+    ui_back
+    ui_prompt opt
+    case "$opt" in
+      1) show_ipv6_status; ui_action_pause ;;
+      2)
+        backup_dir="$(make_backup_dir ipv6-enable)" || { ui_action_pause; continue; }
+        backup_path_to_dir "$conf" "$backup_dir" || { echo_error "IPv6 配置备份失败。"; ui_action_pause; continue; }
+        if ! {
+          echo "# server-toolkit v2.7: ipv6 enable"
+          sysctl_key_exists net.ipv6.conf.all.disable_ipv6 && echo "net.ipv6.conf.all.disable_ipv6=0"
+          sysctl_key_exists net.ipv6.conf.default.disable_ipv6 && echo "net.ipv6.conf.default.disable_ipv6=0"
+          sysctl_key_exists net.ipv6.conf.lo.disable_ipv6 && echo "net.ipv6.conf.lo.disable_ipv6=0"
+        } > "$conf"; then
+          echo_error "IPv6 sysctl 配置写入失败，已中止。"
+          rm -f "$conf"
+          restore_path_from_dir "$conf" "$backup_dir" >/dev/null 2>&1 || true
+          ui_action_pause; continue
+        fi
+        if ! update_grub_ipv6_param enable; then rm -f "$conf"; restore_path_from_dir "$conf" "$backup_dir" || true; ui_action_pause; continue; fi
+        sysctl -p "$conf" || echo_warn "部分运行时 sysctl 未能应用，可能需要重启。"
+        show_ipv6_status
+        ui_action_pause
+        ;;
+      3)
+        confirm_action "确认关闭 IPv6？此操作可能影响业务网络。" "2" || { echo_warn "已取消。"; ui_action_pause; continue; }
+        backup_dir="$(make_backup_dir ipv6-disable)" || { ui_action_pause; continue; }
+        backup_path_to_dir "$conf" "$backup_dir" || { echo_error "IPv6 配置备份失败。"; ui_action_pause; continue; }
+        if ! {
+          echo "# server-toolkit v2.7: ipv6 disable"
+          sysctl_key_exists net.ipv6.conf.all.disable_ipv6 && echo "net.ipv6.conf.all.disable_ipv6=1"
+          sysctl_key_exists net.ipv6.conf.default.disable_ipv6 && echo "net.ipv6.conf.default.disable_ipv6=1"
+          sysctl_key_exists net.ipv6.conf.lo.disable_ipv6 && echo "net.ipv6.conf.lo.disable_ipv6=1"
+        } > "$conf"; then
+          echo_error "IPv6 sysctl 配置写入失败，已中止。"
+          rm -f "$conf"
+          restore_path_from_dir "$conf" "$backup_dir" >/dev/null 2>&1 || true
+          ui_action_pause; continue
+        fi
+        if ! update_grub_ipv6_param disable; then rm -f "$conf"; restore_path_from_dir "$conf" "$backup_dir" || true; ui_action_pause; continue; fi
+        sysctl -p "$conf" || echo_warn "部分运行时 sysctl 未能应用，可能需要重启。"
+        show_ipv6_status
+        ui_action_pause
+        ;;
+      0) return 0 ;;
+      *) echo_error "无效选项"; ui_action_pause ;;
+    esac
+  done
 }
 
 format_bytes() {
@@ -2872,7 +3071,7 @@ apply_conservative_sysctl_hardening() {
     backup_path_to_dir "$conf" "$backup_dir" || { echo_error "原 sysctl 加固配置备份失败，已中止。"; return 1; }
   fi
   tmp="$(mktemp /tmp/server-toolkit-sysctl.XXXXXX)" || return 1
-  echo "# server-toolkit v2.6: conservative hardening" > "$tmp"
+  echo "# server-toolkit v2.7: conservative hardening" > "$tmp"
   apply_sysctl_if_exists net.ipv4.tcp_syncookies 1 "$tmp"
   apply_sysctl_if_exists net.ipv4.conf.all.accept_redirects 0 "$tmp"
   apply_sysctl_if_exists net.ipv4.conf.default.accept_redirects 0 "$tmp"
@@ -2915,8 +3114,7 @@ toggle_unpriv_userns() {
   if [ "$existed" -eq 1 ]; then
     backup_path_to_dir "$conf" "$backup_dir" || { echo_error "原 user namespace 配置备份失败，已中止。"; return 1; }
   fi
-  printf 'kernel.unprivileged_userns_clone=%s
-' "$value" > "$conf" || return 1
+  printf 'kernel.unprivileged_userns_clone=%s\n' "$value" > "$conf" || return 1
   if ! sysctl -p "$conf"; then
     echo_error "user namespace sysctl 应用失败，开始回滚。"
     if [ "$existed" -eq 1 ]; then restore_path_from_dir "$conf" "$backup_dir" || true; else rm -f "$conf"; fi
@@ -2929,17 +3127,19 @@ apply_regresshion_mitigation() {
   echo_warn "正式修复应升级 OpenSSH 包；临时缓解只调整 sshd 登录窗口与并发，不替代升级。"
   confirm_action "确认应用临时缓解 LoginGraceTime=0 MaxStartups=10:30:60？" "2" || return 0
   local backup_dir
-  backup_dir="$(make_backup_dir ssh-regresshion)" || return 1; backup_ssh_tree "$backup_dir" || return 1
-  set_sshd_kv_effective LoginGraceTime 0
-  set_sshd_kv_effective MaxStartups "10:30:60"
+  backup_dir="$(make_backup_dir ssh-regresshion)" || return 1
+  backup_ssh_tree "$backup_dir" || return 1
+  set_sshd_kv_effective LoginGraceTime 0 || { restore_ssh_tree "$backup_dir" || true; return 1; }
+  set_sshd_kv_effective MaxStartups "10:30:60" || { restore_ssh_tree "$backup_dir" || true; return 1; }
   ssh_apply_with_rollback "regreSSHion 临时缓解" "$backup_dir" "LoginGraceTime=0" "MaxStartups=10:30:60"
 }
 
 restore_regresshion_mitigation() {
   local backup_dir
-  backup_dir="$(make_backup_dir ssh-regresshion-restore)" || return 1; backup_ssh_tree "$backup_dir" || return 1
-  set_sshd_kv_effective LoginGraceTime 30
-  set_sshd_kv_effective MaxStartups "10:30:100"
+  backup_dir="$(make_backup_dir ssh-regresshion-restore)" || return 1
+  backup_ssh_tree "$backup_dir" || return 1
+  set_sshd_kv_effective LoginGraceTime 30 || { restore_ssh_tree "$backup_dir" || true; return 1; }
+  set_sshd_kv_effective MaxStartups "10:30:100" || { restore_ssh_tree "$backup_dir" || true; return 1; }
   ssh_apply_with_rollback "regreSSHion 缓解恢复" "$backup_dir" "LoginGraceTime=30" "MaxStartups=10:30:100"
 }
 
@@ -2952,7 +3152,7 @@ apply_copy_fail_mitigation() {
   local conf="/etc/modprobe.d/server-toolkit-copy-fail.conf"
   backup_file "$conf" || { echo_error "临时缓解配置备份失败，已中止。"; return 1; }
   cat > "$conf" <<'EOF_CF'
-# server-toolkit v2.6: CVE-2026-31431 temporary mitigation
+# server-toolkit v2.7: CVE-2026-31431 temporary mitigation
 # 临时缓解不能替代升级内核；如使用 IPsec/AF_ALG 相关功能，启用前必须评估影响。
 install algif_aead /bin/false
 blacklist algif_aead
@@ -3003,35 +3203,36 @@ security_update_core_packages() {
 server_hardening() {
   while true; do
     ui_title "服务器加固"
-    ui_option 1 "一键保守加固（sysctl + SSH 保守增强）"
-    ui_option 2 "应用保守 sysctl 加固"
-    ui_option 3 "CVE-2024-6387 / regreSSHion 临时缓解"
-    ui_option 4 "恢复 regreSSHion 临时缓解默认值"
-    ui_option 5 "CVE-2026-31431 / Copy Fail 临时缓解"
-    ui_option 6 "移除 Copy Fail 临时缓解"
-    ui_option 7 "关闭/恢复 unprivileged user namespace"
-    ui_option 8 "安全更新核心包"
-    ui_option 9 "查看加固状态"
+    ui_menu_section "状态 / 推荐操作" harden
+    ui_option 1 "查看当前加固与缓解状态"
+    ui_option 2 "一键保守加固（sysctl + SSH 保守增强）"
+    ui_option 3 "仅应用保守 sysctl 加固"
+    ui_option 4 "安全更新核心软件包"
+    ui_menu_section "临时缓解 / 兼容性开关" warning
+    ui_option 5 "应用 CVE-2024-6387 / regreSSHion 临时缓解"
+    ui_option 6 "移除 regreSSHion 临时缓解"
+    ui_option 7 "应用 CVE-2026-31431 / Copy Fail 临时缓解"
+    ui_option 8 "移除 Copy Fail 临时缓解"
+    ui_option 9 "关闭 / 恢复 unprivileged user namespace"
     ui_back
     local opt
     ui_prompt opt
     case "$opt" in
-      1) one_click_safe_hardening; pause_return ;;
-      2) apply_conservative_sysctl_hardening; pause_return ;;
-      3) apply_regresshion_mitigation; pause_return ;;
-      4) restore_regresshion_mitigation; pause_return ;;
-      5) apply_copy_fail_mitigation; pause_return ;;
-      6) remove_copy_fail_mitigation; pause_return ;;
-      7) toggle_unpriv_userns; pause_return ;;
-      8) security_update_core_packages; pause_return ;;
-      9) show_vulnerability_status; pause_return ;;
+      1) show_vulnerability_status; ui_action_pause ;;
+      2) one_click_safe_hardening; ui_action_pause ;;
+      3) apply_conservative_sysctl_hardening; ui_action_pause ;;
+      4) security_update_core_packages; ui_action_pause ;;
+      5) apply_regresshion_mitigation; ui_action_pause ;;
+      6) restore_regresshion_mitigation; ui_action_pause ;;
+      7) apply_copy_fail_mitigation; ui_action_pause ;;
+      8) remove_copy_fail_mitigation; ui_action_pause ;;
+      9) toggle_unpriv_userns; ui_action_pause ;;
       0) return 0 ;;
-      *) echo_error "无效选项"; pause_return ;;
+      *) echo_error "无效选项"; ui_action_pause ;;
     esac
   done
 }
 
-# ---------- 新服务器初始化 / 更新 ----------
 openssh_security_upgrade() {
   echo_info "正在尝试定向升级/安装 OpenSSH 安全更新..."
   pkg_makecache || return 1
@@ -3041,47 +3242,62 @@ openssh_security_upgrade() {
   echo_color "OpenSSH 定向安全更新流程已完成。"
 }
 
+ensure_package_sources_ready() {
+  echo_info "正在检查当前软件源是否可用……"
+  if pkg_makecache; then
+    echo_color "当前软件源可用。"
+    return 0
+  fi
+  echo_warn "当前软件源刷新失败。"
+  if ! confirm_action "是否进入软件源修复菜单？修复完成后脚本会再次验证。" "2"; then
+    echo_error "软件源不可用，已停止更新流程。"
+    return 1
+  fi
+  repair_sources_menu || return 1
+  pkg_makecache || { echo_error "软件源修复后仍无法刷新缓存，已停止更新流程。"; return 1; }
+}
+
 new_server_basic_update() {
-  echo_warn "保守更新：修复源 -> 更新缓存 -> 安装常用工具 -> 尝试升级 OpenSSH。"
+  echo_warn "保守更新：检查软件源 → 安装常用工具 → 定向升级 OpenSSH。不会自动执行全量 dist-upgrade。"
   confirm_action "确认执行保守更新？" "2" || { echo_warn "已取消。"; return 0; }
-  repair_sources_menu || true
-  pkg_makecache || return 1
+  ensure_package_sources_ready || return 1
   pkg_install wget curl sudo vim git unzip openssh-server openssh-client ca-certificates || return 1
   openssh_security_upgrade || return 1
 }
 
 new_server_full_update() {
-  echo_warn "全量更新会执行 upgrade/dist-upgrade/autoremove，可能更新内核。生产环境建议先快照。"
-  confirm_action "确认执行全量更新？" "2" || { echo_warn "已取消。"; return 0; }
-  repair_sources_menu || true
-  pkg_makecache || return 1
+  echo_warn "全量更新：检查软件源 → 全量升级 → autoremove → OpenSSH 检查。可能更新内核并影响生产业务。"
+  echo_warn "生产环境建议先创建云快照或完整备份。"
+  confirm_action "确认执行全量系统更新？" "2" || { echo_warn "已取消。"; return 0; }
+  ensure_package_sources_ready || return 1
   pkg_full_upgrade || return 1
   openssh_security_upgrade || return 1
 }
 
 new_server_init_menu() {
   while true; do
-    ui_title "新服务器初始化 / 源修复"
+    ui_title "初始化 / 软件源 / 系统更新"
     show_os_detected
-    ui_option 1 "自动检测并修复软件源（APT/DNF/YUM）"
-    ui_option 2 "保守更新：安装常用工具并升级 OpenSSH"
-    ui_option 3 "全量系统更新"
-    ui_option 4 "单独升级/修复 OpenSSH"
+    ui_menu_section "软件源" package
+    ui_option 1 "查看、检测或修复软件源"
+    ui_menu_section "系统更新" linux
+    ui_option 2 "保守更新（常用工具 + OpenSSH）"
+    ui_option 3 "全量系统更新（高风险，可能更新内核）"
+    ui_option 4 "仅升级 / 修复 OpenSSH"
     ui_back
     local opt
     ui_prompt opt
     case "$opt" in
       1) repair_sources_menu ;;
-      2) new_server_basic_update; pause_return ;;
-      3) new_server_full_update; pause_return ;;
-      4) openssh_security_upgrade; pause_return ;;
+      2) new_server_basic_update; ui_action_pause ;;
+      3) new_server_full_update; ui_action_pause ;;
+      4) openssh_security_upgrade; ui_action_pause ;;
       0) return 0 ;;
-      *) echo_error "无效选项"; pause_return ;;
+      *) echo_error "无效选项"; ui_action_pause ;;
     esac
   done
 }
 
-# ---------- 定时重启 / 哪吒 ----------
 write_interval_guard_script() {
   local target="${1:-}" interval="${2:-}" command_line="${3:-}"
   local script state_dir state_file now
@@ -3153,18 +3369,19 @@ remove_cron_reboot() {
 manage_cron_reboot() {
   while true; do
     ui_title "定时重启管理"
-    ui_option 1 "设置/更新定时重启"
-    ui_option 2 "查看当前任务"
+    ui_menu_note "先查看当前任务；设置和移除都只操作 server-toolkit 自己的 marker，不覆盖其他 crontab。"
+    ui_option 1 "查看当前定时重启任务"
+    ui_option 2 "设置 / 更新定时重启"
     ui_option 3 "移除定时重启任务"
     ui_back
     local opt
     ui_prompt opt
     case "$opt" in
-      1) setup_cron_reboot; pause_return ;;
-      2) show_cron_reboot_status; pause_return ;;
-      3) remove_cron_reboot; pause_return ;;
+      1) show_cron_reboot_status; ui_action_pause ;;
+      2) setup_cron_reboot; ui_action_pause ;;
+      3) remove_cron_reboot; ui_action_pause ;;
       0) return 0 ;;
-      *) echo_error "无效选项"; pause_return ;;
+      *) echo_error "无效选项"; ui_action_pause ;;
     esac
   done
 }
@@ -3194,54 +3411,76 @@ remove_nezha_agent_restart_cron() {
   echo_color "已移除 nezha-agent 定期重启任务及守护文件。"
 }
 
+nezha_status() {
+  ui_title "哪吒状态"
+  if is_systemd_available; then
+    ui_kv info "nezha-agent" "$(systemctl is-active nezha-agent 2>/dev/null || echo not-found/inactive)"
+    ui_kv info "nezha-dashboard" "$(systemctl is-active nezha-dashboard 2>/dev/null || echo not-found/inactive)"
+  else
+    echo_warn "当前环境不是标准 systemd；仅检查进程。"
+    pgrep -af 'nezha-agent|nezha-dashboard' 2>/dev/null || echo_info "未发现哪吒进程。"
+  fi
+  echo_info "Agent 定期重启任务："
+  if command -v crontab >/dev/null 2>&1; then
+    crontab -l 2>/dev/null | grep -F '# server-toolkit: nezha-agent-restart' || echo_dim "未配置 server-toolkit Agent 定期重启。"
+  else
+    echo_dim "crontab 不可用。"
+  fi
+}
+
+restart_nezha_both() {
+  local failed=0
+  if service_restart_safe nezha-agent; then echo_color "nezha-agent 已重启。"; else echo_warn "nezha-agent 重启失败或服务不存在。"; failed=1; fi
+  if service_restart_safe nezha-dashboard; then echo_color "nezha-dashboard 已重启。"; else echo_warn "nezha-dashboard 重启失败或服务不存在。"; failed=1; fi
+  return "$failed"
+}
+
 manage_nezha() {
   while true; do
     ui_title "哪吒面板管理"
-    ui_option 1 "重启哪吒 Agent"
-    ui_option 2 "重启哪吒 Dashboard"
-    ui_option 3 "重启 Agent + Dashboard"
-    ui_option 4 "设置定期重启 Agent"
-    ui_option 5 "移除 Agent 定期重启任务"
-    ui_option 6 "卸载哪吒面板/探针"
+    ui_menu_section "状态 / 重启" nezha
+    ui_option 1 "查看 Agent / Dashboard / 定时任务状态"
+    ui_option 2 "重启哪吒 Agent"
+    ui_option 3 "重启哪吒 Dashboard"
+    ui_option 4 "同时重启 Agent + Dashboard"
+    ui_menu_section "定时任务 / 卸载" reboot
+    ui_option 5 "设置定期重启 Agent"
+    ui_option 6 "移除 Agent 定期重启任务"
+    ui_option 7 "卸载哪吒面板 / 探针（高风险）"
     ui_back
     local opt
     ui_prompt opt
     case "$opt" in
-      1) service_restart_safe nezha-agent || echo_warn "nezha-agent 重启失败或不存在。"; pause_return ;;
-      2) service_restart_safe nezha-dashboard || echo_warn "nezha-dashboard 重启失败或不存在。"; pause_return ;;
-      3) service_restart_safe nezha-agent || true; service_restart_safe nezha-dashboard || true; pause_return ;;
-      4) setup_nezha_agent_restart_cron; pause_return ;;
-      5) remove_nezha_agent_restart_cron; pause_return ;;
-      6)
+      1) nezha_status; ui_action_pause ;;
+      2) service_restart_safe nezha-agent && echo_color "nezha-agent 已重启。" || echo_warn "nezha-agent 重启失败或不存在。"; ui_action_pause ;;
+      3) service_restart_safe nezha-dashboard && echo_color "nezha-dashboard 已重启。" || echo_warn "nezha-dashboard 重启失败或不存在。"; ui_action_pause ;;
+      4) restart_nezha_both || true; ui_action_pause ;;
+      5) setup_nezha_agent_restart_cron; ui_action_pause ;;
+      6) remove_nezha_agent_restart_cron; ui_action_pause ;;
+      7)
         echo_warn "此操作会删除 /opt/nezha /etc/nezha /var/log/nezha。"
-        confirm_action "第一重确认：卸载哪吒面板/探针？" "2" || { echo_warn "已取消。"; pause_return; continue; }
-        confirm_action "第二重确认：继续将删除哪吒目录及服务文件。" "2" || { echo_warn "已取消。"; pause_return; continue; }
+        confirm_action "第一重确认：卸载哪吒面板/探针？" "2" || { echo_warn "已取消。"; ui_action_pause; continue; }
+        confirm_action "第二重确认：继续将删除哪吒目录及服务文件。" "2" || { echo_warn "已取消。"; ui_action_pause; continue; }
         if is_systemd_available; then
           systemctl stop nezha-agent 2>/dev/null || true; systemctl stop nezha-dashboard 2>/dev/null || true
           systemctl disable nezha-agent 2>/dev/null || true; systemctl disable nezha-dashboard 2>/dev/null || true
         else
           service nezha-agent stop 2>/dev/null || true; service nezha-dashboard stop 2>/dev/null || true
         fi
-        rm -f /etc/systemd/system/nezha-agent.service /etc/systemd/system/nezha-dashboard.service
-        rm -rf /opt/nezha /etc/nezha /var/log/nezha
-        systemctl daemon-reload 2>/dev/null || true
-        echo_color "哪吒面板/探针已尝试移除。"; pause_return ;;
+        rm -f /etc/systemd/system/nezha-agent.service /etc/systemd/system/nezha-dashboard.service || echo_warn "部分 systemd service 文件删除失败。"
+        if rm -rf /opt/nezha /etc/nezha /var/log/nezha; then
+          echo_color "哪吒面板/探针目录已移除。"
+        else
+          echo_error "部分哪吒目录删除失败，请手动检查。"
+        fi
+        is_systemd_available && systemctl daemon-reload 2>/dev/null || true
+        ui_action_pause
+        ;;
       0) return 0 ;;
-      *) echo_error "无效选项"; pause_return ;;
+      *) echo_error "无效选项"; ui_action_pause ;;
     esac
   done
 }
-
-# ---------- 主菜单 ----------
-# ---------- 系统重装（leitbogioro/Tools 包装器） ----------
-REINSTALL_UPSTREAM_URL="https://raw.githubusercontent.com/leitbogioro/Tools/master/Linux_reinstall/InstallNET.sh"
-REINSTALL_UPSTREAM_URL_CN="https://gitee.com/mb9e8j2/Tools/raw/master/Linux_reinstall/InstallNET.sh"
-REINSTALL_DISTRO_FLAG=""
-REINSTALL_VERSION=""
-REINSTALL_ARGS=()
-REINSTALL_PASSWORD_SET=0
-REINSTALL_PLAN_READY=0
-REINSTALL_TARGET_KIND=""
 
 validate_simple_version() { [[ "${1:-}" =~ ^[A-Za-z0-9._-]+$ ]]; }
 validate_hostname_value() { [[ "${1:-}" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ ]]; }
@@ -3418,44 +3657,46 @@ manage_system_reinstall() {
   local workdir script opt rc
   REINSTALL_ARGS=(); REINSTALL_PLAN_READY=0
   while true; do
-    ui_title "系统重装 · leitbogioro/Tools InstallNET.sh"
-    echo_warn "这是不可逆高风险功能。server-toolkit 只负责安全收集参数和执行上游脚本，不保证所有云平台都能重装成功。"
-    ui_option 1 "配置/重新配置重装参数"
+    ui_title "系统重装 · leitbogioro/Tools"
+    echo_warn "不可逆高风险功能。建议先配置参数 → 查看计划/预检 → 查看上游脚本 → 最后执行。"
+    ui_option 1 "配置 / 重新配置重装参数"
     ui_option 2 "查看当前重装计划（密码脱敏）"
-    ui_option 3 "下载并查看上游脚本前 120 行"
-    ui_option 4 "执行当前重装计划"
+    ui_option 3 "执行环境预检（不重装）"
+    ui_option 4 "下载并查看上游 InstallNET.sh 前 120 行"
+    ui_option 5 "执行当前重装计划（高风险）"
     ui_back
     ui_prompt opt
     case "$opt" in
-      1) reinstall_collect_plan && { echo_color "参数已收集。"; reinstall_display_plan; }; pause_return ;;
-      2) reinstall_display_plan || true; pause_return ;;
-      3)
-        workdir="$(mktemp -d /tmp/server-toolkit-reinstall.XXXXXX)" || { pause_return; continue; }
+      1) reinstall_collect_plan && { echo_color "参数已收集。"; reinstall_display_plan; }; ui_action_pause ;;
+      2) reinstall_display_plan || true; ui_action_pause ;;
+      3) reinstall_preflight; ui_action_pause ;;
+      4)
+        workdir="$(mktemp -d /tmp/server-toolkit-reinstall.XXXXXX)" || { echo_error "创建临时目录失败。"; ui_action_pause; continue; }
         script="$workdir/InstallNET.sh"
         if reinstall_download_script "$script"; then sed -n '1,120p' "$script"; echo_info "临时路径：$script"; else rm -rf "$workdir"; fi
-        pause_return
+        ui_action_pause
         ;;
-      4)
-        [ "${REINSTALL_PLAN_READY:-0}" -eq 1 ] || { echo_error "请先配置参数。"; pause_return; continue; }
-        reinstall_preflight || { pause_return; continue; }
+      5)
+        [ "${REINSTALL_PLAN_READY:-0}" -eq 1 ] || { echo_error "请先使用选项 1 配置重装参数。"; ui_action_pause; continue; }
+        reinstall_preflight || { ui_action_pause; continue; }
         reinstall_display_plan
-        confirm_action "第一重确认：继续会准备覆盖当前系统盘。" "2" || { echo_warn "已取消。"; pause_return; continue; }
+        confirm_action "第一重确认：继续会准备覆盖当前系统盘。" "2" || { echo_warn "已取消。"; ui_action_pause; continue; }
         echo_warn "第二重确认：请再次确认备份、救援入口、安全组和新密码均已准备。"
-        confirm_action "确认执行上游 InstallNET.sh？" "2" || { echo_warn "已取消。"; pause_return; continue; }
-        mkdir -p /root/server-toolkit-reinstall
-        chmod 700 /root/server-toolkit-reinstall
-        workdir="$(mktemp -d "/root/server-toolkit-reinstall/$(date +%F_%H-%M-%S).XXXXXX")" || { echo_error "创建重装工作目录失败。"; pause_return; continue; }
-        chmod 700 "$workdir"
+        confirm_action "确认执行上游 InstallNET.sh？" "2" || { echo_warn "已取消。"; ui_action_pause; continue; }
+        mkdir -p /root/server-toolkit-reinstall || { echo_error "无法创建重装工作目录。"; ui_action_pause; continue; }
+        chmod 700 /root/server-toolkit-reinstall || { echo_error "无法保护重装工作目录权限。"; ui_action_pause; continue; }
+        workdir="$(mktemp -d "/root/server-toolkit-reinstall/$(date +%F_%H-%M-%S).XXXXXX")" || { echo_error "创建重装工作目录失败。"; ui_action_pause; continue; }
+        chmod 700 "$workdir" || { echo_error "无法设置工作目录权限。"; ui_action_pause; continue; }
         script="$workdir/InstallNET.sh"
-        reinstall_download_script "$script" || { pause_return; continue; }
+        reinstall_download_script "$script" || { ui_action_pause; continue; }
         echo_info "上游脚本已保存：$script"
         (cd "$workdir" && bash "$script" "${REINSTALL_ARGS[@]}")
         rc=$?
         if [ "$rc" -eq 0 ]; then echo_color "InstallNET.sh 已执行完成。请仔细阅读上游输出，不要关闭云控制台；系统可能需要按上游提示重启。"; else echo_error "InstallNET.sh 执行失败，退出码：$rc。现场保留在：$workdir"; fi
-        pause_return
+        ui_action_pause
         ;;
       0) REINSTALL_ARGS=(); REINSTALL_PLAN_READY=0; return 0 ;;
-      *) echo_error "无效选项"; pause_return ;;
+      *) echo_error "无效选项"; ui_action_pause ;;
     esac
   done
 }
@@ -3471,16 +3712,30 @@ print_menu() {
   ui_hr
   menu_symbol="$(ui_symbol menu)"
   if [ -n "$menu_symbol" ]; then printf '%s  %s  功能菜单%s\n' "$UI_CYAN" "$menu_symbol" "$UI_RESET"; else printf '%s  功能菜单%s\n' "$UI_CYAN" "$UI_RESET"; fi
-  printf '%s' "$UI_DIM"; ui_repeat "$UI_HR_CHAR" "$(ui_terminal_columns)"; printf '%s\n' "$UI_RESET"
-  ui_main_row "$(ui_menu_label time 1 '时间同步')"               "$(ui_menu_label benchmark 9 'YABS 测试')"
-  ui_main_row "$(ui_menu_label firewall 2 '防火墙管理')"        "$(ui_menu_label reboot 10 '定时重启管理')"
-  ui_main_row "$(ui_menu_label selinux 3 'SELinux 管理')"       "$(ui_menu_label nezha 11 '哪吒面板管理')"
-  ui_main_row "$(ui_menu_label ssh 4 'SSH 安全增强')"           "$(ui_menu_label world 12 'IP 质量检测')"
-  ui_main_row "$(ui_menu_label ban 5 'Fail2Ban 管理')"          "$(ui_menu_label ipv6 13 'IPv6 开启/关闭')"
-  ui_main_row "$(ui_menu_label key 6 'SSH 端口/密码/密钥/root')" "$(ui_menu_label harden 14 '服务器加固')"
-  ui_main_row "$(ui_menu_label media 7 '流媒体解锁检测')"       "$(ui_menu_label package 15 '初始化/软件源修复')"
-  ui_main_row "$(ui_menu_label info 8 '显示服务器信息')"        "$(ui_menu_label reinstall 16 '系统重装（高风险）')"
-  ui_main_row ""                                                 "$(ui_menu_label exit 0 '退出')"
+
+  ui_menu_section "系统基础与访问安全" ssh
+  printf '  %s\n' "$(ui_menu_label time 1 '时间同步管理')"
+  printf '  %s\n' "$(ui_menu_label firewall 2 '防火墙管理')"
+  printf '  %s\n' "$(ui_menu_label selinux 3 'SELinux 管理')"
+  printf '  %s\n' "$(ui_menu_label ssh 4 'SSH 安全策略')"
+  printf '  %s\n' "$(ui_menu_label ban 5 'Fail2Ban 管理')"
+  printf '  %s\n' "$(ui_menu_label key 6 'SSH 连接 / 登录 / 账号管理')"
+
+  ui_menu_section "检测与日常维护" info
+  printf '  %s\n' "$(ui_menu_label media 7 '流媒体解锁检测')"
+  printf '  %s\n' "$(ui_menu_label info 8 '服务器信息')"
+  printf '  %s\n' "$(ui_menu_label benchmark 9 'YABS 性能测试')"
+  printf '  %s\n' "$(ui_menu_label reboot 10 '定时重启管理')"
+  printf '  %s\n' "$(ui_menu_label nezha 11 '哪吒面板管理')"
+  printf '  %s\n' "$(ui_menu_label world 12 'IP 质量检测')"
+
+  ui_menu_section "系统配置与恢复" harden
+  printf '  %s\n' "$(ui_menu_label ipv6 13 'IPv6 管理')"
+  printf '  %s\n' "$(ui_menu_label harden 14 '服务器加固')"
+  printf '  %s\n' "$(ui_menu_label package 15 '初始化 / 软件源 / 系统更新')"
+  printf '  %s\n' "$(ui_menu_label reinstall 16 '系统重装（高风险）')"
+
+  printf '\n  %s\n' "$(ui_menu_label exit 0 '退出')"
   printf '%s' "$UI_DIM"; ui_repeat "$UI_HR_CHAR" "$(ui_terminal_columns)"; printf '%s\n' "$UI_RESET"
 }
 
@@ -3490,9 +3745,9 @@ main() {
   while true; do
     print_menu
     local option
-    ui_prompt option "请选择一个操作"
+    ui_prompt option "请选择功能编号"
     case "$option" in
-      1) time_sync; pause_return ;;
+      1) time_sync ;;
       2) manage_firewall ;;
       3) manage_selinux ;;
       4) secure_ssh ;;
@@ -3504,12 +3759,12 @@ main() {
       10) manage_cron_reboot ;;
       11) manage_nezha ;;
       12) check_ip_quality; pause_return ;;
-      13) manage_ipv6; pause_return ;;
+      13) manage_ipv6 ;;
       14) server_hardening ;;
       15) new_server_init_menu ;;
       16) manage_system_reinstall ;;
-      0) echo_color "已退出 server-toolkit。"; exit 0 ;;
-      *) echo_error "无效的选项，请重新输入"; pause_return ;;
+      0) echo_color "已退出 server-toolkit。"; return 0 ;;
+      *) echo_error "无效选项：${option:-空}。请输入 0-16。"; pause_return ;;
     esac
   done
 }

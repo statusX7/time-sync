@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# cfdns v2.6 installer
+# cfdns v2.7 installer
 # Cloudflare DNS multi-group A-record incremental sync tool
 
 APP_NAME="cf-dns-sync"
-APP_VERSION="2.6"
+APP_VERSION="2.7"
 INSTALL_DIR="/opt/cfdns"
 INSTALL_COPY="${INSTALL_DIR}/cfdns-installer.sh"
 BASE_DIR="/etc/${APP_NAME}"
@@ -32,7 +32,6 @@ STATE_FILE="${VAR_DIR}/state.tsv"
 RUNSTATE_FILE="${VAR_DIR}/runstate.tsv"
 FAILOVER_STATE_FILE="${VAR_DIR}/failover-state.tsv"
 GLOBALPING_USAGE_FILE="${VAR_DIR}/globalping-usage.tsv"
-INIT_FLAG="${VAR_DIR}/.initialized"
 
 mkdir -p "${BASE_DIR}" "${VAR_DIR}"
 
@@ -226,7 +225,7 @@ write_sync_script() {
 #!/usr/bin/env bash
 set -uo pipefail
 
-APP_VERSION="2.6"
+APP_VERSION="2.7"
 BASE_DIR="/etc/cf-dns-sync"
 VAR_DIR="/var/lib/cf-dns-sync"
 SETTINGS_FILE="${BASE_DIR}/settings.conf"
@@ -265,7 +264,7 @@ GLOBALPING_POLL_MAX_SEC="${GLOBALPING_POLL_MAX_SEC:-25}"
 [[ "${FORCE_RECONCILE_SEC}" =~ ^[0-9]+$ ]] && (( FORCE_RECONCILE_SEC >= 60 )) || FORCE_RECONCILE_SEC=3600
 [[ "${DNS_QUERY_TIMEOUT_SEC}" =~ ^[0-9]+$ ]] && (( DNS_QUERY_TIMEOUT_SEC >= 1 )) || DNS_QUERY_TIMEOUT_SEC=2
 [[ "${GLOBALPING_MAX_TESTS_PER_HOUR}" =~ ^[0-9]+$ ]] && (( GLOBALPING_MAX_TESTS_PER_HOUR >= 1 )) || GLOBALPING_MAX_TESTS_PER_HOUR=240
-[[ "${GLOBALPING_MEASUREMENT_TIMEOUT_SEC}" =~ ^[0-9]+$ ]] && (( GLOBALPING_MEASUREMENT_TIMEOUT_SEC >= 3 && GLOBALPING_MEASUREMENT_TIMEOUT_SEC <= 30 )) || GLOBALPING_MEASUREMENT_TIMEOUT_SEC=12
+[[ "${GLOBALPING_MEASUREMENT_TIMEOUT_SEC}" =~ ^[0-9]+$ ]] && (( GLOBALPING_MEASUREMENT_TIMEOUT_SEC >= 5 && GLOBALPING_MEASUREMENT_TIMEOUT_SEC <= 30 )) || GLOBALPING_MEASUREMENT_TIMEOUT_SEC=12
 [[ "${GLOBALPING_POLL_MAX_SEC}" =~ ^[0-9]+$ ]] && (( GLOBALPING_POLL_MAX_SEC >= GLOBALPING_MEASUREMENT_TIMEOUT_SEC && GLOBALPING_POLL_MAX_SEC <= 60 )) || GLOBALPING_POLL_MAX_SEC=25
 
 COMMAND="${1:-AUTO}"
@@ -477,9 +476,17 @@ globalping_prune_usage() {
   local now cutoff tmp
   now="$(now_ts)"; cutoff=$((now-3600))
   tmp="$(mktemp "${VAR_DIR}/.globalping-usage.XXXXXX")" || return 1
-  awk -v c="${cutoff}" '$1 ~ /^[0-9]+$/ && $1 >= c {print $1}' "${GLOBALPING_USAGE_FILE}" 2>/dev/null > "${tmp}" || true
-  mv "${tmp}" "${GLOBALPING_USAGE_FILE}"
-  chmod 600 "${GLOBALPING_USAGE_FILE}" 2>/dev/null || true
+  if ! awk -v c="${cutoff}" '
+    NF == 0 {next}
+    NF != 1 || $1 !~ /^[0-9]+$/ {bad=1; next}
+    $1 >= c {print $1}
+    END {exit bad ? 1 : 0}
+  ' "${GLOBALPING_USAGE_FILE}" 2>/dev/null > "${tmp}"; then
+    rm -f "${tmp}"
+    return 1
+  fi
+  mv "${tmp}" "${GLOBALPING_USAGE_FILE}" || { rm -f "${tmp}"; return 1; }
+  chmod 600 "${GLOBALPING_USAGE_FILE}" 2>/dev/null || return 1
 }
 
 globalping_usage_count() {
@@ -489,19 +496,24 @@ globalping_usage_count() {
 
 globalping_budget_available() {
   local count
-  count="$(globalping_usage_count)" || return 1
+  count="$(globalping_usage_count)" || return 2
   (( count < GLOBALPING_MAX_TESTS_PER_HOUR ))
 }
 
 globalping_record_usage() {
-  printf '%s\n' "$(now_ts)" >> "${GLOBALPING_USAGE_FILE}"
-  chmod 600 "${GLOBALPING_USAGE_FILE}" 2>/dev/null || true
+  local tests="${1:-1}" ts i
+  [[ "${tests}" =~ ^[0-9]+$ ]] && (( tests >= 1 )) || tests=1
+  ts="$(now_ts)"
+  for ((i=0; i<tests; i++)); do
+    printf '%s\n' "${ts}"
+  done >> "${GLOBALPING_USAGE_FILE}" || return 1
+  chmod 600 "${GLOBALPING_USAGE_FILE}" 2>/dev/null || return 1
 }
 
 globalping_health_check() {
   local group="$1" role="$2" target="$3" check_type="$4" port="$5" location="$6"
   local payload create_resp measurement_id probes_count start now resp status result_status failure_source
-  local rcv loss probe_country probe_city resolved raw detail
+  local rcv loss probe_country probe_city resolved raw budget_rc usage_tests
 
   GP_CHECK_CLASS="UNKNOWN"
   GP_CHECK_DETAIL=""
@@ -509,29 +521,44 @@ globalping_health_check() {
   GP_PROBE=""
   GP_RESOLVED_ADDRESS=""
 
-  if ! globalping_budget_available; then
-    GP_CHECK_DETAIL="本机一小时安全预算已用尽（${GLOBALPING_MAX_TESTS_PER_HOUR} tests/h）"
-    log INFO "组 ${group}: Globalping ${role} 检测跳过：${GP_CHECK_DETAIL}"
-    return 0
-  fi
+  globalping_budget_available
+  budget_rc=$?
+  case "${budget_rc}" in
+    0) ;;
+    1)
+      GP_CHECK_DETAIL="本机一小时安全预算已用尽（${GLOBALPING_MAX_TESTS_PER_HOUR} tests/h）"
+      log INFO "组 ${group}: Globalping ${role} 检测跳过：${GP_CHECK_DETAIL}"
+      return 0
+      ;;
+    *)
+      GP_CHECK_DETAIL="本机Globalping用量文件无法读取或更新；为防止超额，本次不创建测量"
+      log ERROR "组 ${group}: Globalping ${role} 检测跳过：${GP_CHECK_DETAIL}"
+      return 0
+      ;;
+  esac
 
   if [[ "${check_type}" == "PING_TCP" ]]; then
     payload="$(jq -nc --arg target "${target}" --arg location "${location}" \
       --argjson timeout "${GLOBALPING_MEASUREMENT_TIMEOUT_SEC}" --argjson port "${port}" \
-      '{type:"ping",target:$target,limit:1,locations:[{magic:$location,limit:1}],timeout:$timeout,measurementOptions:{protocol:"TCP",port:$port,packets:3,ipVersion:4}}')"
+      '{type:"ping",target:$target,locations:[{magic:$location,limit:1}],timeout:$timeout,measurementOptions:{protocol:"TCP",port:$port,packets:3,ipVersion:4}}')"
   else
     payload="$(jq -nc --arg target "${target}" --arg location "${location}" \
       --argjson timeout "${GLOBALPING_MEASUREMENT_TIMEOUT_SEC}" \
-      '{type:"ping",target:$target,limit:1,locations:[{magic:$location,limit:1}],timeout:$timeout,measurementOptions:{protocol:"ICMP",packets:3,ipVersion:4}}')"
+      '{type:"ping",target:$target,locations:[{magic:$location,limit:1}],timeout:$timeout,measurementOptions:{protocol:"ICMP",packets:3,ipVersion:4}}')"
   fi
 
   create_resp="$(gp_api POST /measurements "${payload}")"
   measurement_id="$(jq -r '.id // empty' <<< "${create_resp}" 2>/dev/null || true)"
   probes_count="$(jq -r '.probesCount // 0' <<< "${create_resp}" 2>/dev/null || echo 0)"
-  # 只要 API 已接受并返回 measurement ID，就按一次测试计入本机滑动小时预算。
-  # 即使暂时没有可用探针，也避免本机计数低估真实 API 消耗。
+  # API 接受后按 probesCount 记录实际 tests；字段异常时至少记 1 次，避免低估 API 消耗。
   if [[ -n "${measurement_id}" ]]; then
-    globalping_record_usage
+    usage_tests=1
+    [[ "${probes_count}" =~ ^[0-9]+$ ]] && (( probes_count >= 1 )) && usage_tests="${probes_count}"
+    if ! globalping_record_usage "${usage_tests}"; then
+      GP_CHECK_DETAIL="测量已创建（ID=${measurement_id}），但本机用量记录失败；为防止预算失控，本次结果按未知处理"
+      log ERROR "组 ${group}: Globalping ${role} 检测未知：${GP_CHECK_DETAIL}"
+      return 0
+    fi
   fi
   if [[ -z "${measurement_id}" || ! "${probes_count}" =~ ^[0-9]+$ || "${probes_count}" -lt 1 ]]; then
     GP_CHECK_DETAIL="创建测量失败或没有可用探针，HTTP=$(jq -r '._http_status // 0' <<< "${create_resp}" 2>/dev/null || echo 0)，错误=$(jq -c '.error // .errors // {}' <<< "${create_resp}" 2>/dev/null || echo unknown)"
@@ -637,6 +664,7 @@ csv_contains_value() {
 
 validate_failover_config() {
   local group="$1" primary_sources="$2" domain
+  [[ "${FO_GROUP}" == "${group}" ]] || { log ERROR "组 ${group}: failover.tsv 组名字段不一致"; return 1; }
   [[ -z "${FO_EXTRA:-}" ]] || { log ERROR "组 ${group}: failover.tsv 字段数量超过13"; return 1; }
   [[ "${FO_ENABLED}" == "true" || "${FO_ENABLED}" == "false" ]] || { log ERROR "组 ${group}: 故障转移 enabled 必须是true/false"; return 1; }
   csv_to_sources_array "${FO_BACKUP_SOURCES}"
@@ -680,6 +708,7 @@ load_failover_state() {
   line="$(get_failover_state_line "${group}")"
   if [[ -n "${line}" ]]; then
     IFS=$'\t' read -r FS_GROUP FS_ACTIVE_ROLE FS_PHASE FS_PRIMARY_FAILS FS_BACKUP_SUCCESSES FS_PRIMARY_SUCCESSES FS_LAST_PRIMARY_CHECK FS_LAST_BACKUP_CHECK FS_LAST_RESULT FS_LAST_MEASUREMENT_ID FS_LAST_SWITCH FS_UPDATED FS_EXTRA <<< "${line}"
+    [[ -z "${FS_EXTRA:-}" ]] || { log ERROR "组 ${group}: failover-state.tsv 字段数量超过12"; return 1; }
   else
     inferred="$(infer_initial_failover_role "${group}" "${primary_csv}" "${backup_csv}")"
     FS_GROUP="${group}"
@@ -770,7 +799,6 @@ failover_switch_role() {
   mark_group_sync_due "${group}"
   write_failover_history "${group}" SWITCH "${old_role}" "${new_role}" "${reason}" "${measurement_id}"
   log INFO "组 ${group}: 故障转移 ${old_role} -> ${new_role}，原因：${reason}"
-  FAILOVER_SWITCHED=1
 }
 
 failover_due() {
@@ -790,12 +818,11 @@ failover_record_check() {
 
 failover_tick() {
   local group="$1" group_enabled="$2" primary_sources="$3" state_repaired=0
-  FAILOVER_SWITCHED=0
   [[ "${group_enabled}" == true ]] || return 0
   load_failover_config "${group}" || return 0
   validate_failover_config "${group}" "${primary_sources}" || return 1
   [[ "${FO_ENABLED}" == true ]] || return 0
-  load_failover_state "${group}" "${primary_sources}" "${FO_BACKUP_SOURCES}"
+  load_failover_state "${group}" "${primary_sources}" "${FO_BACKUP_SOURCES}" || return 1
 
   if [[ "${FS_ACTIVE_ROLE}" == PRIMARY && "${FS_PHASE}" == BACKUP_* ]]; then FS_PHASE=PRIMARY_STABLE; state_repaired=1; fi
   if [[ "${FS_ACTIVE_ROLE}" == BACKUP && "${FS_PHASE}" == PRIMARY_* ]]; then FS_PHASE=BACKUP_FAST; state_repaired=1; fi
@@ -903,7 +930,7 @@ get_effective_group_sources() {
   load_failover_config "${group}" || return 0
   [[ "${FO_ENABLED}" == "true" ]] || return 0
   validate_failover_config "${group}" "${primary_sources}" || return 1
-  load_failover_state "${group}" "${primary_sources}" "${FO_BACKUP_SOURCES}"
+  load_failover_state "${group}" "${primary_sources}" "${FO_BACKUP_SOURCES}" || return 1
   if [[ "${FS_ACTIVE_ROLE}" == "BACKUP" ]]; then
     EFFECTIVE_ROUTE="BACKUP"
     EFFECTIVE_SOURCES_CSV="${FO_BACKUP_SOURCES}"
@@ -943,7 +970,7 @@ manual_failover_switch() {
   load_failover_config "${group}" || { log ERROR "组 ${group} 尚未配置故障转移"; return 1; }
   [[ "${FO_ENABLED}" == "true" ]] || { log ERROR "组 ${group} 故障转移已禁用"; return 1; }
   validate_failover_config "${group}" "${_primary_sources}" || return 1
-  load_failover_state "${group}" "${_primary_sources}" "${FO_BACKUP_SOURCES}"
+  load_failover_state "${group}" "${_primary_sources}" "${FO_BACKUP_SOURCES}" || return 1
   [[ "${role}" == "PRIMARY" || "${role}" == "BACKUP" ]] || { log ERROR "切换角色必须是 PRIMARY/BACKUP"; return 1; }
   if [[ "${FS_ACTIVE_ROLE}" == "${role}" ]]; then
     log INFO "组 ${group}: 当前已经是 ${role}"
@@ -960,7 +987,7 @@ manual_failover_reset() {
   IFS=$'\t' read -r _group _enabled _interval _token _zone _target _ttl _proxied _mode _primary_sources _extra <<< "${row}"
   load_failover_config "${group}" || { log ERROR "组 ${group} 尚未配置故障转移"; return 1; }
   validate_failover_config "${group}" "${_primary_sources}" || return 1
-  load_failover_state "${group}" "${_primary_sources}" "${FO_BACKUP_SOURCES}"
+  load_failover_state "${group}" "${_primary_sources}" "${FO_BACKUP_SOURCES}" || return 1
   local old="${FS_ACTIVE_ROLE}"
   FS_ACTIVE_ROLE="PRIMARY"; FS_PHASE="PRIMARY_STABLE"
   FS_PRIMARY_FAILS=0; FS_BACKUP_SUCCESSES=0; FS_PRIMARY_SUCCESSES=0
@@ -1438,7 +1465,7 @@ write_ctl_script() {
 set -uo pipefail
 
 APP_NAME="cf-dns-sync"
-APP_VERSION="2.6"
+APP_VERSION="2.7"
 BASE_DIR="/etc/${APP_NAME}"
 VAR_DIR="/var/lib/${APP_NAME}"
 SETTINGS_FILE="${BASE_DIR}/settings.conf"
@@ -1548,6 +1575,9 @@ GLOBALPING_API_TOKEN="${GLOBALPING_API_TOKEN:-}"
 GLOBALPING_MAX_TESTS_PER_HOUR="${GLOBALPING_MAX_TESTS_PER_HOUR:-240}"
 GLOBALPING_MEASUREMENT_TIMEOUT_SEC="${GLOBALPING_MEASUREMENT_TIMEOUT_SEC:-12}"
 GLOBALPING_POLL_MAX_SEC="${GLOBALPING_POLL_MAX_SEC:-25}"
+[[ "${GLOBALPING_MAX_TESTS_PER_HOUR}" =~ ^[0-9]+$ ]] && (( GLOBALPING_MAX_TESTS_PER_HOUR >= 1 )) || GLOBALPING_MAX_TESTS_PER_HOUR=240
+[[ "${GLOBALPING_MEASUREMENT_TIMEOUT_SEC}" =~ ^[0-9]+$ ]] && (( GLOBALPING_MEASUREMENT_TIMEOUT_SEC >= 5 && GLOBALPING_MEASUREMENT_TIMEOUT_SEC <= 30 )) || GLOBALPING_MEASUREMENT_TIMEOUT_SEC=12
+[[ "${GLOBALPING_POLL_MAX_SEC}" =~ ^[0-9]+$ ]] && (( GLOBALPING_POLL_MAX_SEC >= GLOBALPING_MEASUREMENT_TIMEOUT_SEC && GLOBALPING_POLL_MAX_SEC <= 60 )) || GLOBALPING_POLL_MAX_SEC=25
 
 CHOSEN_INDEX=""
 CHOSEN_LINE=""
@@ -1565,7 +1595,7 @@ line() {
 title() {
   clear 2>/dev/null || true
   line
-  color "1;36" "                          🚀 cfdns 管理菜单 v2.6"
+  color "1;36" "                          🚀 cfdns 管理菜单 v2.7"
   echo
   color "0;37" "  5秒本机检测 / Globalping中国节点故障转移 / 安全DNS联动 / 自检修复"
   line
@@ -1908,6 +1938,8 @@ load_failover_state_ui() {
     FS_LAST_PRIMARY_CHECK=0; FS_LAST_BACKUP_CHECK=0; FS_LAST_RESULT="INIT"
     FS_LAST_MEASUREMENT_ID=""; FS_LAST_SWITCH=0; FS_UPDATED=0; FS_EXTRA=""
   fi
+  [[ "${FS_UPDATED:-0}" =~ ^[0-9]+$ ]] || FS_UPDATED=0
+  [[ -z "${FS_EXTRA:-}" ]] || FS_LAST_RESULT="STATE_FIELDS_INVALID"
 }
 
 save_failover_state_ui() {
@@ -1942,6 +1974,59 @@ get_group_primary_sources() {
   cut -f10 <<< "${line}"
 }
 
+get_group_enabled_ui() {
+  local line
+  line="$(get_group_line_by_name "$1")"
+  [[ -n "${line}" ]] || return 1
+  cut -f2 <<< "${line}"
+}
+
+activate_failover_scheduler() {
+  local group="$1" base_enabled timer_state last_check last_display
+  base_enabled="$(get_group_enabled_ui "${group}" 2>/dev/null || true)"
+  if [[ "${base_enabled}" != "true" ]]; then
+    echo "⚠️  组 ${group} 的主组状态为 ${base_enabled:-不存在}；故障转移配置已保存，但主组启用前不会自动检测。"
+    return 2
+  fi
+
+  if ! systemctl daemon-reload; then
+    echo "❌ systemd daemon-reload 失败；故障转移配置已保存，但自动调度未确认启动。"
+    return 1
+  fi
+  systemctl reset-failed "${SERVICE_NAME}" "${TIMER_NAME}" 2>/dev/null || true
+  if ! systemctl enable --now "${TIMER_NAME}"; then
+    echo "❌ ${TIMER_NAME} 启用失败；请查看菜单22状态或运行菜单25一键修复。"
+    return 1
+  fi
+  timer_state="$(systemctl is-active "${TIMER_NAME}" 2>/dev/null || true)"
+  if [[ "${timer_state}" != "active" ]]; then
+    echo "❌ ${TIMER_NAME} 当前状态为 ${timer_state:-unknown}，自动检测尚未启动。"
+    return 1
+  fi
+
+  # 配置已将上次检查时间归零；立即运行一次 AUTO，避免用户等待下一个 timer 周期且无法判断是否启动。
+  if ! systemctl start "${SERVICE_NAME}"; then
+    echo "❌ ${SERVICE_NAME} 首次自动检测启动失败；请查看菜单19日志和菜单24自检。"
+    return 1
+  fi
+
+  load_failover_state_ui "${group}"
+  last_check="${FS_LAST_PRIMARY_CHECK:-0}"
+  [[ "${last_check}" =~ ^[0-9]+$ ]] || last_check=0
+  if [[ "${FS_LAST_BACKUP_CHECK:-0}" =~ ^[0-9]+$ ]] && (( FS_LAST_BACKUP_CHECK > last_check )); then
+    last_check="${FS_LAST_BACKUP_CHECK}"
+  fi
+  if [[ "${last_check}" =~ ^[0-9]+$ ]] && (( last_check > 0 )); then
+    last_display="$(date -d "@${last_check}" '+%F %T' 2>/dev/null || printf '%s' "${last_check}")"
+    echo "✅ Globalping 自动检测已执行：组=${group}，时间=${last_display}，结果=${FS_LAST_RESULT:-unknown}"
+    [[ "${FS_LAST_RESULT:-}" != *_UNKNOWN ]] || echo "⚠️  检测已启动但结果为 UNKNOWN；请查看故障转移历史了解 API 或探针错误。"
+    return 0
+  fi
+
+  echo "⚠️  timer 已启动，但组 ${group} 尚未写入首次 Globalping 检测状态；请运行菜单24自检并查看菜单19日志。"
+  return 3
+}
+
 first_source_from_csv() {
   normalize_sources_csv "$1" | cut -d, -f1
 }
@@ -1960,6 +2045,7 @@ csv_overlap_value() {
 
 validate_failover_ui() {
   local primary_sources="$1" overlap
+  [[ -z "${FO_EXTRA:-}" ]] || { echo "failover.tsv 字段数量超过13"; return 1; }
   [[ "${FO_ENABLED}" == "true" || "${FO_ENABLED}" == "false" ]] || { echo "enabled 必须为 true/false"; return 1; }
   validate_sources_csv "${FO_BACKUP_SOURCES}" || { echo "BACKUP 源域名必须为1~20个有效域名"; return 1; }
   overlap="$(csv_overlap_value "${primary_sources}" "${FO_BACKUP_SOURCES}" || true)"
@@ -2011,15 +2097,29 @@ prompt_fast_interval() {
 }
 
 list_failover_status() {
-  printf '%-14s %-7s %-9s %-16s %-8s %-8s %-8s %-18s\n' "组名" "启用" "活动线路" "阶段" "P失败" "B成功" "P恢复" "最后结果"
-  printf '%-14s %-7s %-9s %-16s %-8s %-8s %-8s %-18s\n' "--------------" "-------" "---------" "----------------" "--------" "--------" "--------" "------------------"
-  local group enabled backup ptarget btarget type port location stable fast pf bs pr extra found=0
-  while IFS=$'\t' read -r group enabled backup ptarget btarget type port location stable fast pf bs pr extra; do
+  local timer_state
+  timer_state="$(systemctl is-active "${TIMER_NAME}" 2>/dev/null || true)"
+  echo "自动调度器 ${TIMER_NAME}: ${timer_state:-unknown}"
+  printf '%-14s %-7s %-7s %-9s %-16s %-8s %-8s %-8s %-19s %-18s\n' "组名" "主组" "故转" "活动线路" "阶段" "P失败" "B成功" "P恢复" "最后检测" "最后结果"
+  printf '%-14s %-7s %-7s %-9s %-16s %-8s %-8s %-8s %-19s %-18s\n' "--------------" "-------" "-------" "---------" "----------------" "--------" "--------" "--------" "-------------------" "------------------"
+  local group enabled _backup _ptarget _btarget _type _port _location _stable _fast _pf _bs _pr extra found=0
+  local base_enabled last_check last_display
+  while IFS=$'\t' read -r group enabled _backup _ptarget _btarget _type _port _location _stable _fast _pf _bs _pr extra; do
     [[ -z "${group}" || "${group}" =~ ^# ]] && continue
-    found=1; load_failover_state_ui "${group}"
-    printf '%-14s %-7s %-9s %-16s %-8s %-8s %-8s %-18s\n' "${group}" "${enabled}" "${FS_ACTIVE_ROLE}" "${FS_PHASE}" "${FS_PRIMARY_FAILS}" "${FS_BACKUP_SUCCESSES}" "${FS_PRIMARY_SUCCESSES}" "${FS_LAST_RESULT:0:18}"
+    found=1
+    base_enabled="$(get_group_enabled_ui "${group}" 2>/dev/null || true)"
+    [[ -n "${base_enabled}" ]] || base_enabled="missing"
+    load_failover_state_ui "${group}"
+    [[ -z "${extra:-}" ]] || FS_LAST_RESULT="CONFIG_FIELDS_INVALID"
+    last_check="${FS_LAST_PRIMARY_CHECK:-0}"
+    [[ "${last_check}" =~ ^[0-9]+$ ]] || last_check=0
+    if [[ "${FS_LAST_BACKUP_CHECK:-0}" =~ ^[0-9]+$ ]] && (( FS_LAST_BACKUP_CHECK > last_check )); then last_check="${FS_LAST_BACKUP_CHECK}"; fi
+    if (( last_check > 0 )); then last_display="$(date -d "@${last_check}" '+%F %T' 2>/dev/null || printf '%s' "${last_check}")"; else last_display="从未"; fi
+    printf '%-14s %-7s %-7s %-9s %-16s %-8s %-8s %-8s %-19s %-18s\n' \
+      "${group}" "${base_enabled}" "${enabled}" "${FS_ACTIVE_ROLE}" "${FS_PHASE}" "${FS_PRIMARY_FAILS}" "${FS_BACKUP_SUCCESSES}" "${FS_PRIMARY_SUCCESSES}" "${last_display:0:19}" "${FS_LAST_RESULT:0:18}"
   done < "${FAILOVER_FILE}"
   [[ "${found}" -eq 1 ]] || echo "当前没有配置 Globalping 故障转移的组。现有 groups.tsv 组仍按 PRIMARY 正常同步。"
+  echo "说明：只有 主组=true 且 故转=true 的组会执行自动 Globalping 检测。"
 }
 
 configure_failover_group() {
@@ -2081,8 +2181,12 @@ configure_failover_group() {
   validate_failover_ui "${primary_sources}" || return
   save_failover_line_replace "${GROUP_NAME}" "$(build_failover_line)" || { echo "保存故障转移配置失败"; return; }
   reset_failover_counters_preserve_role "${GROUP_NAME}"
-  systemctl enable --now "${TIMER_NAME}" >/dev/null 2>&1 || true
   echo "已保存组 ${GROUP_NAME} 的 Globalping 故障转移配置（enabled=${FO_ENABLED}）。现有源域名保持为 PRIMARY。"
+  if [[ "${FO_ENABLED}" == "true" ]]; then
+    activate_failover_scheduler "${GROUP_NAME}" || return $?
+  else
+    echo "当前故障转移配置保持禁用，不会消耗 Globalping 用量。"
+  fi
 }
 
 manage_backup_sources() {
@@ -2150,6 +2254,7 @@ toggle_failover_enabled() {
     else
       echo "故障转移已启用并重置为 PRIMARY，但立即同步失败（退出码=${rc}）；定时任务会继续重试。"
     fi
+    activate_failover_scheduler "${GROUP_NAME}" || return $?
   else
     if [[ "${rc}" -eq 0 ]]; then
       echo "故障转移已禁用，已回到 PRIMARY 并完成一次同步。"
@@ -2204,7 +2309,7 @@ globalping_settings_menu() {
       2) GLOBALPING_API_TOKEN="" ;;
       3) read -rp "请输入 tests/h（匿名建议不超过240）: " value; [[ "${value}" =~ ^[0-9]+$ && "${value}" -ge 1 ]] || { echo "无效数字"; pause_wait; continue; }; GLOBALPING_MAX_TESTS_PER_HOUR="${value}" ;;
       4)
-        read -rp "测量timeout秒数（3~30）: " value; [[ "${value}" =~ ^[0-9]+$ && "${value}" -ge 3 && "${value}" -le 30 ]] || { echo "无效数字"; pause_wait; continue; }; GLOBALPING_MEASUREMENT_TIMEOUT_SEC="${value}"
+        read -rp "测量timeout秒数（5~30）: " value; [[ "${value}" =~ ^[0-9]+$ && "${value}" -ge 5 && "${value}" -le 30 ]] || { echo "无效数字"; pause_wait; continue; }; GLOBALPING_MEASUREMENT_TIMEOUT_SEC="${value}"
         GLOBALPING_POLL_MAX_SEC=$((value+13)); (( GLOBALPING_POLL_MAX_SEC > 60 )) && GLOBALPING_POLL_MAX_SEC=60
         ;;
       0) return ;;
@@ -2217,11 +2322,91 @@ globalping_settings_menu() {
 show_globalping_limits() {
   local -a args=(-sS --connect-timeout 10 --max-time 30 -H 'Accept: application/json' -H "User-Agent: cfdns/${APP_VERSION}")
   [[ -n "${GLOBALPING_API_TOKEN}" ]] && args+=(-H "Authorization: Bearer ${GLOBALPING_API_TOKEN}")
-  local resp rc count
-  resp="$(curl "${args[@]}" https://api.globalping.io/v1/limits 2>&1)"; rc=$?
-  count=0; [[ -f "${GLOBALPING_USAGE_FILE}" ]] && count="$(awk -v c="$(( $(date +%s)-3600 ))" '$1>=c{n++} END{print n+0}' "${GLOBALPING_USAGE_FILE}" 2>/dev/null)"
-  echo "本机过去1小时已记录Globalping测试：${count}/${GLOBALPING_MAX_TESTS_PER_HOUR}"
-  if [[ "${rc}" -eq 0 ]] && jq -e . >/dev/null 2>&1 <<< "${resp}"; then jq . <<< "${resp}"; else echo "Globalping limits API读取失败：${resp}"; fi
+  local now cutoff count invalid local_remaining timer_state
+  local configured=0 failover_enabled=0 runnable=0 parent_disabled=0
+  local group fo_enabled base_enabled latest_check=0 group_last latest_group="" latest_result=""
+  local _backup _ptarget _btarget _type _port _location _stable _fast _pf _bs _pr _extra
+  local body resp rc http_code remote_limit remote_remaining remote_reset remote_type remote_used error_detail
+
+  now="$(date +%s)"; cutoff=$((now-3600))
+  count=0; invalid=0
+  if [[ -f "${GLOBALPING_USAGE_FILE}" ]]; then
+    read -r count invalid < <(awk -v c="${cutoff}" '
+      NF == 1 && $1 ~ /^[0-9]+$/ {if ($1 >= c) n++; next}
+      NF {bad++}
+      END {print n+0, bad+0}
+    ' "${GLOBALPING_USAGE_FILE}" 2>/dev/null)
+  fi
+  [[ "${count}" =~ ^[0-9]+$ ]] || count=0
+  [[ "${invalid}" =~ ^[0-9]+$ ]] || invalid=0
+  local_remaining=$((GLOBALPING_MAX_TESTS_PER_HOUR-count)); (( local_remaining >= 0 )) || local_remaining=0
+
+  timer_state="$(systemctl is-active "${TIMER_NAME}" 2>/dev/null || true)"
+  while IFS=$'\t' read -r group fo_enabled _backup _ptarget _btarget _type _port _location _stable _fast _pf _bs _pr _extra; do
+    [[ -z "${group}" || "${group}" =~ ^# ]] && continue
+    configured=$((configured+1))
+    [[ "${fo_enabled}" == "true" ]] || continue
+    failover_enabled=$((failover_enabled+1))
+    base_enabled="$(get_group_enabled_ui "${group}" 2>/dev/null || true)"
+    if [[ "${base_enabled}" != "true" ]]; then parent_disabled=$((parent_disabled+1)); continue; fi
+    runnable=$((runnable+1))
+    load_failover_state_ui "${group}"
+    group_last="${FS_LAST_PRIMARY_CHECK:-0}"
+    [[ "${group_last}" =~ ^[0-9]+$ ]] || group_last=0
+    if [[ "${FS_LAST_BACKUP_CHECK:-0}" =~ ^[0-9]+$ ]] && (( FS_LAST_BACKUP_CHECK > group_last )); then group_last="${FS_LAST_BACKUP_CHECK}"; fi
+    if (( group_last > latest_check )); then latest_check="${group_last}"; latest_group="${group}"; latest_result="${FS_LAST_RESULT:-unknown}"; fi
+  done < "${FAILOVER_FILE}"
+
+  line
+  echo "📈 Globalping 用量与自动调度诊断"
+  line
+  echo "本机滑动1小时已记录 tests：${count}/${GLOBALPING_MAX_TESTS_PER_HOUR}（剩余安全预算 ${local_remaining}）"
+  echo "自动调度器：${TIMER_NAME}=${timer_state:-unknown}"
+  echo "故障转移配置：总数=${configured}，自身启用=${failover_enabled}，主组同时启用=${runnable}，主组禁用/缺失=${parent_disabled}"
+  if (( latest_check > 0 )); then
+    echo "最近自动检测：$(date -d "@${latest_check}" '+%F %T' 2>/dev/null || printf '%s' "${latest_check}")，组=${latest_group}，结果=${latest_result}"
+  else
+    echo "最近自动检测：尚无状态记录"
+  fi
+  if (( invalid > 0 )); then
+    echo "⚠️  本机用量文件含 ${invalid} 条非法记录，新测量已暂停以防超额。"
+    echo "请先备份 ${GLOBALPING_USAGE_FILE}，确认最近1小时用量后人工修正；菜单25不会自动清空，以免低估额度。"
+  fi
+
+  if (( count == 0 )); then
+    echo "0 次诊断："
+    (( configured > 0 )) || echo "- 尚未配置任何故障转移组。"
+    (( configured == 0 || failover_enabled > 0 )) || echo "- 所有故障转移配置均为禁用。"
+    (( parent_disabled == 0 )) || echo "- 有 ${parent_disabled} 个故障转移配置的主组被禁用或已不存在。"
+    [[ "${timer_state}" == "active" ]] || echo "- timer 未处于 active，自动 Globalping 检测不会运行。"
+    if (( runnable > 0 && latest_check == 0 )); then echo "- 存在可运行组但从未写入检测状态；请运行菜单24自检并查看菜单19日志。"; fi
+    if (( latest_check >= cutoff )) && [[ "${latest_result}" == *_UNKNOWN ]]; then echo "- 最近调度已执行但结果为 UNKNOWN；创建请求可能被 API 拒绝，请查看菜单13故障转移历史。"; fi
+    if (( latest_check > 0 && latest_check < cutoff )); then echo "- 最近一次检测已超过1小时，本地滑动窗口显示0属于预期；请检查 timer 和配置周期。"; fi
+  fi
+
+  body="$(mktemp)" || { echo "Globalping limits API读取失败：无法创建临时文件"; return 1; }
+  http_code="$(curl "${args[@]}" -o "${body}" -w '%{http_code}' https://api.globalping.io/v1/limits 2>/dev/null)"; rc=$?
+  resp="$(cat "${body}" 2>/dev/null || true)"; rm -f "${body}"
+  if [[ "${rc}" -eq 0 && "${http_code}" == "200" ]] && jq -e . >/dev/null 2>&1 <<< "${resp}"; then
+    remote_limit="$(jq -r '.rateLimit.measurements.create.limit // empty' <<< "${resp}")"
+    remote_remaining="$(jq -r '.rateLimit.measurements.create.remaining // empty' <<< "${resp}")"
+    remote_reset="$(jq -r '.rateLimit.measurements.create.reset // empty' <<< "${resp}")"
+    remote_type="$(jq -r '.rateLimit.measurements.create.type // "unknown"' <<< "${resp}")"
+    if [[ "${remote_limit}" =~ ^[0-9]+$ && "${remote_remaining}" =~ ^[0-9]+$ ]]; then
+      [[ "${remote_reset}" =~ ^[0-9]+$ ]] || remote_reset="unknown"
+      [[ "${remote_type}" == "ip" || "${remote_type}" == "user" ]] || remote_type="unknown"
+      remote_used=$((remote_limit-remote_remaining)); (( remote_used >= 0 )) || remote_used=0
+      echo "Globalping远端当前窗口：已用 ${remote_used}/${remote_limit}，剩余 ${remote_remaining}，约 ${remote_reset:-unknown}s 后重置，类型=${remote_type}"
+      echo "说明：远端额度按当前 Token 或出口 IP 统计，可能包含其他程序；本机数字只统计 cfdns 成功创建的 tests。"
+    else
+      echo "Globalping limits API返回成功，但缺少可识别的 measurements.create 限额字段。"
+    fi
+  else
+    error_detail="$(jq -r '.error.message // .message // empty' <<< "${resp}" 2>/dev/null || true)"
+    [[ -n "${error_detail}" ]] || error_detail="$(tr '\r\n\t' '   ' <<< "${resp}" | cut -c1-240)"
+    error_detail="$(tr '\r\n\t' '   ' <<< "${error_detail}" | sed 's/[[:space:]]\+/ /g' | cut -c1-240)"
+    echo "Globalping limits API读取失败：HTTP=${http_code:-0}，curl_rc=${rc}，详情=${error_detail:-empty}"
+  fi
 }
 
 test_backup_sources_local_dns() {
@@ -2264,7 +2449,7 @@ remove_failover_config_ui() {
 }
 
 show_failover_history() {
-  local raw sorted days choice cutoff_epoch t group action from to reason mid extra ts shown=0
+  local raw sorted days choice cutoff_epoch t group action from to reason _mid extra ts shown=0
   echo "1. 最近3天"; echo "2. 最近7天"; echo "3. 最近30天"; echo "4. 最近180天"; echo "5. 自定义天数"; echo "0. 返回"
   read -rp "请选择: " choice || return
   case "${choice}" in
@@ -2285,7 +2470,7 @@ show_failover_history() {
 
   printf '%-20s %-14s %-8s %-9s %-9s %-36s\n' "Time" "Group" "Action" "From" "To" "Reason"
   printf '%-20s %-14s %-8s %-9s %-9s %-36s\n' "--------------------" "--------------" "--------" "---------" "---------" "------------------------------------"
-  while IFS=$'\t' read -r t group action from to reason mid extra; do
+  while IFS=$'\t' read -r t group action from to reason _mid extra; do
     [[ -n "${t}" && -n "${group}" && -n "${action}" && -z "${extra:-}" ]] || continue
     ts="$(date -d "${t}" +%s 2>/dev/null || true)"
     [[ "${ts}" =~ ^[0-9]+$ ]] || continue
@@ -2306,14 +2491,14 @@ failover_menu() {
     echo " 2. 🧭 配置/更新组故障转移"
     echo " 3. 🛟 管理 BACKUP 源域名"
     echo " 4. 🔘 启用/禁用组故障转移"
-    echo " 5. 🧪 Globalping 测试 PRIMARY（不改变计数）"
-    echo " 6. 🧪 Globalping 测试 BACKUP（不改变计数）"
+    echo " 5. 🧪 Globalping 测试 PRIMARY（不改状态计数，会记录API用量）"
+    echo " 6. 🧪 Globalping 测试 BACKUP（不改状态计数，会记录API用量）"
     echo " 7. 🔎 测试 BACKUP 本机 DNS 解析"
     echo " 8. ⏪ 人工切换到 PRIMARY"
     echo " 9. ⏩ 人工切换到 BACKUP"
     echo "10. ♻️ 重置状态并回到 PRIMARY"
     echo "11. ⚙️ Globalping 全局设置"
-    echo "12. 📈 查看 Globalping 配额/本机使用量"
+    echo "12. 📈 查看 Globalping 配额/本机使用量/调度诊断"
     echo "13. 📜 查看故障转移历史"
     echo "14. 🗑️ 删除组故障转移配置（保留PRIMARY组）"
     echo " 0. ↩️ 返回主菜单"
@@ -2331,10 +2516,10 @@ failover_menu() {
 
 activate_after_init() {
   local group_name="${1:-ALL}"
-  systemctl daemon-reload || true
+  systemctl daemon-reload || { echo "systemd daemon-reload 失败"; return 1; }
   systemctl reset-failed "${SERVICE_NAME}" "${TIMER_NAME}" 2>/dev/null || true
-  systemctl enable --now "${TIMER_NAME}" >/dev/null 2>&1 || true
-  /usr/local/bin/cf-dns-sync.sh "${group_name}" FORCE || true
+  systemctl enable --now "${TIMER_NAME}" || { echo "${TIMER_NAME} 启用失败"; return 1; }
+  /usr/local/bin/cf-dns-sync.sh "${group_name}" FORCE || { echo "首次同步失败，请查看项目日志"; return 1; }
 }
 
 
@@ -2362,15 +2547,18 @@ run_init_wizard() {
   line
   read -rp "请选择 [1-2]: " wizard_choice
 
-  local before_count after_count
+  local before_count after_count init_ok=0
   before_count="$(get_group_count)"
   case "${wizard_choice}" in
     1)
-      quick_add_first_group
+      quick_add_first_group && init_ok=1
       after_count="$(get_group_count)"
       if [[ "${after_count}" -gt "${before_count}" ]]; then
         touch "${INIT_FLAG}"
         chmod 600 "${INIT_FLAG}"
+        if [[ "${init_ok}" -ne 1 ]]; then
+          echo "首组配置已保存，但自动调度或首次同步未成功；为避免重复建组，初始化向导不再重复，请运行菜单24/25诊断修复。"
+        fi
       else
         echo "初始化未完成，下次进入 cfdns 时仍会显示快速初始化向导。"
       fi
@@ -2424,8 +2612,12 @@ quick_add_first_group() {
     "${group_name}" true "${interval_sec}" "${api_token}" "${zone_id}" "${target_fqdn}" "${ttl}" false "${mode}" "${sources_csv}" >> "${GROUPS_FILE}"
   chmod 600 "${GROUPS_FILE}"
   invalidate_group_sync_state "${group_name}"
-  activate_after_init "${group_name}"
-  echo "初始化完成：已启用定时器并立即强制同步组 ${group_name}。"
+  if activate_after_init "${group_name}"; then
+    echo "初始化完成：已启用定时器并立即强制同步组 ${group_name}。"
+  else
+    echo "组配置已保存，但初始化未完全可用；请运行菜单24自检或菜单25一键修复。"
+    return 1
+  fi
 }
 
 
@@ -2529,8 +2721,16 @@ add_group() {
     "${group_name}" "${enabled}" "${interval_sec}" "${api_token}" "${zone_id}" "${target_fqdn}" "${ttl}" "${proxied}" "${mode}" "${sources_csv}" >> "${GROUPS_FILE}"
   chmod 600 "${GROUPS_FILE}"
   invalidate_group_sync_state "${group_name}"
-  systemctl enable --now "${TIMER_NAME}" >/dev/null 2>&1 || true
-  echo "组已添加：${group_name}；最快会在下一个5秒调度周期检测。"
+  if [[ "${enabled}" == "true" ]]; then
+    if systemctl enable --now "${TIMER_NAME}"; then
+      echo "组已添加：${group_name}；最快会在下一个5秒调度周期检测。"
+    else
+      echo "组已添加，但 ${TIMER_NAME} 启用失败；请运行菜单24自检或菜单25一键修复。"
+      return 1
+    fi
+  else
+    echo "组已添加：${group_name}（当前禁用，不会自动检测）。"
+  fi
 }
 
 
@@ -2561,7 +2761,10 @@ toggle_group_enabled() {
   if [[ "${GROUP_ENABLED}" == "true" ]]; then
     invalidate_group_sync_state "${GROUP_NAME}"
     load_failover_config_ui "${GROUP_NAME}" >/dev/null 2>&1 && reset_failover_counters_preserve_role "${GROUP_NAME}"
-    systemctl enable --now "${TIMER_NAME}" >/dev/null 2>&1 || true
+    if ! systemctl enable --now "${TIMER_NAME}"; then
+      echo "组 ${GROUP_NAME} 已启用，但 ${TIMER_NAME} 启用失败；请运行菜单24自检或菜单25一键修复。"
+      return 1
+    fi
   fi
   echo "组 ${GROUP_NAME} 已切换为 ${GROUP_ENABLED}"
 }
@@ -2793,8 +2996,6 @@ view_group_current_ips() {
     failover_enabled=true; backup_csv="${FO_BACKUP_SOURCES}"; load_failover_state_ui "${GROUP_NAME}"
     [[ "${FS_ACTIVE_ROLE}" == "BACKUP" ]] && active_role="BACKUP"
   fi
-  local active_csv="${GROUP_SOURCES_CSV}"
-  [[ "${active_role}" == "BACKUP" ]] && active_csv="${backup_csv}"
   local tmp_all i domain ips selected count joined resp encoded csv label
   tmp_all="$(mktemp)"; : > "${tmp_all}"
 
@@ -2846,9 +3047,12 @@ view_group_current_ips() {
 }
 
 start_sync() {
-  systemctl enable --now "${TIMER_NAME}"
-  systemctl start "${SERVICE_NAME}" || true
-  echo "已启动"
+  systemctl daemon-reload || { echo "启动失败：systemd daemon-reload 失败"; return 1; }
+  systemctl reset-failed "${SERVICE_NAME}" "${TIMER_NAME}" 2>/dev/null || true
+  systemctl enable --now "${TIMER_NAME}" || { echo "启动失败：${TIMER_NAME} 无法启用"; return 1; }
+  systemctl start "${SERVICE_NAME}" || { echo "启动失败：${SERVICE_NAME} 首次运行失败"; return 1; }
+  systemctl is-active --quiet "${TIMER_NAME}" || { echo "启动失败：${TIMER_NAME} 未处于 active"; return 1; }
+  echo "已启动并完成一次调度"
 }
 
 stop_sync() {
@@ -2859,11 +3063,12 @@ stop_sync() {
 }
 
 restart_sync() {
-  systemctl daemon-reload
+  systemctl daemon-reload || { echo "重启失败：systemd daemon-reload 失败"; return 1; }
   systemctl reset-failed "${SERVICE_NAME}" "${TIMER_NAME}" 2>/dev/null || true
-  systemctl restart "${TIMER_NAME}"
-  systemctl restart "${SERVICE_NAME}" || true
-  echo "已重启"
+  systemctl restart "${TIMER_NAME}" || { echo "重启失败：${TIMER_NAME} 无法重启"; return 1; }
+  systemctl restart "${SERVICE_NAME}" || { echo "重启失败：${SERVICE_NAME} 运行失败"; return 1; }
+  systemctl is-active --quiet "${TIMER_NAME}" || { echo "重启失败：${TIMER_NAME} 未处于 active"; return 1; }
+  echo "已重启并完成一次调度"
 }
 
 manual_run_all() {
@@ -3212,8 +3417,9 @@ self_check() {
   local line_no=0 name enabled interval token zone target ttl proxied mode sources_csv extra src_count key source_domain
   local fo_group fo_enabled fo_backup fo_ptarget fo_btarget fo_type fo_port fo_location fo_stable fo_fast fo_pf fo_bs fo_pr fo_extra
   local primary_sources overlap worst_fast worst_stable group_worst theoretical_total=0 state_group state_role state_phase state_extra
-  declare -A seen_names=() seen_targets=() seen_fo=()
-  echo "🩺 cfdns v2.6 自检"
+  local gp_usage_valid=0 gp_usage_invalid=0
+  declare -A seen_names=() seen_targets=() seen_fo=() group_enabled_map=()
+  echo "🩺 cfdns v2.7 自检"
   line
   check_ok(){ printf '✅ %s\n' "$*"; }
   check_warn(){ warnings=$((warnings+1)); printf '⚠️  %s\n' "$*"; }
@@ -3230,9 +3436,18 @@ self_check() {
   [[ "${FORCE_RECONCILE_SEC}" =~ ^[0-9]+$ && "${FORCE_RECONCILE_SEC}" -ge 60 ]] && check_ok "强制校准周期：${FORCE_RECONCILE_SEC}s" || check_fail "FORCE_RECONCILE_SEC 必须>=60"
   [[ "${DNS_QUERY_TIMEOUT_SEC}" =~ ^[0-9]+$ && "${DNS_QUERY_TIMEOUT_SEC}" -ge 1 ]] && check_ok "DNS查询超时：${DNS_QUERY_TIMEOUT_SEC}s" || check_fail "DNS_QUERY_TIMEOUT_SEC 必须>=1"
   [[ "${GLOBALPING_MAX_TESTS_PER_HOUR}" =~ ^[0-9]+$ && "${GLOBALPING_MAX_TESTS_PER_HOUR}" -ge 1 ]] && check_ok "Globalping本机预算：${GLOBALPING_MAX_TESTS_PER_HOUR} tests/h" || check_fail "GLOBALPING_MAX_TESTS_PER_HOUR 非法"
-  [[ "${GLOBALPING_MEASUREMENT_TIMEOUT_SEC}" =~ ^[0-9]+$ && "${GLOBALPING_MEASUREMENT_TIMEOUT_SEC}" -ge 3 && "${GLOBALPING_MEASUREMENT_TIMEOUT_SEC}" -le 30 ]] && check_ok "Globalping测量超时：${GLOBALPING_MEASUREMENT_TIMEOUT_SEC}s" || check_fail "GLOBALPING_MEASUREMENT_TIMEOUT_SEC 必须3~30"
+  [[ "${GLOBALPING_MEASUREMENT_TIMEOUT_SEC}" =~ ^[0-9]+$ && "${GLOBALPING_MEASUREMENT_TIMEOUT_SEC}" -ge 5 && "${GLOBALPING_MEASUREMENT_TIMEOUT_SEC}" -le 30 ]] && check_ok "Globalping测量超时：${GLOBALPING_MEASUREMENT_TIMEOUT_SEC}s" || check_fail "GLOBALPING_MEASUREMENT_TIMEOUT_SEC 必须5~30"
   [[ "${GLOBALPING_POLL_MAX_SEC}" =~ ^[0-9]+$ && "${GLOBALPING_POLL_MAX_SEC}" -ge "${GLOBALPING_MEASUREMENT_TIMEOUT_SEC}" && "${GLOBALPING_POLL_MAX_SEC}" -le 60 ]] && check_ok "Globalping最长等待：${GLOBALPING_POLL_MAX_SEC}s" || check_fail "GLOBALPING_POLL_MAX_SEC 非法"
   if [[ -z "${GLOBALPING_API_TOKEN}" && "${GLOBALPING_MAX_TESTS_PER_HOUR}" -gt 250 ]]; then check_warn "匿名Globalping预算大于250 tests/h，建议设为240以内"; fi
+  read -r gp_usage_valid gp_usage_invalid < <(awk 'NF == 1 && $1 ~ /^[0-9]+$/ {ok++; next} NF {bad++} END{print ok+0, bad+0}' "${GLOBALPING_USAGE_FILE}" 2>/dev/null)
+  [[ "${gp_usage_invalid}" -eq 0 ]] && check_ok "Globalping用量文件格式正常（${gp_usage_valid}条）" || check_fail "Globalping用量文件有${gp_usage_invalid}条非法记录"
+  if grep -Fq 'target:$target,limit:1,locations:' /usr/local/bin/cf-dns-sync.sh 2>/dev/null; then
+    check_fail "Globalping请求同时设置全局limit和位置limit，API会拒绝"
+  elif grep -Fq 'target:$target,locations:[{magic:$location,limit:1}]' /usr/local/bin/cf-dns-sync.sh 2>/dev/null; then
+    check_ok "Globalping请求仅使用位置limit=1"
+  else
+    check_warn "无法确认Globalping单探针limit配置"
+  fi
 
   [[ "$(stat -c '%a' "${LOG_DIR}" 2>/dev/null || true)" == 700 ]] && check_ok "日志目录权限为700" || check_warn "日志目录权限不是700"
   for f in "${LOG_FILE}" "${HISTORY_FILE}" "${FAILOVER_HISTORY_FILE}" "${SETTINGS_FILE}" "${GROUPS_FILE}" "${FAILOVER_FILE}" "${FAILOVER_STATE_FILE}" "${GLOBALPING_USAGE_FILE}"; do [[ "$(stat -c '%a' "${f}" 2>/dev/null || true)" == 600 ]] && check_ok "权限600：${f}" || check_warn "权限不是600：${f}"; done
@@ -3241,6 +3456,7 @@ self_check() {
   while IFS=$'\t' read -r name enabled interval token zone target ttl proxied mode sources_csv extra; do
     line_no=$((line_no+1)); [[ -z "${name}" || "${name}" =~ ^# ]] && continue
     group_count=$((group_count+1)); [[ "${enabled}" == true ]] && enabled_count=$((enabled_count+1))
+    group_enabled_map["${name}"]="${enabled}"
     [[ -z "${extra:-}" ]] || check_fail "groups.tsv第${line_no}行字段过多"
     if [[ -n "${seen_names["${name}"]+x}" ]]; then check_fail "组名重复：${name}"; else seen_names["${name}"]=1; fi
     key="${zone,,}|${target,,}"
@@ -3267,6 +3483,7 @@ self_check() {
     if [[ -n "${seen_fo["${fo_group}"]+x}" ]]; then check_fail "故障转移组重复：${fo_group}"; else seen_fo["${fo_group}"]=1; fi
     [[ -n "${seen_names["${fo_group}"]+x}" ]] || check_fail "故障转移配置引用不存在的组：${fo_group}"
     [[ "${fo_enabled}" == true || "${fo_enabled}" == false ]] || check_fail "组 ${fo_group}: failover enabled非法"
+    if [[ "${fo_enabled}" == true && "${group_enabled_map["${fo_group}"]:-missing}" != true ]]; then check_warn "组 ${fo_group}: 故障转移已启用，但主组状态为${group_enabled_map["${fo_group}"]:-missing}，自动Globalping检测不会运行"; fi
     primary_sources="$(get_group_primary_sources "${fo_group}" 2>/dev/null || true)"
     validate_sources_csv "${fo_backup}" || check_fail "组 ${fo_group}: BACKUP源域名必须为1~20个有效域名"
     overlap="$(csv_overlap_value "${primary_sources}" "${fo_backup}" || true)"; [[ -z "${overlap}" ]] || check_fail "组 ${fo_group}: PRIMARY/BACKUP重复域名=${overlap}"
@@ -3277,7 +3494,7 @@ self_check() {
     case "${fo_location,,}" in china|china+*|cn|cn+*) ;; *) check_fail "组 ${fo_group}: 位置必须是中国区（China/CN）" ;; esac
     [[ "${fo_stable}" =~ ^[0-9]+$ && "${fo_fast}" =~ ^[0-9]+$ && "${fo_stable}" -ge 60 && "${fo_fast}" -ge 60 && "${fo_stable}" -ge "${fo_fast}" ]] || check_fail "组 ${fo_group}: 稳定/快速周期非法"
     [[ "${fo_pf}" =~ ^[0-9]+$ && "${fo_bs}" =~ ^[0-9]+$ && "${fo_pr}" =~ ^[0-9]+$ && "${fo_pf}" -ge 1 && "${fo_bs}" -ge 1 && "${fo_pr}" -ge 1 ]] || check_fail "组 ${fo_group}: 阈值非法"
-    if [[ "${fo_enabled}" == true && "${fo_fast}" =~ ^[0-9]+$ && "${fo_stable}" =~ ^[0-9]+$ && "${fo_fast}" -gt 0 && "${fo_stable}" -gt 0 ]]; then
+    if [[ "${fo_enabled}" == true && "${group_enabled_map["${fo_group}"]:-false}" == true && "${fo_fast}" =~ ^[0-9]+$ && "${fo_stable}" =~ ^[0-9]+$ && "${fo_fast}" -gt 0 && "${fo_stable}" -gt 0 ]]; then
       worst_fast=$(( (3600 + fo_fast - 1) / fo_fast )); worst_stable=$(( 2 * ((3600 + fo_stable - 1) / fo_stable) )); group_worst=${worst_fast}; (( worst_stable > group_worst )) && group_worst=${worst_stable}; theoretical_total=$((theoretical_total + group_worst))
     fi
   done < "${FAILOVER_FILE}"
@@ -3318,7 +3535,7 @@ self_check() {
 }
 
 one_key_repair() {
-  echo "🧯 cfdns v2.6 一键修复"
+  echo "🧯 cfdns v2.7 一键修复"
   line
   [[ "$(id -u)" -eq 0 ]] || { echo "请使用 root 运行"; return 1; }
 
@@ -3371,12 +3588,18 @@ TSV
   chmod 600 "${STATE_FILE}" "${RUNSTATE_FILE}" "${RECONCILE_FILE}" "${FAILOVER_STATE_FILE}" "${GLOBALPING_USAGE_FILE}" "${LOG_FILE}" "${HISTORY_FILE}" "${FAILOVER_HISTORY_FILE}" "${SETTINGS_FILE}" "${GROUPS_FILE}" "${FAILOVER_FILE}" 2>/dev/null || true
   command -v restorecon >/dev/null 2>&1 && restorecon -RF "${LOG_DIR}" >/dev/null 2>&1 || true
   chmod +x /usr/local/bin/cfdns /usr/local/bin/cf-dns-sync.sh 2>/dev/null || true
-  systemctl daemon-reload || true
+  systemctl daemon-reload || { echo "一键修复失败：systemd daemon-reload 失败"; return 1; }
   systemctl reset-failed "${SERVICE_NAME}" "${TIMER_NAME}" 2>/dev/null || true
-  systemctl enable --now "${TIMER_NAME}" || true
-  /usr/local/bin/cf-dns-sync.sh ALL FORCE || true
-  echo "一键修复完成。"
-  self_check || true
+  systemctl enable --now "${TIMER_NAME}" || { echo "一键修复失败：${TIMER_NAME} 无法启用"; return 1; }
+  /usr/local/bin/cf-dns-sync.sh ALL FORCE || { echo "一键修复失败：首次同步未成功，请查看项目日志"; return 1; }
+  systemctl is-active --quiet "${TIMER_NAME}" || { echo "一键修复失败：${TIMER_NAME} 未处于 active"; return 1; }
+  echo "一键修复操作已完成，开始最终自检。"
+  if self_check; then
+    echo "一键修复完成。"
+  else
+    echo "一键修复已执行，但最终自检仍有错误。"
+    return 1
+  fi
 }
 
 
@@ -3647,8 +3870,12 @@ backup_existing() {
 
 store_installer_copy() {
   mkdir -p "${INSTALL_DIR}"
-  if [[ -f "$0" ]] && grep -q 'cfdns v2.6 installer' "$0" 2>/dev/null; then
-    install -m 700 "$0" "${INSTALL_COPY}"
+  if [[ -f "$0" ]] && grep -q 'cfdns v2.7 installer' "$0" 2>/dev/null; then
+    if [[ -e "${INSTALL_COPY}" && "$0" -ef "${INSTALL_COPY}" ]]; then
+      chmod 700 "${INSTALL_COPY}"
+    else
+      install -m 700 "$0" "${INSTALL_COPY}"
+    fi
   fi
 }
 
@@ -3681,14 +3908,19 @@ main() {
   chmod 700 "${LOG_DIR}" 2>/dev/null || true
   command -v restorecon >/dev/null 2>&1 && restorecon -RF "${LOG_DIR}" >/dev/null 2>&1 || true
   store_installer_copy
-  systemctl daemon-reload || true
+  systemctl daemon-reload || { echo "安装文件已写入，但 systemd daemon-reload 失败；安装未完成。"; return 1; }
   systemctl reset-failed "${APP_NAME}.service" "${APP_NAME}.timer" 2>/dev/null || true
   if [[ "${CFDNS_NO_START:-0}" != "1" ]]; then
-    systemctl enable --now "${APP_NAME}.timer" || true
-    systemctl start "${APP_NAME}.service" || true
+    systemctl enable --now "${APP_NAME}.timer" || { echo "安装文件已写入，但 ${APP_NAME}.timer 启用失败；安装未完成。"; return 1; }
+    systemctl start "${APP_NAME}.service" || { echo "安装文件已写入，但首次同步执行失败；安装未完成。"; return 1; }
+    systemctl is-active --quiet "${APP_NAME}.timer" || { echo "安装文件已写入，但 ${APP_NAME}.timer 未处于 active；安装未完成。"; return 1; }
   fi
   echo
-  echo "安装/升级完成: v2.6"
+  if [[ "${CFDNS_NO_START:-0}" == "1" ]]; then
+    echo "安装/升级文件写入完成: v${APP_VERSION}（按 CFDNS_NO_START=1 未启动）"
+  else
+    echo "安装/升级完成: v${APP_VERSION}"
+  fi
   echo "管理命令: cfdns"
   echo "本机基础调度周期: 5 秒"
   echo "每组按照独立周期查询源域名；源IP未变化时不会调用Cloudflare API。"

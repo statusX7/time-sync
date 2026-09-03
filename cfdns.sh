@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# cfdns v2.7 installer
+# cfdns v2.8 installer
 # Cloudflare DNS multi-group A-record incremental sync tool
 
 APP_NAME="cf-dns-sync"
-APP_VERSION="2.7"
+APP_VERSION="2.8"
 INSTALL_DIR="/opt/cfdns"
 INSTALL_COPY="${INSTALL_DIR}/cfdns-installer.sh"
 BASE_DIR="/etc/${APP_NAME}"
@@ -51,6 +51,7 @@ need_install_pkgs() {
   command -v logrotate >/dev/null 2>&1 || missing+=("logrotate")
   command -v zcat >/dev/null 2>&1 || missing+=("gzip")
   command -v gzip >/dev/null 2>&1 || missing+=("gzip")
+  command -v tac >/dev/null 2>&1 || missing+=("coreutils")
 
   printf '%s\n' "${missing[@]}" | sed '/^$/d' | sort -u
 }
@@ -225,7 +226,7 @@ write_sync_script() {
 #!/usr/bin/env bash
 set -uo pipefail
 
-APP_VERSION="2.7"
+APP_VERSION="2.8"
 BASE_DIR="/etc/cf-dns-sync"
 VAR_DIR="/var/lib/cf-dns-sync"
 SETTINGS_FILE="${BASE_DIR}/settings.conf"
@@ -1465,7 +1466,7 @@ write_ctl_script() {
 set -uo pipefail
 
 APP_NAME="cf-dns-sync"
-APP_VERSION="2.7"
+APP_VERSION="2.8"
 BASE_DIR="/etc/${APP_NAME}"
 VAR_DIR="/var/lib/${APP_NAME}"
 SETTINGS_FILE="${BASE_DIR}/settings.conf"
@@ -1484,6 +1485,7 @@ RUNSTATE_FILE="${VAR_DIR}/runstate.tsv"
 RECONCILE_FILE="${VAR_DIR}/reconcile.tsv"
 FAILOVER_STATE_FILE="${VAR_DIR}/failover-state.tsv"
 GLOBALPING_USAGE_FILE="${VAR_DIR}/globalping-usage.tsv"
+HISTORY_LOCK_FILE="/run/cf-dns-sync.lock"
 INSTALL_COPY="/opt/cfdns/cfdns-installer.sh"
 INIT_FLAG="${VAR_DIR}/.initialized"
 
@@ -1595,7 +1597,7 @@ line() {
 title() {
   clear 2>/dev/null || true
   line
-  color "1;36" "                          🚀 cfdns 管理菜单 v2.7"
+  color "1;36" "                          🚀 cfdns 管理菜单 v2.8"
   echo
   color "0;37" "  5秒本机检测 / Globalping中国节点故障转移 / 安全DNS联动 / 自检修复"
   line
@@ -3242,7 +3244,7 @@ show_status() {
 show_dep_status() {
   printf '%-18s %-10s\n' "Command" "Status"
   printf '%-18s %-10s\n' "------------------" "----------"
-  for cmd in curl jq dig flock logrotate zcat gzip awk sed grep comm mktemp paste cut tr date wc stat; do
+  for cmd in curl jq dig flock logrotate zcat gzip tac awk sed grep comm mktemp paste cut tr date wc stat; do
     if command -v "${cmd}" >/dev/null 2>&1; then
       printf '%-18s %-10s\n' "${cmd}" "OK"
     else
@@ -3277,20 +3279,183 @@ collect_history_to_file() {
   collect_log_family_to_file "${HISTORY_FILE}" "$1"
 }
 
+managed_history_file_kind() {
+  local path="$1" suffix
+  [[ -f "${path}" && ! -L "${path}" ]] || return 1
+  if [[ "${path}" == "${HISTORY_FILE}" ]]; then
+    printf '%s\n' current
+    return 0
+  fi
+
+  suffix="${path#"${HISTORY_FILE}"}"
+  [[ "${suffix}" != "${path}" ]] || return 1
+  if [[ "${suffix}" =~ ^\.[0-9]+(\.gz)?$ || "${suffix}" =~ ^-[0-9]{8}(\.gz)?$ ]]; then
+    printf '%s\n' rotated
+    return 0
+  fi
+  return 1
+}
+
+collect_managed_history_files() {
+  local f mtime
+  local -a rotated_files=()
+  HISTORY_FILES=()
+
+  if managed_history_file_kind "${HISTORY_FILE}" >/dev/null 2>&1; then
+    HISTORY_FILES+=("${HISTORY_FILE}")
+  fi
+
+  shopt -s nullglob
+  for f in "${HISTORY_FILE}".* "${HISTORY_FILE}"-*; do
+    managed_history_file_kind "${f}" >/dev/null 2>&1 || continue
+    rotated_files+=("${f}")
+  done
+  shopt -u nullglob
+
+  if [[ "${#rotated_files[@]}" -gt 0 ]]; then
+    while IFS=$'\t' read -r _ f; do
+      [[ -n "${f}" ]] && HISTORY_FILES+=("${f}")
+    done < <(
+      for f in "${rotated_files[@]}"; do
+        mtime="$(stat -c '%Y' "${f}" 2>/dev/null)" || continue
+        printf '%s\t%s\n' "${mtime}" "${f}"
+      done | LC_ALL=C sort -t $'\t' -k1,1nr -k2,2r
+    )
+  fi
+}
+
+history_file_may_match_cutoff() {
+  local path="$1" cutoff_day="$2" suffix stamp compact_cutoff
+  [[ "${path}" == "${HISTORY_FILE}" ]] && return 0
+  suffix="${path#"${HISTORY_FILE}"}"
+  if [[ "${suffix}" =~ ^[.-]([0-9]{8})(\.gz)?$ ]]; then
+    stamp="${BASH_REMATCH[1]}"
+    compact_cutoff="${cutoff_day//-/}"
+    [[ "${stamp}" < "${compact_cutoff}" ]] && return 1
+  fi
+  return 0
+}
+
+history_extract_recent_from_file() {
+  local file="$1" cutoff="$2" record_mode="$3" target_group="$4" limit="$5"
+  managed_history_file_kind "${file}" >/dev/null 2>&1 || return 1
+  [[ "${record_mode}" == "all" || "${record_mode}" == "deleted" ]] || return 1
+  [[ "${limit}" =~ ^[0-9]+$ && "${limit}" -ge 1 && "${limit}" -le 1000 ]] || return 1
+
+  if [[ "${file}" == *.gz ]]; then
+    gzip -cd -- "${file}" 2>/dev/null | LC_ALL=C awk -F '\t' \
+      -v cutoff="${cutoff}" -v record_mode="${record_mode}" \
+      -v target_group="${target_group}" -v limit="${limit}" '
+        function wanted() {
+          if (NF != 7 || length($1) != 19) return 0
+          if ($1 !~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]$/) return 0
+          if ($1 < cutoff) return 0
+          if (target_group != "" && $2 != target_group) return 0
+          if (record_mode == "deleted" && $3 != "DELETE") return 0
+          return 1
+        }
+        wanted() {
+          slot = seen % limit
+          rows[slot] = $0
+          seen++
+        }
+        END {
+          count = seen < limit ? seen : limit
+          for (i = 0; i < count; i++) {
+            slot = (seen - 1 - i) % limit
+            print rows[slot]
+          }
+        }
+      '
+    return
+  fi
+
+  (
+    set +o pipefail
+    LC_ALL=C tac -- "${file}" 2>/dev/null | LC_ALL=C awk -F '\t' \
+      -v cutoff="${cutoff}" -v record_mode="${record_mode}" \
+      -v target_group="${target_group}" -v limit="${limit}" '
+        NF == 7 && length($1) == 19 &&
+        $1 ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]$/ &&
+        $1 >= cutoff &&
+        (target_group == "" || $2 == target_group) &&
+        (record_mode != "deleted" || $3 == "DELETE") {
+          print
+          count++
+          if (count >= limit) exit 75
+        }
+      '
+    local -a pipe_status=("${PIPESTATUS[@]}")
+    [[ "${pipe_status[1]}" -eq 75 ]] && exit 0
+    [[ "${pipe_status[1]}" -eq 0 && "${pipe_status[0]}" -eq 0 ]]
+  )
+}
+
+collect_recent_history_to_file() {
+  local cutoff="$1" record_mode="$2" target_group="$3" limit="$4" output="$5"
+  local cutoff_day candidate part count=0 remaining
+  : > "${output}" || return 1
+  part="$(mktemp)" || return 1
+  cutoff_day="${cutoff%% *}"
+
+  HISTORY_READ_ERRORS=()
+  HISTORY_FILES_SCANNED=0
+  HISTORY_FILES_SKIPPED=0
+  HISTORY_LIMIT_REACHED=0
+  HISTORY_RESULT_COUNT=0
+  collect_managed_history_files
+  HISTORY_TOTAL_FILES="${#HISTORY_FILES[@]}"
+
+  for candidate in "${HISTORY_FILES[@]}"; do
+    if ! history_file_may_match_cutoff "${candidate}" "${cutoff_day}"; then
+      HISTORY_FILES_SKIPPED=$((HISTORY_FILES_SKIPPED+1))
+      continue
+    fi
+    remaining=$((limit-count))
+    (( remaining > 0 )) || { HISTORY_LIMIT_REACHED=1; break; }
+    : > "${part}"
+    HISTORY_FILES_SCANNED=$((HISTORY_FILES_SCANNED+1))
+    if history_extract_recent_from_file "${candidate}" "${cutoff}" "${record_mode}" "${target_group}" "${remaining}" > "${part}"; then
+      cat -- "${part}" >> "${output}" || { rm -f "${part}"; return 1; }
+    else
+      HISTORY_READ_ERRORS+=("${candidate}")
+    fi
+    read -r count < <(wc -l < "${output}")
+    if (( count >= limit )); then
+      HISTORY_LIMIT_REACHED=1
+      break
+    fi
+  done
+
+  rm -f "${part}"
+  HISTORY_RESULT_COUNT="${count}"
+}
+
+print_history_header() {
+  local record_mode="$1"
+  if [[ "${record_mode}" == "all" ]]; then
+    printf '%-20s %-14s %-8s %-16s %-28s %-10s %-30s\n' \
+      "Time" "Group" "Action" "IP" "SourceDomain" "Mode" "Target"
+    printf '%-20s %-14s %-8s %-16s %-28s %-10s %-30s\n' \
+      "--------------------" "--------------" "--------" "----------------" \
+      "----------------------------" "----------" "------------------------------"
+  else
+    printf '%-20s %-14s %-16s %-28s %-10s %-30s\n' \
+      "Time" "Group" "DeletedIP" "SourceDomain" "Mode" "Target"
+    printf '%-20s %-14s %-16s %-28s %-10s %-30s\n' \
+      "--------------------" "--------------" "----------------" \
+      "----------------------------" "----------" "------------------------------"
+  fi
+}
+
 render_history_data_file() {
-  local input="$1" cutoff="$2" record_mode="$3" target_group="${4:-}"
-  local record_time group action ip source_domain mode metadata extra ts target shown=0
+  local input="$1" record_mode="$2"
+  local record_time group action ip source_domain mode metadata extra target shown=0
 
   while IFS=$'\t' read -r record_time group action ip source_domain mode metadata extra; do
     [[ -n "${record_time}" && -n "${group}" && -n "${action}" && -n "${ip}" ]] || continue
     [[ -z "${extra:-}" ]] || continue
-    ts="$(date -d "${record_time}" +%s 2>/dev/null || true)"
-    [[ "${ts}" =~ ^[0-9]+$ ]] || continue
-    (( ts >= cutoff )) || continue
-    [[ -z "${target_group}" || "${group}" == "${target_group}" ]] || continue
-    [[ "${record_mode}" != "deleted" || "${action}" == "DELETE" ]] || continue
     target="${metadata%%|*}"
-
     if [[ "${record_mode}" == "all" ]]; then
       printf '%-20s %-14s %-8s %-16s %-28s %-10s %-30s\n' \
         "${record_time:0:20}" "${group:0:14}" "${action:0:8}" "${ip:0:16}" \
@@ -3306,51 +3471,199 @@ render_history_data_file() {
   [[ "${shown}" -gt 0 ]] || echo "暂无符合条件的历史记录"
 }
 
+delete_managed_history_file() {
+  local target="$1" kind
+  kind="$(managed_history_file_kind "${target}" 2>/dev/null)" || return 1
+  if [[ "${kind}" == "current" ]]; then
+    : > "${target}" || return 1
+    chmod 600 "${target}" 2>/dev/null || true
+  else
+    rm -- "${target}" 2>/dev/null || return 1
+  fi
+}
+
 history_renderer_self_test() {
-  local tmp out
-  tmp="$(mktemp)"
-  printf '2026-01-02 03:04:05\ttest-group\tDELETE\t203.0.113.10\tsource.example.com\tALL_IPS\ttarget.example.com|self_test\n' > "${tmp}"
-  out="$(render_history_data_file "${tmp}" 0 deleted test-group 2>&1)"
-  rm -f "${tmp}"
-  grep -Fq '203.0.113.10' <<< "${out}"
+  local dir output result rendered rotated_old rotated_new unsafe_link rc=0
+  local HISTORY_FILE
+  dir="$(mktemp -d)" || return 1
+  HISTORY_FILE="${dir}/cf-dns-sync-history.tsv"
+  rotated_old="${HISTORY_FILE}-20260101"
+  rotated_new="${HISTORY_FILE}-20260102.gz"
+  unsafe_link="${HISTORY_FILE}.9"
+  output="${dir}/output.tsv"
+
+  printf '2026-01-01 03:04:05\ttest-group\tADD\t203.0.113.10\tsource.example.invalid\tALL_IPS\ttarget.example.invalid|self_test\n' > "${rotated_old}"
+  printf '2026-01-02 03:04:05\ttest-group\tDELETE\t203.0.113.20\tsource.example.invalid\tALL_IPS\ttarget.example.invalid|self_test\n' | gzip -c > "${rotated_new}" || rc=1
+  printf '2026-01-03 03:04:05\ttest-group\tADD\t203.0.113.30\tsource.example.invalid\tALL_IPS\ttarget.example.invalid|self_test\n' > "${HISTORY_FILE}"
+  ln -s "${HISTORY_FILE}" "${unsafe_link}" || rc=1
+
+  collect_recent_history_to_file '2026-01-02 00:00:00' all test-group 2 "${output}" || rc=1
+  result="$(cat "${output}" 2>/dev/null)"
+  [[ "${result}" == *$'203.0.113.30'* && "${result}" == *$'203.0.113.20'* ]] || rc=1
+  [[ "${result}" != *$'203.0.113.10'* && "${HISTORY_TOTAL_FILES}" -eq 3 && "${HISTORY_FILES_SCANNED}" -eq 2 && "${HISTORY_LIMIT_REACHED}" -eq 1 ]] || rc=1
+
+  collect_recent_history_to_file '2026-01-02 00:00:00' all test-group 10 "${output}" || rc=1
+  [[ "${HISTORY_FILES_SKIPPED}" -eq 1 && "${HISTORY_RESULT_COUNT}" -eq 2 ]] || rc=1
+
+  collect_recent_history_to_file '2026-01-01 00:00:00' deleted test-group 1 "${output}" || rc=1
+  result="$(cat "${output}" 2>/dev/null)"
+  [[ "${result}" == *$'203.0.113.20'* && "${result}" != *$'203.0.113.30'* ]] || rc=1
+  rendered="$(render_history_data_file "${output}" deleted 2>/dev/null)"
+  [[ "${rendered}" == *$'203.0.113.20'* ]] || rc=1
+  delete_managed_history_file "${rotated_new}" || rc=1
+  [[ ! -e "${rotated_new}" ]] || rc=1
+  if delete_managed_history_file "${unsafe_link}" 2>/dev/null; then rc=1; fi
+  [[ -L "${unsafe_link}" ]] || rc=1
+  delete_managed_history_file "${HISTORY_FILE}" || rc=1
+  [[ -f "${HISTORY_FILE}" && ! -s "${HISTORY_FILE}" ]] || rc=1
+
+  rm -f -- "${rotated_old}" "${unsafe_link}" "${HISTORY_FILE}" "${output}"
+  rmdir -- "${dir}" 2>/dev/null || rc=1
+  return "${rc}"
 }
 
 render_history_table() {
-  local days="$1" record_mode="$2" target_group="${3:-}"
-  local cutoff now raw sorted
-  now="$(date +%s)"
-  cutoff=$((now - days*24*3600))
-  raw="$(mktemp)"
-  sorted="$(mktemp)"
+  local days="$1" record_mode="$2" target_group="${3:-}" limit="${4:-200}"
+  local cutoff output failed
+  cutoff="$(date -d "${days} days ago" '+%F %T' 2>/dev/null)" || { echo "无法计算历史时间范围"; return 1; }
+  output="$(mktemp)" || { echo "无法创建临时文件"; return 1; }
 
-  collect_history_to_file "${raw}"
-  LC_ALL=C sort -t $'\t' -k1,1 -k2,2 "${raw}" > "${sorted}" 2>/dev/null || cp -f "${raw}" "${sorted}"
-
-  if [[ "${record_mode}" == "all" ]]; then
-    printf '%-20s %-14s %-8s %-16s %-28s %-10s %-30s\n' \
-      "Time" "Group" "Action" "IP" "SourceDomain" "Mode" "Target"
-    printf '%-20s %-14s %-8s %-16s %-28s %-10s %-30s\n' \
-      "--------------------" "--------------" "--------" "----------------" \
-      "----------------------------" "----------" "------------------------------"
-  else
-    printf '%-20s %-14s %-16s %-28s %-10s %-30s\n' \
-      "Time" "Group" "DeletedIP" "SourceDomain" "Mode" "Target"
-    printf '%-20s %-14s %-16s %-28s %-10s %-30s\n' \
-      "--------------------" "--------------" "----------------" \
-      "----------------------------" "----------" "------------------------------"
+  echo "正在读取最新记录；达到 ${limit} 条后立即停止扫描后续轮转文件……"
+  if ! collect_recent_history_to_file "${cutoff}" "${record_mode}" "${target_group}" "${limit}" "${output}"; then
+    rm -f "${output}"
+    echo "读取历史记录失败"
+    return 1
   fi
 
-  render_history_data_file "${sorted}" "${cutoff}" "${record_mode}" "${target_group}"
-  rm -f "${raw}" "${sorted}"
+  print_history_header "${record_mode}"
+  render_history_data_file "${output}" "${record_mode}"
+  rm -f "${output}"
+  echo
+  echo "已显示 ${HISTORY_RESULT_COUNT} 条（最新在前）；扫描文件 ${HISTORY_FILES_SCANNED}/${HISTORY_TOTAL_FILES}。"
+  [[ "${HISTORY_FILES_SKIPPED}" -eq 0 ]] || echo "已按日期跳过 ${HISTORY_FILES_SKIPPED} 个确定早于查询范围的轮转文件。"
+  [[ "${HISTORY_LIMIT_REACHED}" -eq 0 ]] || echo "已达到 ${limit} 条显示上限；可缩小组/类型范围，或在每日文件管理中选择具体日期。"
+  for failed in "${HISTORY_READ_ERRORS[@]}"; do
+    echo "警告：无法完整读取 ${failed##*/}，该文件的结果未显示。" >&2
+  done
+}
+
+render_single_history_file() {
+  local file="$1" limit="${2:-200}" output count
+  managed_history_file_kind "${file}" >/dev/null 2>&1 || { echo "文件已不存在或不是受管历史文件"; return 1; }
+  output="$(mktemp)" || { echo "无法创建临时文件"; return 1; }
+  [[ "${file}" != *.gz ]] || echo "正在解压所选单日文件；不会读取其他日期的日志……"
+  if ! history_extract_recent_from_file "${file}" '0000-00-00 00:00:00' all '' "${limit}" > "${output}"; then
+    rm -f "${output}"
+    echo "无法完整读取 ${file##*/}；未显示不完整结果。"
+    return 1
+  fi
+  read -r count < <(wc -l < "${output}")
+  print_history_header all
+  render_history_data_file "${output}" all
+  rm -f "${output}"
+  echo
+  echo "文件：${file##*/}；已显示 ${count} 条（最新在前，最多 ${limit} 条）。"
+}
+
+confirm_delete_history_file() {
+  local target="$1" kind size identity current_identity confirm action rc=0
+  kind="$(managed_history_file_kind "${target}" 2>/dev/null)" || { echo "文件已不存在或不是受管历史文件"; return 1; }
+  size="$(stat -c '%s' "${target}" 2>/dev/null)" || { echo "无法读取文件大小"; return 1; }
+  identity="$(stat -c '%d:%i' "${target}" 2>/dev/null)" || { echo "无法确认目标文件身份"; return 1; }
+  if [[ "${kind}" == "current" ]]; then action="清空当前历史文件"; else action="删除轮转历史文件"; fi
+
+  echo
+  echo "操作：${action}"
+  echo "目标：${target##*/}"
+  echo "数量：1 个文件；大小：${size} 字节"
+  echo "此操作不可撤销，但不会影响普通运行日志或故障转移日志。"
+  read -rp "输入 DELETE 确认，其他输入取消: " confirm || return 1
+  [[ "${confirm}" == "DELETE" ]] || { echo "已取消"; return 0; }
+
+  if ! exec 8>"${HISTORY_LOCK_FILE}"; then
+    echo "无法打开同步锁，本次未删除"
+    return 1
+  fi
+  if ! flock -w 30 8; then
+    echo "同步任务正在运行，等待30秒后仍未取得锁；本次未删除"
+    exec 8>&-
+    return 1
+  fi
+  current_identity="$(stat -c '%d:%i' "${target}" 2>/dev/null || true)"
+  if [[ -z "${current_identity}" || "${current_identity}" != "${identity}" ]]; then
+    echo "目标文件在确认期间已轮转、替换或消失；为避免误删，本次未操作"
+    rc=1
+  elif ! delete_managed_history_file "${target}"; then
+    rc=1
+  fi
+  flock -u 8
+  exec 8>&-
+
+  if [[ "${rc}" -eq 0 ]]; then
+    echo "已完成：${action}（${target##*/}）"
+  else
+    echo "操作失败；目标文件未被报告为已删除"
+  fi
+  return "${rc}"
+}
+
+history_files_menu() {
+  local selection index file action kind size modified
+  while true; do
+    clear 2>/dev/null || true
+    line
+    color "1;36" "📂 浏览或删除每日 IP 历史文件"
+    echo
+    line
+    collect_managed_history_files
+    if [[ "${#HISTORY_FILES[@]}" -eq 0 ]]; then
+      echo "暂无受管 IP 历史文件"
+      pause_wait
+      return
+    fi
+
+    printf '%-5s %-8s %-12s %-19s %s\n' "序号" "类型" "大小(字节)" "修改时间" "文件"
+    printf '%-5s %-8s %-12s %-19s %s\n' "-----" "--------" "------------" "-------------------" "------------------------------"
+    for index in "${!HISTORY_FILES[@]}"; do
+      file="${HISTORY_FILES[${index}]}"
+      kind="$(managed_history_file_kind "${file}" 2>/dev/null)" || continue
+      size="$(stat -c '%s' "${file}" 2>/dev/null || printf '?')"
+      modified="$(stat -c '%y' "${file}" 2>/dev/null || printf '?')"
+      [[ "${kind}" == "current" ]] && kind="当前" || kind="轮转"
+      printf '%-5s %-8s %-12s %-19s %s\n' "$((index+1))" "${kind}" "${size}" "${modified:0:19}" "${file##*/}"
+    done
+    echo
+    echo "选择一个文件后，可查看其最新 200 条，或在二次确认后删除；当前文件执行安全清空。"
+    read -rp "请输入文件序号，输入 0 返回: " selection || return
+    [[ "${selection}" == "0" ]] && return
+    if [[ ! "${selection}" =~ ^[1-9][0-9]{0,2}$ ]] || (( 10#${selection} > ${#HISTORY_FILES[@]} )); then
+      echo "序号无效"
+      pause_wait
+      continue
+    fi
+    index=$((10#${selection}-1))
+    file="${HISTORY_FILES[${index}]}"
+    echo
+    echo "1. 查看此文件最新 200 条"
+    echo "2. 删除此文件（当前文件将被清空）"
+    echo "0. 返回文件列表"
+    read -rp "请选择: " action || return
+    case "${action}" in
+      1) render_single_history_file "${file}" 200; pause_wait ;;
+      2) confirm_delete_history_file "${file}"; pause_wait ;;
+      0) ;;
+      *) echo "无效选择"; pause_wait ;;
+    esac
+  done
 }
 
 history_menu() {
-  local days record_mode scope group=""
+  local days record_mode scope group="" time_choice mode_choice scope_choice limit_choice limit
 
   while true; do
     clear 2>/dev/null || true
     line
-    color "1;36" "📜 查看域名 IP 历史记录"
+    color "1;36" "📜 查看或管理域名 IP 历史记录"
     echo
     line
     echo "1. 🕒 查看最近三天的历史"
@@ -3358,9 +3671,11 @@ history_menu() {
     echo "3. 🗓️  查看最近一个月的历史"
     echo "4. ✍️  自定义时间：查看多少天前到今天的历史"
     echo "5. 🧾 查看最近半年的历史"
+    echo "6. 📂 浏览或删除每日历史文件"
     echo "0. ↩️  返回主菜单"
+    echo "提示：查询默认只显示最新 200 条，并在达到上限后停止读取旧文件。"
     line
-    if ! read -rp "请选择时间范围: " time_choice; then
+    if ! read -rp "请选择时间范围或管理功能: " time_choice; then
       return
     fi
 
@@ -3373,6 +3688,7 @@ history_menu() {
         [[ "${days}" =~ ^[0-9]+$ && "${days}" -ge 1 ]] || { echo "天数无效"; pause_wait; continue; }
         ;;
       5) days=180 ;;
+      6) history_files_menu; continue ;;
       0) return ;;
       *) echo "无效选择"; pause_wait; continue ;;
     esac
@@ -3405,9 +3721,24 @@ history_menu() {
     esac
 
     echo
-    echo "历史范围：最近 ${days} 天；记录类型：${record_mode}；查看范围：${scope}${group:+ / ${group}}"
+    echo "单次显示上限："
+    echo "1. 100 条"
+    echo "2. 200 条（默认）"
+    echo "3. 500 条"
+    echo "4. 1000 条"
+    read -rp "请选择 [1-4，回车默认 200]: " limit_choice
+    case "${limit_choice}" in
+      1) limit=100 ;;
+      ''|2) limit=200 ;;
+      3) limit=500 ;;
+      4) limit=1000 ;;
+      *) echo "无效选择"; pause_wait; continue ;;
+    esac
+
     echo
-    render_history_table "${days}" "${record_mode}" "${group}"
+    echo "历史范围：最近 ${days} 天；记录类型：${record_mode}；查看范围：${scope}${group:+ / ${group}}；上限：${limit} 条"
+    echo
+    render_history_table "${days}" "${record_mode}" "${group}" "${limit}"
     pause_wait
   done
 }
@@ -3419,7 +3750,7 @@ self_check() {
   local primary_sources overlap worst_fast worst_stable group_worst theoretical_total=0 state_group state_role state_phase state_extra
   local gp_usage_valid=0 gp_usage_invalid=0
   declare -A seen_names=() seen_targets=() seen_fo=() group_enabled_map=()
-  echo "🩺 cfdns v2.7 自检"
+  echo "🩺 cfdns v2.8 自检"
   line
   check_ok(){ printf '✅ %s\n' "$*"; }
   check_warn(){ warnings=$((warnings+1)); printf '⚠️  %s\n' "$*"; }
@@ -3430,7 +3761,7 @@ self_check() {
   for f in "${SETTINGS_FILE}" "${GROUPS_FILE}" "${FAILOVER_FILE}" "${LOG_FILE}" "${HISTORY_FILE}" "${FAILOVER_HISTORY_FILE}" "${FAILOVER_STATE_FILE}" "${GLOBALPING_USAGE_FILE}" /usr/local/bin/cfdns /usr/local/bin/cf-dns-sync.sh; do [[ -e "${f}" ]] && check_ok "文件存在：${f}" || check_fail "文件缺失：${f}"; done
   bash -n /usr/local/bin/cfdns >/dev/null 2>&1 && check_ok "管理脚本语法正常" || check_fail "管理脚本语法异常"
   bash -n /usr/local/bin/cf-dns-sync.sh >/dev/null 2>&1 && check_ok "同步脚本语法正常" || check_fail "同步脚本语法异常"
-  for cmd in curl jq dig flock logrotate zcat gzip awk sed grep comm mktemp paste cut tr date wc cmp systemctl tar install xargs stat sleep; do command -v "${cmd}" >/dev/null 2>&1 && check_ok "依赖：${cmd}" || check_fail "缺少依赖：${cmd}"; done
+  for cmd in curl jq dig flock logrotate zcat gzip tac awk sed grep comm mktemp paste cut tr date wc cmp systemctl tar install xargs stat sleep; do command -v "${cmd}" >/dev/null 2>&1 && check_ok "依赖：${cmd}" || check_fail "缺少依赖：${cmd}"; done
 
   case "${LOG_LEVEL}" in NONE|OFF|ERROR|INFO|DEBUG) check_ok "日志等级合法：${LOG_LEVEL}" ;; *) check_fail "日志等级非法：${LOG_LEVEL}" ;; esac
   [[ "${FORCE_RECONCILE_SEC}" =~ ^[0-9]+$ && "${FORCE_RECONCILE_SEC}" -ge 60 ]] && check_ok "强制校准周期：${FORCE_RECONCILE_SEC}s" || check_fail "FORCE_RECONCILE_SEC 必须>=60"
@@ -3518,12 +3849,12 @@ self_check() {
   if grep -Fq "${LOG_FILE} ${HISTORY_FILE} ${FAILOVER_HISTORY_FILE}" /etc/logrotate.d/cf-dns-sync 2>/dev/null; then check_ok "logrotate已包含三类专用日志"; else check_fail "logrotate未包含全部三类日志"; fi
   logrotate -d /etc/logrotate.d/cf-dns-sync >/dev/null 2>&1 && check_ok "logrotate配置正常" || check_fail "logrotate配置校验失败"
   [[ -f "${INSTALL_COPY}" ]] && check_ok "一键修复安装器副本存在" || check_warn "安装器副本不存在"
-  history_renderer_self_test && check_ok "IP历史渲染自测正常" || check_fail "IP历史渲染自测失败"
+  history_renderer_self_test && check_ok "IP历史有界读取与删除自测正常" || check_fail "IP历史有界读取与删除自测失败"
   runtime_log_renderer_self_test && check_ok "跨轮转运行日志读取自测正常" || check_fail "跨轮转日志读取自测失败"
 
-  local malformed_history=0 malformed_fo_history=0 raw l fields
-  raw="$(mktemp)"; collect_history_to_file "${raw}"; while IFS= read -r l; do [[ -z "${l}" ]] && continue; fields="$(awk -F '\t' '{print NF}' <<< "${l}")"; [[ "${fields}" -eq 7 ]] || malformed_history=$((malformed_history+1)); done < "${raw}"; rm -f "${raw}"
-  raw="$(mktemp)"; collect_log_family_to_file "${FAILOVER_HISTORY_FILE}" "${raw}"; while IFS= read -r l; do [[ -z "${l}" ]] && continue; fields="$(awk -F '\t' '{print NF}' <<< "${l}")"; [[ "${fields}" -eq 7 ]] || malformed_fo_history=$((malformed_fo_history+1)); done < "${raw}"; rm -f "${raw}"
+  local malformed_history=0 malformed_fo_history=0 raw
+  raw="$(mktemp)"; collect_history_to_file "${raw}"; malformed_history="$(awk -F '\t' 'NF && NF != 7 {bad++} END {print bad+0}' "${raw}")"; rm -f "${raw}"
+  raw="$(mktemp)"; collect_log_family_to_file "${FAILOVER_HISTORY_FILE}" "${raw}"; malformed_fo_history="$(awk -F '\t' 'NF && NF != 7 {bad++} END {print bad+0}' "${raw}")"; rm -f "${raw}"
   [[ "${malformed_history}" -eq 0 ]] && check_ok "IP历史字段结构正常" || check_warn "IP历史有${malformed_history}条格式异常"
   [[ "${malformed_fo_history}" -eq 0 ]] && check_ok "故障转移历史字段结构正常" || check_warn "故障转移历史有${malformed_fo_history}条格式异常"
 
@@ -3535,7 +3866,7 @@ self_check() {
 }
 
 one_key_repair() {
-  echo "🧯 cfdns v2.7 一键修复"
+  echo "🧯 cfdns v2.8 一键修复"
   line
   [[ "$(id -u)" -eq 0 ]] || { echo "请使用 root 运行"; return 1; }
 
@@ -3546,6 +3877,7 @@ one_key_repair() {
   command -v logrotate >/dev/null 2>&1 || missing+=(logrotate)
   command -v zcat >/dev/null 2>&1 || missing+=(gzip)
   command -v gzip >/dev/null 2>&1 || missing+=(gzip)
+  command -v tac >/dev/null 2>&1 || missing+=(coreutils)
   if [[ "${#missing[@]}" -gt 0 ]]; then
     echo "补装缺失依赖：${missing[*]}"
     if command -v apt-get >/dev/null 2>&1; then
@@ -3734,7 +4066,7 @@ menu() {
     echo " 24.  🔎 脚本自检（Self Check / 自检）"
     echo " 25.  🧯 一键修复（Repair / 修复）"
     echo " 26.  🕓 查看各组上次检测时间（Run State / 执行状态）"
-    echo " 27.  📜 查看域名 IP 历史记录（History / 历史记录）"
+    echo " 27.  📜 查看/删除域名 IP 历史记录（History / 历史记录）"
     echo " 28.  🧹 清理项目日志（Clean Logs / 7天或30天）"
     echo " 29.  🛠️  编辑原始配置文件（Edit Raw Files / 原始配置）"
     echo " 30.  💣 彻底卸载（Uninstall / 卸载）"
@@ -3870,7 +4202,7 @@ backup_existing() {
 
 store_installer_copy() {
   mkdir -p "${INSTALL_DIR}"
-  if [[ -f "$0" ]] && grep -q 'cfdns v2.7 installer' "$0" 2>/dev/null; then
+  if [[ -f "$0" ]] && grep -q 'cfdns v2.8 installer' "$0" 2>/dev/null; then
     if [[ -e "${INSTALL_COPY}" && "$0" -ef "${INSTALL_COPY}" ]]; then
       chmod 700 "${INSTALL_COPY}"
     else

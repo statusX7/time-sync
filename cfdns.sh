@@ -308,7 +308,11 @@ GLOBALPING_POLL_MAX_SEC="${GLOBALPING_POLL_MAX_SEC:-25}"
 [[ "${DNS_QUERY_TIMEOUT_SEC}" =~ ^[0-9]+$ ]] && (( DNS_QUERY_TIMEOUT_SEC >= 1 )) || DNS_QUERY_TIMEOUT_SEC=2
 [[ "${GLOBALPING_MAX_TESTS_PER_HOUR}" =~ ^[0-9]+$ ]] && (( GLOBALPING_MAX_TESTS_PER_HOUR >= 1 )) || GLOBALPING_MAX_TESTS_PER_HOUR=240
 [[ "${GLOBALPING_MEASUREMENT_TIMEOUT_SEC}" =~ ^[0-9]+$ ]] && (( GLOBALPING_MEASUREMENT_TIMEOUT_SEC >= 5 && GLOBALPING_MEASUREMENT_TIMEOUT_SEC <= 30 )) || GLOBALPING_MEASUREMENT_TIMEOUT_SEC=12
-[[ "${GLOBALPING_POLL_MAX_SEC}" =~ ^[0-9]+$ ]] && (( GLOBALPING_POLL_MAX_SEC >= GLOBALPING_MEASUREMENT_TIMEOUT_SEC && GLOBALPING_POLL_MAX_SEC <= 60 )) || GLOBALPING_POLL_MAX_SEC=25
+if ! [[ "${GLOBALPING_POLL_MAX_SEC}" =~ ^[0-9]+$ ]] ||
+  (( GLOBALPING_POLL_MAX_SEC < GLOBALPING_MEASUREMENT_TIMEOUT_SEC + 10 || GLOBALPING_POLL_MAX_SEC > 60 )); then
+  GLOBALPING_POLL_MAX_SEC=$((GLOBALPING_MEASUREMENT_TIMEOUT_SEC+13))
+  (( GLOBALPING_POLL_MAX_SEC <= 60 )) || GLOBALPING_POLL_MAX_SEC=60
+fi
 
 COMMAND="${1:-AUTO}"
 ARG1="${2:-}"
@@ -361,6 +365,8 @@ FAILOVER_SWITCH_MEASUREMENT_ID=""
 FAILOVER_SWITCH_ACTION="SWITCH"
 FAILOVER_PRE_SWITCH_STATE=""
 FAILOVER_PENDING_STATE=""
+FAILOVER_RECOVERY_PENDING=0
+FAILOVER_RECOVERY_GROUP=""
 
 # 自动任务不等待锁；人工同步/测试/切换最多等待30秒，避免“实际未执行却提示成功”。
 if ! exec 9>"${LOCK_FILE}"; then
@@ -443,7 +449,7 @@ valid_domain() {
 
 valid_group_name() {
   local value="${1:-}"
-  [[ -n "${value}" && "${#value}" -le 128 && "${value}" != *$'\t'* && "${value}" != *$'\r'* && "${value}" != *$'\n'* && "${value}" != *\\* ]]
+  [[ -n "${value}" && "${#value}" -le 128 && "${value}" != \#* && "${value}" != *$'\t'* && "${value}" != *$'\r'* && "${value}" != *$'\n'* && "${value}" != *\\* ]]
 }
 
 valid_ttl() {
@@ -467,7 +473,15 @@ cf_api() {
 
   local -a args=(
     -sS --connect-timeout 10 --max-time 35
-    --retry 2 --retry-delay 1
+  )
+  # 只自动重试无副作用的 GET。写请求若已被服务端接受但响应丢失，盲目重放可能创建重复记录；
+  # 下个同步周期会先重新读取 Cloudflare 实际状态，再安全决定是否需要重试写入。
+  if [[ "${method}" == "GET" ]]; then
+    args+=(--retry 2 --retry-delay 1)
+  else
+    args+=(--retry 0)
+  fi
+  args+=(
     -D "${hdr}" -o "${body}" -w '%{http_code}'
     -X "${method}" "https://api.cloudflare.com/client/v4${endpoint}"
     -H "Authorization: Bearer ${token}"
@@ -527,7 +541,14 @@ gp_api() {
   fi
   local -a args=(
     -sS --connect-timeout 10 --max-time 35
-    --retry 1 --retry-delay 1
+  )
+  # 创建 measurement 不是幂等操作；仅 GET 允许 curl 自动重试，避免一次检测被重复创建和漏记用量。
+  if [[ "${method}" == "GET" ]]; then
+    args+=(--retry 1 --retry-delay 1)
+  else
+    args+=(--retry 0)
+  fi
+  args+=(
     -D "${hdr}" -o "${body}" -w '%{http_code}'
     -X "${method}" "https://api.globalping.io/v1${endpoint}"
     -H "User-Agent: cfdns/${APP_VERSION}"
@@ -599,8 +620,8 @@ globalping_record_usage() {
 
 globalping_health_check() {
   local group="$1" role="$2" target="$3" check_type="$4" port="$5" location="$6"
-  local payload create_resp measurement_id probes_count start now resp status result_status failure_source
-  local rcv loss probe_country probe_city resolved raw budget_rc usage_tests
+  local payload create_resp create_http measurement_id probes_count start now resp status result_status failure_source
+  local rcv loss probe_country probe_city resolved raw budget_rc usage_tests uncertain_usage_recorded=0
 
   GP_CHECK_CLASS="UNKNOWN"
   GP_CHECK_DETAIL=""
@@ -635,6 +656,8 @@ globalping_health_check() {
   fi
 
   create_resp="$(gp_api POST /measurements "${payload}")"
+  create_http="$(jq -r '._http_status // 0' <<< "${create_resp}" 2>/dev/null || echo 0)"
+  [[ "${create_http}" =~ ^[0-9]+$ ]] || create_http=0
   measurement_id="$(jq -r '.id // empty' <<< "${create_resp}" 2>/dev/null || true)"
   probes_count="$(jq -r '.probesCount // 0' <<< "${create_resp}" 2>/dev/null || echo 0)"
   # API 接受后按 probesCount 记录实际 tests；字段异常时至少记 1 次，避免低估 API 消耗。
@@ -647,8 +670,20 @@ globalping_health_check() {
       return 0
     fi
   fi
+  # 传输中断、408、5xx 或无 ID 的 2xx 无法证明服务端没有创建测量；保守计入 1 次，避免本机预算低估。
+  # 明确的 4xx 拒绝（例如 400/401/403/429）不会创建测量，因此不计入。
+  if [[ -z "${measurement_id}" ]] &&
+    (( create_http == 0 || create_http == 408 || create_http >= 500 || (create_http >= 200 && create_http < 300) )); then
+    if ! globalping_record_usage 1; then
+      GP_CHECK_DETAIL="测量创建结果不确定，且本机用量记录失败；为防止预算失控，本次结果按未知处理"
+      log ERROR "组 ${group}: Globalping ${role} 检测未知：${GP_CHECK_DETAIL}"
+      return 0
+    fi
+    uncertain_usage_recorded=1
+  fi
   if [[ -z "${measurement_id}" || ! "${probes_count}" =~ ^[0-9]+$ || "${probes_count}" -lt 1 ]]; then
-    GP_CHECK_DETAIL="创建测量失败或没有可用探针，HTTP=$(jq -r '._http_status // 0' <<< "${create_resp}" 2>/dev/null || echo 0)，错误=$(jq -c '.error // .errors // {}' <<< "${create_resp}" 2>/dev/null || echo unknown)"
+    GP_CHECK_DETAIL="创建测量失败或没有可用探针，HTTP=${create_http}，错误=$(jq -c '.error // .errors // {}' <<< "${create_resp}" 2>/dev/null || echo unknown)"
+    (( uncertain_usage_recorded == 0 )) || GP_CHECK_DETAIL+="；创建结果不确定，已保守计入1次本机用量"
     log INFO "组 ${group}: Globalping ${role} 检测未知：${GP_CHECK_DETAIL}"
     return 0
   fi
@@ -848,6 +883,24 @@ load_failover_state() {
     log ERROR "组 ${group}: 活动线路状态非法=${FS_ACTIVE_ROLE:-empty}"
     return 1
   }
+  case "${FS_LAST_RESULT}" in
+    SWITCH_PENDING_PRIMARY_TO_BACKUP)
+      [[ "${FS_ACTIVE_ROLE}" == "PRIMARY" ]] || {
+        log ERROR "组 ${group}: 中断切换标记与活动线路不一致=${FS_ACTIVE_ROLE}/${FS_LAST_RESULT}"
+        return 1
+      }
+      ;;
+    SWITCH_PENDING_BACKUP_TO_PRIMARY)
+      [[ "${FS_ACTIVE_ROLE}" == "BACKUP" ]] || {
+        log ERROR "组 ${group}: 中断切换标记与活动线路不一致=${FS_ACTIVE_ROLE}/${FS_LAST_RESULT}"
+        return 1
+      }
+      ;;
+    SWITCH_PENDING_*)
+      log ERROR "组 ${group}: 中断切换标记非法=${FS_LAST_RESULT}"
+      return 1
+      ;;
+  esac
   case "${FS_PHASE}" in
     PRIMARY_STABLE|PRIMARY_FAST|BACKUP_FAST|BACKUP_STABLE) ;;
     *) log ERROR "组 ${group}: 故障转移阶段非法=${FS_PHASE:-empty}"; return 1 ;;
@@ -922,7 +975,7 @@ route_sources_ready_for_switch() {
 
 failover_switch_role() {
   local group="$1" new_role="$2" reason="$3" measurement_id="${4:-}" primary_sources="$5" backup_sources="$6"
-  local action="${7:-SWITCH}" old_role route_sources before_state
+  local action="${7:-SWITCH}" old_role route_sources before_state recovery_state
   old_role="${FS_ACTIVE_ROLE}"
   [[ "${new_role}" == "PRIMARY" || "${new_role}" == "BACKUP" ]] || return 1
   [[ "${action}" == "SWITCH" || "${action}" == "RESET" ]] || return 1
@@ -935,12 +988,22 @@ failover_switch_role() {
   # 保留本次健康检查后的旧线路状态。Cloudflare 未完整同步时必须恢复，不能把期望线路冒充为活动线路。
   FS_UPDATED="$(now_ts)"
   before_state="$(serialize_failover_state)"
-  if ! replace_failover_state_line "${group}" "${before_state}"; then
-    log ERROR "组 ${group}: 无法保存线路切换前状态，已取消切换"
-    return 1
-  fi
   if ! mark_group_sync_due "${group}"; then
     log ERROR "组 ${group}: 无法标记线路切换同步任务"
+    return 1
+  fi
+  # 在旧线路状态中留下持久恢复标记。即使 Cloudflare 已改完、进程却在最终确认前退出，
+  # 下一进程也会立即按旧线路核对，而不会被本轮已写入的运行/校准时间延迟。
+  FS_LAST_RESULT="SWITCH_PENDING_${old_role}_TO_${new_role}"
+  FS_UPDATED="$(now_ts)"
+  recovery_state="$(serialize_failover_state)"
+  if ! replace_failover_state_line "${group}" "${recovery_state}"; then
+    assign_failover_state_line "${before_state}" || true
+    log ERROR "组 ${group}: 无法保存线路切换恢复标记，已取消切换"
+    return 1
+  fi
+  if ! assign_failover_state_line "${before_state}"; then
+    log ERROR "组 ${group}: 无法恢复线路切换前内存状态，已取消切换"
     return 1
   fi
 
@@ -970,9 +1033,31 @@ failover_switch_role() {
   log INFO "组 ${group}: 已准备 ${old_role} -> ${new_role}，正在核对 Cloudflare 后再确认线路切换"
 }
 
+finalize_failover_recovery() {
+  local group="$1"
+  [[ "${FAILOVER_RECOVERY_PENDING}" -eq 1 && "${FAILOVER_RECOVERY_GROUP}" == "${group}" ]] || return 0
+  FS_LAST_RESULT="RECOVERED_INTERRUPTED_SWITCH"
+  FS_UPDATED="$(now_ts)"
+  if ! save_failover_state; then
+    mark_group_sync_due "${group}" || log ERROR "组 ${group}: 无法安排中断切换再次恢复"
+    log ERROR "组 ${group}: Cloudflare 已按持久线路恢复，但无法清除中断切换标记；下轮将继续核对"
+    return 1
+  fi
+  FAILOVER_RECOVERY_PENDING=0
+  FAILOVER_RECOVERY_GROUP=""
+  write_failover_history "${group}" RECOVER "${FS_ACTIVE_ROLE}" "${FS_ACTIVE_ROLE}" \
+    "检测到上次线路切换在最终确认前中断；已按持久线路重新核对Cloudflare" "${FS_LAST_MEASUREMENT_ID}" || \
+    log ERROR "组 ${group}: 中断切换恢复历史写入失败"
+  log INFO "组 ${group}: 已按持久线路 ${FS_ACTIVE_ROLE} 恢复上次中断的故障转移"
+  return 0
+}
+
 finalize_failover_switch() {
   local group="$1" history_failed=0
-  [[ "${FAILOVER_SWITCH_PENDING}" -eq 1 && "${FAILOVER_SWITCH_GROUP}" == "${group}" ]] || return 0
+  if [[ "${FAILOVER_SWITCH_PENDING}" -ne 1 || "${FAILOVER_SWITCH_GROUP}" != "${group}" ]]; then
+    finalize_failover_recovery "${group}"
+    return $?
+  fi
   if [[ -z "${FAILOVER_PENDING_STATE}" ]] || ! replace_failover_state_line "${group}" "${FAILOVER_PENDING_STATE}"; then
     mark_group_sync_due "${group}" || log ERROR "组 ${group}: 无法安排旧线路立即复核"
     assign_failover_state_line "${FAILOVER_PRE_SWITCH_STATE}" || true
@@ -1078,6 +1163,23 @@ failover_tick() {
   validate_failover_config "${group}" "${primary_sources}" || return 1
   [[ "${FO_ENABLED}" == true ]] || return 0
   load_failover_state "${group}" "${primary_sources}" "${FO_BACKUP_SOURCES}" || return 1
+
+  case "${FS_ACTIVE_ROLE}|${FS_LAST_RESULT}" in
+    PRIMARY\|SWITCH_PENDING_PRIMARY_TO_BACKUP|BACKUP\|SWITCH_PENDING_BACKUP_TO_PRIMARY)
+      if ! mark_group_sync_due "${group}"; then
+        log ERROR "组 ${group}: 检测到上次线路切换中断，但无法安排持久线路恢复"
+        return 1
+      fi
+      FAILOVER_RECOVERY_PENDING=1
+      FAILOVER_RECOVERY_GROUP="${group}"
+      log ERROR "组 ${group}: 检测到上次线路切换在最终确认前中断，本轮先按持久线路 ${FS_ACTIVE_ROLE} 恢复Cloudflare"
+      return 0
+      ;;
+    *\|SWITCH_PENDING_*)
+      log ERROR "组 ${group}: 中断切换恢复标记与活动线路不一致=${FS_ACTIVE_ROLE}/${FS_LAST_RESULT}"
+      return 1
+      ;;
+  esac
 
   if [[ "${FS_ACTIVE_ROLE}" == PRIMARY && "${FS_PHASE}" == BACKUP_* ]]; then FS_PHASE=PRIMARY_STABLE; state_repaired=1; fi
   if [[ "${FS_ACTIVE_ROLE}" == BACKUP && "${FS_PHASE}" == PRIMARY_* ]]; then FS_PHASE=BACKUP_FAST; state_repaired=1; fi
@@ -1530,7 +1632,7 @@ sync_one_group() {
   local target_fqdn="$6" ttl="$7" proxied="$8" mode="$9" sources_csv="${10}" active_route="${11:-PRIMARY}"
 
   if ! valid_group_name "${group_name}"; then
-    log ERROR "组名为空、过长或包含 TAB、换行、回车或反斜杠"
+    log ERROR "组名为空、过长、以#开头或包含 TAB、换行、回车或反斜杠"
     return 1
   fi
 
@@ -1820,7 +1922,7 @@ main() {
     assign_group_config_line "${row}" || { failures=$((failures+1)); continue; }
     [[ "${enabled}" == "true" ]] && enabled_count=$((enabled_count+1))
     if ! valid_group_name "${group_name}"; then
-      log ERROR "组名为空、过长或包含 TAB、换行、回车或反斜杠，已跳过该配置"
+      log ERROR "组名为空、过长、以#开头或包含 TAB、换行、回车或反斜杠，已跳过该配置"
       failures=$((failures+1)); continue
     fi
     if (( ${group_name_count["${group_name}"]:-0} > 1 )); then
@@ -1838,6 +1940,8 @@ main() {
     # 只有自动调度推进 Globalping 状态机。手动同步只核对当前活动线路，避免意外消耗测试额度。
     if [[ "${RUN_MODE}" == "AUTO" ]]; then
       FAILOVER_SWITCH_PENDING=0
+      FAILOVER_RECOVERY_PENDING=0
+      FAILOVER_RECOVERY_GROUP=""
       if ! failover_tick "${group_name}" "${enabled}" "${sources_csv}"; then
         failures=$((failures+1))
         log ERROR "组 ${group_name}: 故障转移状态机执行失败；本轮不改变线路"
@@ -2019,7 +2123,11 @@ GLOBALPING_MEASUREMENT_TIMEOUT_SEC="${GLOBALPING_MEASUREMENT_TIMEOUT_SEC:-12}"
 GLOBALPING_POLL_MAX_SEC="${GLOBALPING_POLL_MAX_SEC:-25}"
 [[ "${GLOBALPING_MAX_TESTS_PER_HOUR}" =~ ^[0-9]+$ ]] && (( GLOBALPING_MAX_TESTS_PER_HOUR >= 1 )) || GLOBALPING_MAX_TESTS_PER_HOUR=240
 [[ "${GLOBALPING_MEASUREMENT_TIMEOUT_SEC}" =~ ^[0-9]+$ ]] && (( GLOBALPING_MEASUREMENT_TIMEOUT_SEC >= 5 && GLOBALPING_MEASUREMENT_TIMEOUT_SEC <= 30 )) || GLOBALPING_MEASUREMENT_TIMEOUT_SEC=12
-[[ "${GLOBALPING_POLL_MAX_SEC}" =~ ^[0-9]+$ ]] && (( GLOBALPING_POLL_MAX_SEC >= GLOBALPING_MEASUREMENT_TIMEOUT_SEC && GLOBALPING_POLL_MAX_SEC <= 60 )) || GLOBALPING_POLL_MAX_SEC=25
+if ! [[ "${GLOBALPING_POLL_MAX_SEC}" =~ ^[0-9]+$ ]] ||
+  (( GLOBALPING_POLL_MAX_SEC < GLOBALPING_MEASUREMENT_TIMEOUT_SEC + 10 || GLOBALPING_POLL_MAX_SEC > 60 )); then
+  GLOBALPING_POLL_MAX_SEC=$((GLOBALPING_MEASUREMENT_TIMEOUT_SEC+13))
+  (( GLOBALPING_POLL_MAX_SEC <= 60 )) || GLOBALPING_POLL_MAX_SEC=60
+fi
 
 CHOSEN_INDEX=""
 CHOSEN_LINE=""
@@ -2111,7 +2219,7 @@ valid_api_token_field() {
 
 valid_group_name_field() {
   local value="${1:-}"
-  [[ -n "${value}" && "${#value}" -le 128 && "${value}" != *$'\t'* && "${value}" != *$'\r'* && "${value}" != *$'\n'* && "${value}" != *\\* ]]
+  [[ -n "${value}" && "${#value}" -le 128 && "${value}" != \#* && "${value}" != *$'\t'* && "${value}" != *$'\r'* && "${value}" != *$'\n'* && "${value}" != *\\* ]]
 }
 
 validate_sources_csv() {
@@ -2414,7 +2522,25 @@ remove_failover_state_for_group() {
 }
 
 rename_failover_group() {
-  local old="$1" new="$2" line tmp
+  local old="$1" new="$2" line tmp old_config_count new_config_count old_state_count new_state_count
+  old_config_count="$(awk -F '\t' -v g="${old}" '!/^#/ && $1==g{n++} END{print n+0}' "${FAILOVER_FILE}" 2>/dev/null)" || {
+    echo "无法读取故障转移配置，已取消组重命名" >&2
+    return 1
+  }
+  new_config_count="$(awk -F '\t' -v g="${new}" '!/^#/ && $1==g{n++} END{print n+0}' "${FAILOVER_FILE}" 2>/dev/null)" || return 1
+  old_state_count="$(awk -F '\t' -v g="${old}" '$1==g{n++} END{print n+0}' "${FAILOVER_STATE_FILE}" 2>/dev/null)" || {
+    echo "无法读取故障转移状态，已取消组重命名" >&2
+    return 1
+  }
+  new_state_count="$(awk -F '\t' -v g="${new}" '$1==g{n++} END{print n+0}' "${FAILOVER_STATE_FILE}" 2>/dev/null)" || return 1
+  if (( old_config_count > 1 || old_state_count > 1 )); then
+    echo "旧组 ${old} 存在重复故障转移配置或状态；为避免扩大损坏，已取消重命名" >&2
+    return 1
+  fi
+  if [[ "${old}" != "${new}" ]] && (( new_config_count > 0 || new_state_count > 0 )); then
+    echo "新组名 ${new} 已被孤立故障转移配置或状态占用；请先运行菜单24自检并清理" >&2
+    return 1
+  fi
   line="$(get_failover_line_by_group "${old}")"
   if [[ -n "${line}" ]]; then
     load_failover_config_ui "${old}" || return 1
@@ -2471,6 +2597,11 @@ load_failover_state_ui() {
     FS_LAST_MEASUREMENT_ID=""; FS_LAST_SWITCH=0; FS_UPDATED=0; FS_EXTRA=""
   fi
   if [[ "${FS_ACTIVE_ROLE}" != PRIMARY && "${FS_ACTIVE_ROLE}" != BACKUP ]]; then FS_EXTRA="invalid"; fi
+  case "${FS_LAST_RESULT}" in
+    SWITCH_PENDING_PRIMARY_TO_BACKUP) [[ "${FS_ACTIVE_ROLE}" == PRIMARY ]] || FS_EXTRA="invalid" ;;
+    SWITCH_PENDING_BACKUP_TO_PRIMARY) [[ "${FS_ACTIVE_ROLE}" == BACKUP ]] || FS_EXTRA="invalid" ;;
+    SWITCH_PENDING_*) FS_EXTRA="invalid" ;;
+  esac
   case "${FS_PHASE}" in PRIMARY_STABLE|PRIMARY_FAST|BACKUP_FAST|BACKUP_STABLE) ;; *) FS_EXTRA="invalid" ;; esac
   for _v in FS_PRIMARY_FAILS FS_BACKUP_SUCCESSES FS_PRIMARY_SUCCESSES FS_LAST_PRIMARY_CHECK FS_LAST_BACKUP_CHECK FS_LAST_SWITCH FS_UPDATED; do
     [[ "${!_v:-}" =~ ^[0-9]+$ ]] || FS_EXTRA="invalid"
@@ -3226,7 +3357,7 @@ quick_add_first_group() {
   color "1;33" "🧱 创建第一个组"
   echo
   read -rp "组名（例如 group-a）: " group_name || return
-  valid_group_name_field "${group_name}" || { echo "组名不能为空、不能超过128字符，且不能包含 TAB、换行或反斜杠"; return; }
+  valid_group_name_field "${group_name}" || { echo "组名不能为空、不能超过128字符、不能以#开头，且不能包含 TAB、换行或反斜杠"; return; }
   if awk -F '	' -v g="${group_name}" '!/^#/ && $1==g{found=1} END{exit !found}' "${GROUPS_FILE}"; then
     echo "组名已存在"; return
   fi
@@ -3336,7 +3467,7 @@ add_group() {
   color "1;33" "➕ 新增组（公开脚本模式）"
   echo
   read -rp "请输入组名（例如 group-a）: " group_name || return
-  valid_group_name_field "${group_name}" || { echo "组名不能为空、不能超过128字符，且不能包含 TAB、换行或反斜杠"; return; }
+  valid_group_name_field "${group_name}" || { echo "组名不能为空、不能超过128字符、不能以#开头，且不能包含 TAB、换行或反斜杠"; return; }
   if awk -F '	' -v g="${group_name}" '!/^#/ && $1==g{found=1} END{exit !found}' "${GROUPS_FILE}"; then echo "组名已存在"; return; fi
 
   echo "是否启用该组："
@@ -3562,7 +3693,7 @@ edit_group_basic() {
   echo "当前组名: ${GROUP_NAME}"
   read -rp "新组名（回车保持）: " new_group_name || return
   [[ -z "${new_group_name}" ]] || GROUP_NAME="${new_group_name}"
-  valid_group_name_field "${GROUP_NAME}" || { echo "组名不能为空、不能超过128字符，且不能包含 TAB、换行或反斜杠"; return; }
+  valid_group_name_field "${GROUP_NAME}" || { echo "组名不能为空、不能超过128字符、不能以#开头，且不能包含 TAB、换行或反斜杠"; return; }
   if [[ "${GROUP_NAME}" != "${old_group_name}" ]] && awk -F '\t' -v g="${GROUP_NAME}" '!/^#/ && $1==g{found=1} END{exit !found}' "${GROUPS_FILE}"; then
     echo "新组名已经存在"; return
   fi
@@ -4623,7 +4754,7 @@ self_check() {
   local errors=0 warnings=0 group_count=0 enabled_count=0 failover_count=0 failover_enabled_count=0
   local line_no=0 row field_count name enabled interval token zone target ttl proxied mode sources_csv src_count key source_domain
   local fo_group fo_enabled fo_backup fo_ptarget fo_btarget fo_type fo_port fo_location fo_stable fo_fast fo_pf fo_bs fo_pr
-  local primary_sources overlap worst_fast worst_stable group_worst theoretical_total=0 state_group state_role state_phase state_index
+  local primary_sources overlap worst_fast worst_stable group_worst theoretical_total=0 state_group state_role state_phase state_result state_index
   local gp_usage_valid=0 gp_usage_invalid=0 gp_usage_summary
   declare -A seen_names=() seen_targets=() seen_fo=() seen_state=() group_enabled_map=()
   echo "🩺 cfdns v${APP_VERSION} 自检"
@@ -4739,11 +4870,16 @@ self_check() {
     split_tsv_line "${row}"
     field_count="${#TSV_FIELDS[@]}"
     if (( field_count != 12 )); then check_fail "failover-state.tsv 字段数量应为12，实际=${field_count}"; continue; fi
-    state_group="${TSV_FIELDS[0]}"; state_role="${TSV_FIELDS[1]}"; state_phase="${TSV_FIELDS[2]}"
+    state_group="${TSV_FIELDS[0]}"; state_role="${TSV_FIELDS[1]}"; state_phase="${TSV_FIELDS[2]}"; state_result="${TSV_FIELDS[8]}"
     [[ -n "${state_group}" ]] || { check_fail "failover-state.tsv 组名为空"; continue; }
     if [[ -n "${seen_state["${state_group}"]+x}" ]]; then check_fail "故障转移状态重复：${state_group}"; else seen_state["${state_group}"]=1; fi
     [[ -n "${seen_names["${state_group}"]+x}" ]] || check_warn "发现孤立故障转移状态：${state_group}"
     [[ "${state_role}" == PRIMARY || "${state_role}" == BACKUP ]] || check_fail "组 ${state_group}: 活动线路状态非法"
+    case "${state_result}" in
+      SWITCH_PENDING_PRIMARY_TO_BACKUP) [[ "${state_role}" == PRIMARY ]] || check_fail "组 ${state_group}: 中断切换标记与活动线路不一致" ;;
+      SWITCH_PENDING_BACKUP_TO_PRIMARY) [[ "${state_role}" == BACKUP ]] || check_fail "组 ${state_group}: 中断切换标记与活动线路不一致" ;;
+      SWITCH_PENDING_*) check_fail "组 ${state_group}: 中断切换标记非法=${state_result}" ;;
+    esac
     case "${state_phase}" in PRIMARY_STABLE|PRIMARY_FAST|BACKUP_FAST|BACKUP_STABLE) ;; *) check_fail "组 ${state_group}: 故障转移阶段非法=${state_phase}" ;; esac
     for state_index in 3 4 5 6 7 10 11; do
       [[ "${TSV_FIELDS[${state_index}]}" =~ ^[0-9]+$ ]] || check_fail "组 ${state_group}: 故障转移状态第$((state_index+1))字段应为非负整数"

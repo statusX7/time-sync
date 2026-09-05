@@ -360,6 +360,7 @@ FAILOVER_SWITCH_REASON=""
 FAILOVER_SWITCH_MEASUREMENT_ID=""
 FAILOVER_SWITCH_ACTION="SWITCH"
 FAILOVER_PRE_SWITCH_STATE=""
+FAILOVER_PENDING_STATE=""
 
 # 自动任务不等待锁；人工同步/测试/切换最多等待30秒，避免“实际未执行却提示成功”。
 if ! exec 9>"${LOCK_FILE}"; then
@@ -663,7 +664,8 @@ globalping_health_check() {
       return 0
     fi
     status="$(jq -r '.status // empty' <<< "${resp}" 2>/dev/null || true)"
-    [[ "${status}" == "finished" ]] && break
+    # 官方协议约定除 in-progress 外均为终态；未知终态交给下方保守分类，避免无意义等待到超时。
+    [[ "${status}" != "in-progress" ]] && break
     now="$(now_ts)"
     if (( now - start >= GLOBALPING_POLL_MAX_SEC )); then
       GP_CHECK_DETAIL="测量等待超过 ${GLOBALPING_POLL_MAX_SEC}s"
@@ -711,12 +713,15 @@ globalping_health_check() {
   elif [[ "${result_status}" == "finished" && "${rcv}" -gt 0 ]]; then
     GP_CHECK_CLASS="SUCCESS"
     GP_CHECK_DETAIL="探针=${GP_PROBE:-unknown}，解析=${resolved:-unknown}，接收=${rcv}/3，丢包=${loss}%"
-  elif [[ "${result_status}" == "failed" && "${failure_source}" == "internal" ]] || [[ "${result_status}" == "offline" ]]; then
+  elif [[ "${result_status}" == "failed" && "${failure_source}" == "target" ]]; then
+    GP_CHECK_CLASS="FAILURE"
+    GP_CHECK_DETAIL="探针=${GP_PROBE:-unknown}，status=${result_status}，failureSource=target，接收=${rcv}/3，${raw}"
+  elif [[ "${result_status}" == "failed" ]] || [[ "${result_status}" == "offline" ]]; then
     GP_CHECK_CLASS="UNKNOWN"
     GP_CHECK_DETAIL="探针/平台异常，status=${result_status:-unknown}，failureSource=${failure_source:-unknown}，${raw}"
-  elif [[ "${result_status}" == "failed" || ( "${result_status}" == "finished" && "${rcv}" -eq 0 ) ]]; then
+  elif [[ "${result_status}" == "finished" && "${rcv}" -eq 0 ]]; then
     GP_CHECK_CLASS="FAILURE"
-    GP_CHECK_DETAIL="探针=${GP_PROBE:-unknown}，status=${result_status:-unknown}，failureSource=${failure_source:-target}，接收=${rcv}/3，${raw}"
+    GP_CHECK_DETAIL="探针=${GP_PROBE:-unknown}，status=${result_status}，failureSource=target，接收=${rcv}/3，${raw}"
   else
     GP_CHECK_CLASS="UNKNOWN"
     GP_CHECK_DETAIL="无法识别的结果状态=${result_status:-empty}，${raw}"
@@ -733,18 +738,19 @@ load_failover_config() {
   local group="$1" line count
   count="$(awk -F '\t' -v g="${group}" '!/^#/ && $1==g{n++} END{print n+0}' "${FAILOVER_FILE}" 2>/dev/null)" || {
     log ERROR "组 ${group}: 无法读取 failover.tsv"
-    return 1
+    return 2
   }
-  [[ "${count}" -eq 1 ]] || {
-    [[ "${count}" -gt 1 ]] && log ERROR "组 ${group}: failover.tsv 存在重复配置，已停止故障转移"
-    return 1
-  }
+  (( count == 0 )) && return 1
+  if (( count > 1 )); then
+    log ERROR "组 ${group}: failover.tsv 存在重复配置，已停止故障转移"
+    return 2
+  fi
   line="$(get_failover_config_line "${group}")"
-  [[ -n "${line}" ]] || return 1
+  [[ -n "${line}" ]] || { log ERROR "组 ${group}: failover.tsv 读取结果与计数不一致"; return 2; }
   split_tsv_line "${line}"
   if (( ${#TSV_FIELDS[@]} != 13 )); then
     log ERROR "组 ${group}: failover.tsv 字段数量应为13，实际=${#TSV_FIELDS[@]}"
-    return 1
+    return 2
   fi
   FO_GROUP="${TSV_FIELDS[0]}"; FO_ENABLED="${TSV_FIELDS[1]}"; FO_BACKUP_SOURCES="${TSV_FIELDS[2]}"
   FO_PRIMARY_TARGET="${TSV_FIELDS[3]}"; FO_BACKUP_TARGET="${TSV_FIELDS[4]}"; FO_CHECK_TYPE="${TSV_FIELDS[5]}"
@@ -929,6 +935,10 @@ failover_switch_role() {
   # 保留本次健康检查后的旧线路状态。Cloudflare 未完整同步时必须恢复，不能把期望线路冒充为活动线路。
   FS_UPDATED="$(now_ts)"
   before_state="$(serialize_failover_state)"
+  if ! replace_failover_state_line "${group}" "${before_state}"; then
+    log ERROR "组 ${group}: 无法保存线路切换前状态，已取消切换"
+    return 1
+  fi
   if ! mark_group_sync_due "${group}"; then
     log ERROR "组 ${group}: 无法标记线路切换同步任务"
     return 1
@@ -947,12 +957,6 @@ failover_switch_role() {
     FS_PHASE="PRIMARY_STABLE"
     FS_LAST_PRIMARY_CHECK="$(now_ts)"
   fi
-  if ! save_failover_state; then
-    assign_failover_state_line "${before_state}" || true
-    log ERROR "组 ${group}: 无法暂存线路切换状态"
-    return 1
-  fi
-
   FAILOVER_SWITCH_PENDING=1
   FAILOVER_SWITCH_GROUP="${group}"
   FAILOVER_SWITCH_OLD_ROLE="${old_role}"
@@ -961,19 +965,35 @@ failover_switch_role() {
   FAILOVER_SWITCH_MEASUREMENT_ID="${measurement_id}"
   FAILOVER_SWITCH_ACTION="${action}"
   FAILOVER_PRE_SWITCH_STATE="${before_state}"
+  FS_UPDATED="$(now_ts)"
+  FAILOVER_PENDING_STATE="$(serialize_failover_state)"
   log INFO "组 ${group}: 已准备 ${old_role} -> ${new_role}，正在核对 Cloudflare 后再确认线路切换"
 }
 
 finalize_failover_switch() {
   local group="$1" history_failed=0
   [[ "${FAILOVER_SWITCH_PENDING}" -eq 1 && "${FAILOVER_SWITCH_GROUP}" == "${group}" ]] || return 0
+  if [[ -z "${FAILOVER_PENDING_STATE}" ]] || ! replace_failover_state_line "${group}" "${FAILOVER_PENDING_STATE}"; then
+    mark_group_sync_due "${group}" || log ERROR "组 ${group}: 无法安排旧线路立即复核"
+    assign_failover_state_line "${FAILOVER_PRE_SWITCH_STATE}" || true
+    FAILOVER_SWITCH_PENDING=0
+    FAILOVER_PENDING_STATE=""
+    log ERROR "组 ${group}: Cloudflare 已同步新线路，但本地确认状态保存失败；持久状态仍保留旧线路并已安排立即复核"
+    return 1
+  fi
+  if ! assign_failover_state_line "${FAILOVER_PENDING_STATE}"; then
+    log ERROR "组 ${group}: 新线路状态已保存但内存状态无法恢复；请运行自检"
+    FAILOVER_SWITCH_PENDING=0
+    return 1
+  fi
+  FAILOVER_SWITCH_PENDING=0
+  FAILOVER_PENDING_STATE=""
   if ! write_failover_history "${group}" "${FAILOVER_SWITCH_ACTION}" "${FAILOVER_SWITCH_OLD_ROLE}" "${FAILOVER_SWITCH_NEW_ROLE}" \
     "${FAILOVER_SWITCH_REASON}" "${FAILOVER_SWITCH_MEASUREMENT_ID}"; then
     history_failed=1
     log ERROR "组 ${group}: 线路已同步，但故障转移历史写入失败"
   fi
   log INFO "组 ${group}: Cloudflare 已核对，故障转移 ${FAILOVER_SWITCH_OLD_ROLE} -> ${FAILOVER_SWITCH_NEW_ROLE}，原因：${FAILOVER_SWITCH_REASON}"
-  FAILOVER_SWITCH_PENDING=0
   (( history_failed == 0 ))
 }
 
@@ -994,6 +1014,7 @@ rollback_failover_switch() {
     log ERROR "组 ${group}: Cloudflare 未完整同步，已恢复线路 ${FAILOVER_SWITCH_OLD_ROLE}"
   fi
   FAILOVER_SWITCH_PENDING=0
+  FAILOVER_PENDING_STATE=""
   (( rollback_failed == 0 ))
 }
 
@@ -1010,26 +1031,50 @@ failover_record_check() {
   if [[ "${role}" == "PRIMARY" ]]; then FS_LAST_PRIMARY_CHECK="$(now_ts)"; else FS_LAST_BACKUP_CHECK="$(now_ts)"; fi
   FS_LAST_RESULT="${role}_${GP_CHECK_CLASS}"
   FS_LAST_MEASUREMENT_ID="${GP_MEASUREMENT_ID}"
-  write_failover_history "${FS_GROUP}" CHECK "${role}" "${role}" "${GP_CHECK_CLASS}: ${GP_CHECK_DETAIL}" "${GP_MEASUREMENT_ID}"
+  write_failover_history "${FS_GROUP}" CHECK "${role}" "${role}" "${GP_CHECK_CLASS}: ${GP_CHECK_DETAIL}" "${GP_MEASUREMENT_ID}" || \
+    log ERROR "组 ${FS_GROUP}: Globalping ${role} 检测历史写入失败"
 }
 
 switch_primary_to_backup_after_failures() {
   local group="$1" primary_sources="$2" backup_sources="$3" switch_rc
+  # 切换前先从同一地区明确验证 BACKUP；平台/解析器异常或目标失败都不能触发盲切换。
+  globalping_health_check "${group}" BACKUP "${FO_BACKUP_TARGET}" "${FO_CHECK_TYPE}" "${FO_PORT}" "${FO_LOCATION}"
+  failover_record_check BACKUP
+  if [[ "${GP_CHECK_CLASS}" != "SUCCESS" ]]; then
+    FS_PHASE="PRIMARY_FAST"
+    FS_PRIMARY_FAILS="${FO_PRIMARY_FAIL_THRESHOLD}"
+    write_failover_history "${group}" BLOCKED PRIMARY BACKUP \
+      "PRIMARY已达失败阈值；BACKUP预切换检测=${GP_CHECK_CLASS}: ${GP_CHECK_DETAIL}" "${GP_MEASUREMENT_ID}" || \
+      log ERROR "组 ${group}: BACKUP 预切换阻止记录写入失败"
+    log ERROR "组 ${group}: PRIMARY已达失败阈值，但BACKUP预切换检测=${GP_CHECK_CLASS}，保持PRIMARY并按快速周期重试"
+    save_failover_state
+    return $?
+  fi
+  # 即使后续本机源检查或 Cloudflare 同步失败，也应按快速周期重试已确认故障的 PRIMARY。
+  FS_PHASE="PRIMARY_FAST"
+  FS_PRIMARY_FAILS="${FO_PRIMARY_FAIL_THRESHOLD}"
   if failover_switch_role "${group}" BACKUP "PRIMARY连续失败${FS_PRIMARY_FAILS}次" "${GP_MEASUREMENT_ID}" "${primary_sources}" "${backup_sources}"; then
     return 0
   else
     switch_rc=$?
   fi
   # 被阻止或暂存失败时仍保存本次检查时间，避免5秒基础调度反复消耗 Globalping 额度。
+  FS_PHASE="PRIMARY_FAST"
   FS_PRIMARY_FAILS="${FO_PRIMARY_FAIL_THRESHOLD}"
   save_failover_state || return 1
   return "${switch_rc}"
 }
 
 failover_tick() {
-  local group="$1" group_enabled="$2" primary_sources="$3" state_repaired=0
+  local group="$1" group_enabled="$2" primary_sources="$3" state_repaired=0 config_rc
   [[ "${group_enabled}" == true ]] || return 0
-  load_failover_config "${group}" || return 0
+  load_failover_config "${group}"
+  config_rc=$?
+  case "${config_rc}" in
+    0) ;;
+    1) return 0 ;;
+    *) return "${config_rc}" ;;
+  esac
   validate_failover_config "${group}" "${primary_sources}" || return 1
   [[ "${FO_ENABLED}" == true ]] || return 0
   load_failover_state "${group}" "${primary_sources}" "${FO_BACKUP_SOURCES}" || return 1
@@ -1090,6 +1135,29 @@ failover_tick() {
         FAILURE) FS_BACKUP_SUCCESSES=0; log ERROR "组 ${group}: 当前活动BACKUP检测失败，保持BACKUP并继续快速检测" ;;
         UNKNOWN) log INFO "组 ${group}: BACKUP检测结果未知，不累计成功/失败：${GP_CHECK_DETAIL}" ;;
       esac
+      # BACKUP 长期失败时仍按稳定周期检查 PRIMARY，避免 PRIMARY 已恢复却永久滞留在坏线路。
+      if [[ "${FS_PHASE}" == "BACKUP_FAST" ]] && failover_due "${FS_LAST_PRIMARY_CHECK}" "${FO_STABLE_INTERVAL}"; then
+        globalping_health_check "${group}" PRIMARY "${FO_PRIMARY_TARGET}" "${FO_CHECK_TYPE}" "${FO_PORT}" "${FO_LOCATION}"
+        failover_record_check PRIMARY
+        case "${GP_CHECK_CLASS}" in
+          SUCCESS)
+            FS_PRIMARY_SUCCESSES=$((FS_PRIMARY_SUCCESSES+1))
+            log INFO "组 ${group}: BACKUP快速验证期间PRIMARY恢复成功 ${FS_PRIMARY_SUCCESSES}/${FO_PRIMARY_RECOVERY_THRESHOLD}"
+            if (( FS_PRIMARY_SUCCESSES >= FO_PRIMARY_RECOVERY_THRESHOLD )); then
+              if failover_switch_role "${group}" PRIMARY "BACKUP未稳定期间PRIMARY连续成功${FS_PRIMARY_SUCCESSES}次" "${GP_MEASUREMENT_ID}" "${primary_sources}" "${FO_BACKUP_SOURCES}"; then
+                return 0
+              else
+                local switch_rc=$?
+                FS_PRIMARY_SUCCESSES="${FO_PRIMARY_RECOVERY_THRESHOLD}"
+                save_failover_state || return 1
+                return "${switch_rc}"
+              fi
+            fi
+            ;;
+          FAILURE) FS_PRIMARY_SUCCESSES=0; log INFO "组 ${group}: BACKUP快速验证期间PRIMARY尚未恢复" ;;
+          UNKNOWN) log INFO "组 ${group}: BACKUP快速验证期间PRIMARY结果未知，不改变连续成功计数" ;;
+        esac
+      fi
       save_failover_state
       ;;
     BACKUP_STABLE)
@@ -1135,13 +1203,26 @@ failover_tick() {
 }
 
 get_effective_group_sources() {
-  local group="$1" primary_sources="$2"
+  local group="$1" primary_sources="$2" config_rc
   EFFECTIVE_ROUTE="PRIMARY"
   EFFECTIVE_SOURCES_CSV="${primary_sources}"
-  load_failover_config "${group}" || return 0
+  load_failover_config "${group}"
+  config_rc=$?
+  case "${config_rc}" in
+    0) ;;
+    1) return 0 ;;
+    *) return "${config_rc}" ;;
+  esac
   [[ "${FO_ENABLED}" == "true" ]] || return 0
   validate_failover_config "${group}" "${primary_sources}" || return 1
-  load_failover_state "${group}" "${primary_sources}" "${FO_BACKUP_SOURCES}" || return 1
+  if [[ "${FAILOVER_SWITCH_PENDING}" -eq 1 && "${FAILOVER_SWITCH_GROUP}" == "${group}" ]]; then
+    if [[ -z "${FAILOVER_PENDING_STATE}" ]] || ! assign_failover_state_line "${FAILOVER_PENDING_STATE}"; then
+      log ERROR "组 ${group}: 待确认线路状态缺失或损坏"
+      return 1
+    fi
+  else
+    load_failover_state "${group}" "${primary_sources}" "${FO_BACKUP_SOURCES}" || return 1
+  fi
   if [[ "${FS_ACTIVE_ROLE}" == "BACKUP" ]]; then
     EFFECTIVE_ROUTE="BACKUP"
     EFFECTIVE_SOURCES_CSV="${FO_BACKUP_SOURCES}"
@@ -1150,7 +1231,19 @@ get_effective_group_sources() {
 }
 
 find_group_record() {
-  local wanted="$1"
+  local wanted="$1" count
+  count="$(awk -F '\t' -v g="${wanted}" '!/^#/ && $1==g{n++} END{print n+0}' "${GROUPS_FILE}" 2>/dev/null)" || {
+    log ERROR "无法读取 groups.tsv"
+    return 1
+  }
+  if (( count == 0 )); then
+    log ERROR "未找到组：${wanted}"
+    return 1
+  fi
+  if (( count > 1 )); then
+    log ERROR "组 ${wanted}: groups.tsv 存在重复配置，已拒绝人工故障转移操作"
+    return 1
+  fi
   awk -F '\t' -v g="${wanted}" '!/^#/ && $1==g{print; exit}' "${GROUPS_FILE}"
 }
 
@@ -1162,11 +1255,15 @@ parse_group_record_for_failover() {
 }
 
 manual_globalping_test() {
-  local group="$1" role="$2" row target
-  row="$(find_group_record "${group}")"
-  [[ -n "${row}" ]] || { log ERROR "未找到组：${group}"; return 1; }
+  local group="$1" role="$2" row target config_rc
+  row="$(find_group_record "${group}")" || return 1
   parse_group_record_for_failover "${row}" || { log ERROR "组 ${group}: groups.tsv 字段数量不是10"; return 1; }
-  load_failover_config "${group}" || { log ERROR "组 ${group} 尚未配置故障转移"; return 1; }
+  load_failover_config "${group}"
+  config_rc=$?
+  if (( config_rc != 0 )); then
+    (( config_rc != 1 )) || log ERROR "组 ${group} 尚未配置故障转移"
+    return 1
+  fi
   validate_failover_config "${group}" "${MG_PRIMARY_SOURCES}" || return 1
   case "${role}" in
     PRIMARY) target="${FO_PRIMARY_TARGET}" ;;
@@ -1180,12 +1277,16 @@ manual_globalping_test() {
 }
 
 manual_failover_switch() {
-  local group="$1" role="$2" row
-  row="$(find_group_record "${group}")"
-  [[ -n "${row}" ]] || { log ERROR "未找到组：${group}"; return 1; }
+  local group="$1" role="$2" row config_rc
+  row="$(find_group_record "${group}")" || return 1
   parse_group_record_for_failover "${row}" || { log ERROR "组 ${group}: groups.tsv 字段数量不是10"; return 1; }
   [[ "${MG_ENABLED}" == "true" ]] || { log ERROR "组 ${group} 已禁用"; return 1; }
-  load_failover_config "${group}" || { log ERROR "组 ${group} 尚未配置故障转移"; return 1; }
+  load_failover_config "${group}"
+  config_rc=$?
+  if (( config_rc != 0 )); then
+    (( config_rc != 1 )) || log ERROR "组 ${group} 尚未配置故障转移"
+    return 1
+  fi
   [[ "${FO_ENABLED}" == "true" ]] || { log ERROR "组 ${group} 故障转移已禁用"; return 1; }
   validate_failover_config "${group}" "${MG_PRIMARY_SOURCES}" || return 1
   load_failover_state "${group}" "${MG_PRIMARY_SOURCES}" "${FO_BACKUP_SOURCES}" || return 1
@@ -1199,11 +1300,15 @@ manual_failover_switch() {
 }
 
 manual_failover_reset() {
-  local group="$1" row
-  row="$(find_group_record "${group}")"
-  [[ -n "${row}" ]] || { log ERROR "未找到组：${group}"; return 1; }
+  local group="$1" row config_rc
+  row="$(find_group_record "${group}")" || return 1
   parse_group_record_for_failover "${row}" || { log ERROR "组 ${group}: groups.tsv 字段数量不是10"; return 1; }
-  load_failover_config "${group}" || { log ERROR "组 ${group} 尚未配置故障转移"; return 1; }
+  load_failover_config "${group}"
+  config_rc=$?
+  if (( config_rc != 0 )); then
+    (( config_rc != 1 )) || log ERROR "组 ${group} 尚未配置故障转移"
+    return 1
+  fi
   validate_failover_config "${group}" "${MG_PRIMARY_SOURCES}" || return 1
   load_failover_state "${group}" "${MG_PRIMARY_SOURCES}" "${FO_BACKUP_SOURCES}" || return 1
   local old="${FS_ACTIVE_ROLE}"
@@ -1932,10 +2037,9 @@ line() {
 title() {
   clear 2>/dev/null || true
   line
-  color "1;36" "cfdns 管理菜单 v${APP_VERSION}"
+  color "1;36" "                          🚀 cfdns 管理菜单 v${APP_VERSION}"
   echo
-  color "0;37" "本机检测 · Globalping 故障转移 · 安全 DNS 联动"
-  echo
+  color "0;37" "  5秒本机检测 / Globalping中国节点故障转移 / 安全DNS联动 / 自检修复"
   line
 }
 
@@ -2131,25 +2235,24 @@ find_duplicate_target() {
 }
 
 list_groups_table() {
-  local i=0 row group_name enabled interval_sec target_fqdn ttl proxied mode sources_csv count enabled_text proxy_text
+  printf '%-4s %-14s %-8s %-10s %-28s %-10s %-8s %-10s %-6s\n' "序号" "组名" "启用" "周期(s)" "目标域名" "模式" "TTL" "Proxy" "源数"
+  printf '%-4s %-14s %-8s %-10s %-28s %-10s %-8s %-10s %-6s\n' "----" "--------------" "--------" "----------" "----------------------------" "----------" "--------" "----------" "------"
+
+  local i=0 row group_name enabled interval_sec target_fqdn ttl proxied mode sources_csv count
   while IFS= read -r row || [[ -n "${row}" ]]; do
     [[ -z "${row}" || "${row}" =~ ^# ]] && continue
     i=$((i+1))
     split_tsv_line "${row}"
     if (( ${#TSV_FIELDS[@]} != 10 )); then
-      printf '[%d] 配置损坏（字段应为10，实际为%d；请运行菜单24自检）\n\n' "${i}" "${#TSV_FIELDS[@]}"
+      printf '%-4s %-14s %-8s %-10s %-28s %-10s %-8s %-10s %-6s\n' "${i}" "配置损坏" "-" "-" "字段应为10/实际${#TSV_FIELDS[@]}" "-" "-" "-" "-"
       continue
     fi
     group_name="${TSV_FIELDS[0]}"; enabled="${TSV_FIELDS[1]}"; interval_sec="${TSV_FIELDS[2]}"
     target_fqdn="${TSV_FIELDS[5]}"; ttl="${TSV_FIELDS[6]}"; proxied="${TSV_FIELDS[7]}"
     mode="${TSV_FIELDS[8]}"; sources_csv="${TSV_FIELDS[9]}"
     count="$(count_sources_csv "${sources_csv}")"
-    [[ "${enabled}" == true ]] && enabled_text="启用" || enabled_text="禁用"
-    [[ "${proxied}" == true ]] && proxy_text="开启" || proxy_text="关闭"
-    printf '[%d] %s\n' "${i}" "${group_name}"
-    printf '    状态：%s  周期：%s 秒  模式：%s\n' "${enabled_text}" "${interval_sec}" "${mode}"
-    printf '    目标：%s\n' "${target_fqdn}"
-    printf '    TTL：%s  Cloudflare 代理：%s  源域名：%s 个\n\n' "${ttl}" "${proxy_text}" "${count}"
+    printf '%-4s %-14s %-8s %-10s %-28s %-10s %-8s %-10s %-6s\n' \
+      "${i}" "${group_name}" "${enabled}" "${interval_sec}" "${target_fqdn}" "${mode}" "${ttl}" "${proxied}" "${count}"
   done < "${GROUPS_FILE}"
 
   [[ "${i}" -eq 0 ]] && echo "当前还没有任何组。"
@@ -2235,11 +2338,27 @@ get_failover_line_by_group() {
 }
 
 load_failover_config_ui() {
-  local group="$1" line
+  local group="$1" line count
+  FAILOVER_UI_LOAD_ERROR=""
+  count="$(awk -F '\t' -v g="${group}" '!/^#/ && $1==g{n++} END{print n+0}' "${FAILOVER_FILE}" 2>/dev/null)" || {
+    FAILOVER_UI_LOAD_ERROR="无法读取 failover.tsv"
+    return 2
+  }
+  if (( count == 0 )); then
+    FAILOVER_UI_LOAD_ERROR="该组尚未配置故障转移"
+    return 1
+  fi
+  if (( count > 1 )); then
+    FAILOVER_UI_LOAD_ERROR="组 ${group} 存在重复故障转移配置；请先运行菜单24自检并修正原始配置"
+    return 2
+  fi
   line="$(get_failover_line_by_group "${group}")"
-  [[ -n "${line}" ]] || return 1
+  [[ -n "${line}" ]] || { FAILOVER_UI_LOAD_ERROR="failover.tsv 读取结果与计数不一致"; return 2; }
   split_tsv_line "${line}"
-  (( ${#TSV_FIELDS[@]} == 13 )) || return 1
+  if (( ${#TSV_FIELDS[@]} != 13 )); then
+    FAILOVER_UI_LOAD_ERROR="组 ${group} 的故障转移配置字段应为13，实际为${#TSV_FIELDS[@]}；请运行菜单24自检"
+    return 2
+  fi
   FO_GROUP="${TSV_FIELDS[0]}"; FO_ENABLED="${TSV_FIELDS[1]}"; FO_BACKUP_SOURCES="${TSV_FIELDS[2]}"
   FO_PRIMARY_TARGET="${TSV_FIELDS[3]}"; FO_BACKUP_TARGET="${TSV_FIELDS[4]}"; FO_CHECK_TYPE="${TSV_FIELDS[5]}"
   FO_PORT="${TSV_FIELDS[6]}"; FO_LOCATION="${TSV_FIELDS[7]}"; FO_STABLE_INTERVAL="${TSV_FIELDS[8]}"
@@ -2327,7 +2446,16 @@ mark_group_sync_due_ui() {
 }
 
 load_failover_state_ui() {
-  local group="$1" line
+  local group="$1" line count _v
+  count="$(awk -F '\t' -v g="${group}" '$1==g{n++} END{print n+0}' "${FAILOVER_STATE_FILE}" 2>/dev/null)" || count=-1
+  if (( count < 0 || count > 1 )); then
+    FS_GROUP="${group}"; FS_ACTIVE_ROLE="INVALID"
+    if (( count > 1 )); then FS_PHASE="STATE_DUPLICATE"; else FS_PHASE="STATE_READ_ERROR"; fi
+    FS_PRIMARY_FAILS=0; FS_BACKUP_SUCCESSES=0; FS_PRIMARY_SUCCESSES=0
+    FS_LAST_PRIMARY_CHECK=0; FS_LAST_BACKUP_CHECK=0; FS_LAST_RESULT="${FS_PHASE}"
+    FS_LAST_MEASUREMENT_ID=""; FS_LAST_SWITCH=0; FS_UPDATED=0; FS_EXTRA="invalid"
+    return 2
+  fi
   line="$(awk -F '\t' -v g="${group}" '$1==g{v=$0} END{print v}' "${FAILOVER_STATE_FILE}" 2>/dev/null)"
   if [[ -n "${line}" ]]; then
     split_tsv_line "${line}"
@@ -2342,8 +2470,17 @@ load_failover_state_ui() {
     FS_LAST_PRIMARY_CHECK=0; FS_LAST_BACKUP_CHECK=0; FS_LAST_RESULT="INIT"
     FS_LAST_MEASUREMENT_ID=""; FS_LAST_SWITCH=0; FS_UPDATED=0; FS_EXTRA=""
   fi
+  if [[ "${FS_ACTIVE_ROLE}" != PRIMARY && "${FS_ACTIVE_ROLE}" != BACKUP ]]; then FS_EXTRA="invalid"; fi
+  case "${FS_PHASE}" in PRIMARY_STABLE|PRIMARY_FAST|BACKUP_FAST|BACKUP_STABLE) ;; *) FS_EXTRA="invalid" ;; esac
+  for _v in FS_PRIMARY_FAILS FS_BACKUP_SUCCESSES FS_PRIMARY_SUCCESSES FS_LAST_PRIMARY_CHECK FS_LAST_BACKUP_CHECK FS_LAST_SWITCH FS_UPDATED; do
+    [[ "${!_v:-}" =~ ^[0-9]+$ ]] || FS_EXTRA="invalid"
+  done
   [[ "${FS_UPDATED:-0}" =~ ^[0-9]+$ ]] || FS_UPDATED=0
-  [[ -z "${FS_EXTRA:-}" ]] || FS_LAST_RESULT="STATE_FIELDS_INVALID"
+  if [[ -n "${FS_EXTRA:-}" ]]; then
+    FS_LAST_RESULT="STATE_FIELDS_INVALID"
+    return 2
+  fi
+  return 0
 }
 
 save_failover_state_ui() {
@@ -2361,7 +2498,10 @@ save_failover_state_ui() {
 
 reset_failover_counters_preserve_role() {
   local group="$1"
-  load_failover_state_ui "${group}"
+  load_failover_state_ui "${group}" || {
+    echo "组 ${group} 的故障转移状态损坏或重复；为避免覆盖活动线路，本次未重置，请运行菜单24自检。" >&2
+    return 1
+  }
   if [[ "${FS_ACTIVE_ROLE}" == "BACKUP" ]]; then FS_PHASE="BACKUP_FAST"; else FS_ACTIVE_ROLE="PRIMARY"; FS_PHASE="PRIMARY_STABLE"; fi
   FS_PRIMARY_FAILS=0; FS_BACKUP_SUCCESSES=0; FS_PRIMARY_SUCCESSES=0
   FS_LAST_PRIMARY_CHECK=0; FS_LAST_BACKUP_CHECK=0; FS_LAST_RESULT="CONFIG_CHANGED"; FS_LAST_MEASUREMENT_ID=""
@@ -2516,14 +2656,32 @@ list_failover_status() {
   local timer_state
   timer_state="$(systemctl is-active "${TIMER_NAME}" 2>/dev/null || true)"
   echo "自动调度器 ${TIMER_NAME}: ${timer_state:-unknown}"
+  printf '%-14s %-7s %-7s %-9s %-16s %-8s %-8s %-8s %-19s %-18s\n' "组名" "主组" "故转" "活动线路" "阶段" "P失败" "B成功" "P恢复" "最后检测" "最后结果"
+  printf '%-14s %-7s %-7s %-9s %-16s %-8s %-8s %-8s %-19s %-18s\n' "--------------" "-------" "-------" "---------" "----------------" "--------" "--------" "--------" "-------------------" "------------------"
   local row group enabled found=0
   local base_enabled last_check last_display
+  local -A config_count=()
+  while IFS= read -r row || [[ -n "${row}" ]]; do
+    [[ -z "${row}" || "${row}" =~ ^# ]] && continue
+    split_tsv_line "${row}"
+    group="${TSV_FIELDS[0]:-}"
+    [[ -n "${group}" ]] && config_count["${group}"]=$(( ${config_count["${group}"]:-0} + 1 ))
+  done < "${FAILOVER_FILE}"
   while IFS= read -r row || [[ -n "${row}" ]]; do
     [[ -z "${row}" || "${row}" =~ ^# ]] && continue
     found=1
     split_tsv_line "${row}"
+    group="${TSV_FIELDS[0]:-}"
+    enabled="${TSV_FIELDS[1]:--}"
+    if [[ -n "${group}" ]] && (( ${config_count["${group}"]:-0} > 1 )); then
+      base_enabled="$(get_group_enabled_ui "${group}" 2>/dev/null || true)"
+      [[ -n "${base_enabled}" ]] || base_enabled="missing"
+      printf '%-14s %-7s %-7s %-9s %-16s %-8s %-8s %-8s %-19s %-18s\n' \
+        "${group}" "${base_enabled}" "${enabled}" "INVALID" "CONFIG_DUPLICATE" "-" "-" "-" "-" "运行菜单24"
+      continue
+    fi
     if (( ${#TSV_FIELDS[@]} != 13 )); then
-      printf '\n[配置损坏]\n  failover.tsv 字段应为13，实际为%d；请运行菜单24自检。\n' "${#TSV_FIELDS[@]}"
+      printf '%-14s %-7s %-7s %-9s %-16s %-8s %-8s %-8s %-19s %-18s\n' "配置损坏" "-" "-" "-" "字段=${#TSV_FIELDS[@]}/13" "-" "-" "-" "-" "运行菜单24"
       continue
     fi
     group="${TSV_FIELDS[0]}"; enabled="${TSV_FIELDS[1]}"
@@ -2534,10 +2692,8 @@ list_failover_status() {
     [[ "${last_check}" =~ ^[0-9]+$ ]] || last_check=0
     if [[ "${FS_LAST_BACKUP_CHECK:-0}" =~ ^[0-9]+$ ]] && (( FS_LAST_BACKUP_CHECK > last_check )); then last_check="${FS_LAST_BACKUP_CHECK}"; fi
     if (( last_check > 0 )); then last_display="$(date -d "@${last_check}" '+%F %T' 2>/dev/null || printf '%s' "${last_check}")"; else last_display="从未"; fi
-    printf '\n[%s]\n' "${group}"
-    printf '  主组：%s  故障转移：%s  活动线路：%s\n' "${base_enabled}" "${enabled}" "${FS_ACTIVE_ROLE}"
-    printf '  阶段：%s  P失败：%s  B成功：%s  P恢复：%s\n' "${FS_PHASE}" "${FS_PRIMARY_FAILS}" "${FS_BACKUP_SUCCESSES}" "${FS_PRIMARY_SUCCESSES}"
-    printf '  最后检测：%s  结果：%s\n' "${last_display}" "${FS_LAST_RESULT}"
+    printf '%-14s %-7s %-7s %-9s %-16s %-8s %-8s %-8s %-19s %-18s\n' \
+      "${group}" "${base_enabled}" "${enabled}" "${FS_ACTIVE_ROLE}" "${FS_PHASE}" "${FS_PRIMARY_FAILS}" "${FS_BACKUP_SUCCESSES}" "${FS_PRIMARY_SUCCESSES}" "${last_display:0:19}" "${FS_LAST_RESULT:0:18}"
   done < "${FAILOVER_FILE}"
   [[ "${found}" -eq 1 ]] || echo "当前没有配置 Globalping 故障转移的组。现有 groups.tsv 组仍按 PRIMARY 正常同步。"
   echo "说明：只有 主组=true 且 故转=true 的组会执行自动 Globalping 检测。"
@@ -2547,9 +2703,16 @@ configure_failover_group() {
   echo
   select_group || { echo "序号无效"; return; }
   split_line_to_vars "${CHOSEN_LINE}" || { echo "该组配置字段数量不是10，请运行菜单24自检"; return 1; }
-  local primary_sources="${GROUP_SOURCES_CSV}" existing=0 input first_primary first_backup choice
+  local primary_sources="${GROUP_SOURCES_CSV}" existing=0 input first_primary first_backup choice load_rc
   first_primary="$(first_source_from_csv "${primary_sources}")"
-  if load_failover_config_ui "${GROUP_NAME}"; then existing=1; else
+  if load_failover_config_ui "${GROUP_NAME}"; then
+    existing=1
+  else
+    load_rc=$?
+    if (( load_rc != 1 )); then
+      echo "${FAILOVER_UI_LOAD_ERROR}"
+      return 1
+    fi
     FO_GROUP="${GROUP_NAME}"; FO_ENABLED=true; FO_BACKUP_SOURCES=""; FO_PRIMARY_TARGET="${first_primary}"; FO_BACKUP_TARGET=""
     FO_CHECK_TYPE="PING_ICMP"; FO_PORT=0; FO_LOCATION="China"; FO_STABLE_INTERVAL=300; FO_FAST_INTERVAL=60
     FO_PRIMARY_FAIL_THRESHOLD=3; FO_BACKUP_SUCCESS_THRESHOLD=2; FO_PRIMARY_RECOVERY_THRESHOLD=2; FO_EXTRA=""
@@ -2624,7 +2787,7 @@ manage_backup_sources() {
   echo
   select_group || { echo "序号无效"; return; }
   split_line_to_vars "${CHOSEN_LINE}" || { echo "该组配置字段数量不是10，请运行菜单24自检"; return 1; }
-  load_failover_config_ui "${GROUP_NAME}" || { echo "该组尚未配置故障转移"; return; }
+  load_failover_config_ui "${GROUP_NAME}" || { echo "${FAILOVER_UI_LOAD_ERROR:-该组尚未配置故障转移}"; return; }
   parse_sources_to_array "${FO_BACKUP_SOURCES}"
   local choice input idx
   while true; do
@@ -2667,9 +2830,12 @@ toggle_failover_enabled() {
   echo
   select_group || { echo "序号无效"; return; }
   split_line_to_vars "${CHOSEN_LINE}" || { echo "该组配置字段数量不是10，请运行菜单24自检"; return 1; }
-  load_failover_config_ui "${GROUP_NAME}" || { echo "该组尚未配置故障转移，请先配置"; return; }
+  load_failover_config_ui "${GROUP_NAME}" || { echo "${FAILOVER_UI_LOAD_ERROR:-该组尚未配置故障转移，请先配置}"; return; }
 
-  local primary_sources="${GROUP_SOURCES_CSV}" rc=0 new_state
+  local primary_sources="${GROUP_SOURCES_CSV}" rc=0 new_state old_state original_line
+  old_state="${FO_ENABLED}"
+  original_line="$(get_failover_line_by_group "${GROUP_NAME}")"
+  [[ -n "${original_line}" ]] || { echo "无法读取原故障转移配置"; return 1; }
   if [[ "${FO_ENABLED}" == "true" ]]; then
     new_state="false"
   else
@@ -2682,19 +2848,20 @@ toggle_failover_enabled() {
   # 无论启用还是禁用，都从 PRIMARY_STABLE 重新开始，并立即把目标域名核对到 PRIMARY。
   # 这样不会因之前停留在 BACKUP 状态而出现“已启用但仍走 BACKUP”的联动错误。
   /usr/local/bin/cf-dns-sync.sh FORESET "${GROUP_NAME}" || rc=$?
-  if [[ "${new_state}" == "true" ]]; then
-    if [[ "${rc}" -eq 0 ]]; then
-      echo "故障转移已启用，已重置为 PRIMARY 稳定状态并完成一次同步。"
-    else
-      echo "故障转移已启用并重置为 PRIMARY，但立即同步失败（退出码=${rc}）；定时任务会继续重试。"
+  if [[ "${rc}" -ne 0 ]]; then
+    if save_failover_line_replace "${GROUP_NAME}" "${original_line}"; then
+      FO_ENABLED="${old_state}"
+      echo "回到 PRIMARY 或同步失败（退出码=${rc}），故障转移开关已恢复为 ${old_state}。"
+      return "${rc}"
     fi
+    echo "回到 PRIMARY 或同步失败（退出码=${rc}），且原故障转移开关恢复失败；请立即运行菜单24自检。"
+    return 1
+  fi
+  if [[ "${new_state}" == "true" ]]; then
+    echo "故障转移已启用，已重置为 PRIMARY 稳定状态并完成一次同步。"
     activate_failover_scheduler "${GROUP_NAME}" || return $?
   else
-    if [[ "${rc}" -eq 0 ]]; then
-      echo "故障转移已禁用，已回到 PRIMARY 并完成一次同步。"
-    else
-      echo "故障转移已禁用并重置为 PRIMARY，但立即同步失败（退出码=${rc}）；定时任务会继续按 PRIMARY 重试。"
-    fi
+    echo "故障转移已禁用，已回到 PRIMARY 并完成一次同步。"
   fi
 }
 
@@ -2873,20 +3040,19 @@ test_backup_sources_local_dns() {
   echo
   select_group || { echo "序号无效"; return; }
   split_line_to_vars "${CHOSEN_LINE}" || { echo "该组配置字段数量不是10，请运行菜单24自检"; return 1; }
-  load_failover_config_ui "${GROUP_NAME}" || { echo "该组尚未配置故障转移"; return; }
+  load_failover_config_ui "${GROUP_NAME}" || { echo "${FAILOVER_UI_LOAD_ERROR:-该组尚未配置故障转移}"; return; }
   parse_sources_to_array "${FO_BACKUP_SOURCES}"
   echo "测试组 ${GROUP_NAME} 的 BACKUP 源域名本机解析情况"
+  printf '%-4s %-45s %-8s %-6s %-60s\n' "序号" "源域名" "状态" "数量" "IPv4结果"
+  printf '%-4s %-45s %-8s %-6s %-60s\n' "----" "---------------------------------------------" "--------" "------" "------------------------------------------------------------"
   local i=0 domain ips count joined
   for domain in "${SOURCES_ARRAY[@]}"; do
     i=$((i+1)); ips="$(ui_resolve_domain_ipv4 "${domain}")"
     count="$(sed '/^$/d' <<< "${ips}" | wc -l | awk '{print $1}')"; joined="$(paste -sd ',' <<< "${ips}")"
-    echo
-    printf '[%d] %s\n' "${i}" "${domain}"
     if [[ "${count}" -gt 0 ]]; then
-      printf '  状态：正常  IPv4 数量：%s\n  结果：%s\n' "${count}" "${joined}"
+      printf '%-4s %-45s %-8s %-6s %-60s\n' "${i}" "${domain}" "正常" "${count}" "${joined:0:60}"
     else
-      echo "  状态：失败  IPv4 数量：0"
-      echo "  结果：-"
+      printf '%-4s %-45s %-8s %-6s %-60s\n' "${i}" "${domain}" "失败" 0 "-"
     fi
   done
 }
@@ -2895,7 +3061,7 @@ remove_failover_config_ui() {
   echo
   select_group || { echo "序号无效"; return; }
   split_line_to_vars "${CHOSEN_LINE}" || { echo "该组配置字段数量不是10，请运行菜单24自检"; return 1; }
-  load_failover_config_ui "${GROUP_NAME}" || { echo "该组没有故障转移配置"; return; }
+  load_failover_config_ui "${GROUP_NAME}" || { echo "${FAILOVER_UI_LOAD_ERROR:-该组没有故障转移配置}"; return; }
   echo "删除故障转移配置前会先切回 PRIMARY 并强制同步。"
   echo "1. ✅ 切回PRIMARY并删除配置"
   echo "2. ↩️ 取消"
@@ -2914,7 +3080,7 @@ remove_failover_config_ui() {
 }
 
 show_failover_history() {
-  local days choice limit_choice limit=200 cutoff output t group action from to reason measurement_id extra shown=0 failed
+  local days choice limit_choice limit=200 cutoff output t group action from to reason _measurement_id extra shown=0 failed
   local HISTORY_FILE="${FAILOVER_HISTORY_FILE}"
   echo "1. 最近3天"; echo "2. 最近7天"; echo "3. 最近30天"; echo "4. 最近180天"; echo "5. 自定义天数"; echo "0. 返回"
   read -rp "请选择: " choice || return
@@ -2943,12 +3109,12 @@ show_failover_history() {
     return 1
   fi
 
-  while IFS=$'\t' read -r t group action from to reason measurement_id extra; do
+  printf '%-20s %-14s %-8s %-9s %-9s %-36s\n' "Time" "Group" "Action" "From" "To" "Reason"
+  printf '%-20s %-14s %-8s %-9s %-9s %-36s\n' "--------------------" "--------------" "--------" "---------" "---------" "------------------------------------"
+  while IFS=$'\t' read -r t group action from to reason _measurement_id extra; do
     [[ -n "${t}" && -n "${group}" && -n "${action}" && -z "${extra:-}" ]] || continue
-    printf '\n[%s] %s\n' "${t}" "${group}"
-    printf '  动作：%s  线路：%s -> %s\n' "${action}" "${from}" "${to}"
-    printf '  原因：%s\n' "${reason}"
-    [[ -z "${measurement_id}" ]] || printf '  测量 ID：%s\n' "${measurement_id}"
+    printf '%-20s %-14s %-8s %-9s %-9s %-36s\n' \
+      "${t:0:20}" "${group:0:14}" "${action:0:8}" "${from:0:9}" "${to:0:9}" "${reason:0:36}"
     shown=$((shown+1))
   done < "${output}"
   rm -f "${output}"
@@ -3519,17 +3685,16 @@ test_group_sources_dns() {
   split_line_to_vars "${CHOSEN_LINE}" || { echo "该组配置字段数量不是10，请运行菜单24自检"; return 1; }
   parse_sources_to_array "${GROUP_SOURCES_CSV}"
   echo "测试组 ${GROUP_NAME} 的 PRIMARY 源域名解析情况"
+  printf '%-4s %-45s %-8s %-6s %-60s\n' "序号" "源域名" "状态" "数量" "IPv4结果"
+  printf '%-4s %-45s %-8s %-6s %-60s\n' "----" "---------------------------------------------" "--------" "------" "------------------------------------------------------------"
   local i=0 domain ips count joined
   for domain in "${SOURCES_ARRAY[@]}"; do
     i=$((i+1)); ips="$(ui_resolve_domain_ipv4 "${domain}")"
     count="$(sed '/^$/d' <<< "${ips}" | wc -l | awk '{print $1}')"; joined="$(paste -sd ',' <<< "${ips}")"
-    echo
-    printf '[%d] %s\n' "${i}" "${domain}"
     if [[ "${count}" -gt 0 ]]; then
-      printf '  状态：正常  IPv4 数量：%s\n  结果：%s\n' "${count}" "${joined}"
+      printf '%-4s %-45s %-8s %-6s %-60s\n' "${i}" "${domain}" "正常" "${count}" "${joined:0:60}"
     else
-      echo "  状态：失败  IPv4 数量：0"
-      echo "  结果：-"
+      printf '%-4s %-45s %-8s %-6s %-60s\n' "${i}" "${domain}" "失败" 0 "-"
     fi
   done
 }
@@ -3538,10 +3703,21 @@ view_group_current_ips() {
   echo
   select_group || { echo "序号无效"; return; }
   split_line_to_vars "${CHOSEN_LINE}" || { echo "该组配置字段数量不是10，请运行菜单24自检"; return 1; }
-  local active_role="PRIMARY" backup_csv="" failover_enabled="false"
-  if load_failover_config_ui "${GROUP_NAME}" >/dev/null 2>&1 && [[ "${FO_ENABLED}" == "true" ]]; then
-    failover_enabled=true; backup_csv="${FO_BACKUP_SOURCES}"; load_failover_state_ui "${GROUP_NAME}"
-    [[ "${FS_ACTIVE_ROLE}" == "BACKUP" ]] && active_role="BACKUP"
+  local active_role="PRIMARY" backup_csv="" failover_enabled="false" fo_load_rc
+  load_failover_config_ui "${GROUP_NAME}" >/dev/null 2>&1
+  fo_load_rc=$?
+  if (( fo_load_rc == 0 )) && [[ "${FO_ENABLED}" == "true" ]]; then
+    failover_enabled=true; backup_csv="${FO_BACKUP_SOURCES}"
+    if load_failover_state_ui "${GROUP_NAME}"; then
+      [[ "${FS_ACTIVE_ROLE}" == "BACKUP" ]] && active_role="BACKUP"
+    else
+      active_role="INVALID"
+      echo "警告：故障转移状态损坏或重复，运行时会停止该组同步；请运行菜单24自检。"
+    fi
+  elif (( fo_load_rc > 1 )); then
+    failover_enabled="INVALID"
+    active_role="INVALID"
+    echo "警告：${FAILOVER_UI_LOAD_ERROR}"
   fi
   local tmp_all i domain ips selected count joined resp encoded csv label
   tmp_all="$(mktemp)" || { echo "无法创建临时文件"; return 1; }
@@ -3557,6 +3733,8 @@ view_group_current_ips() {
     [[ "${label}" == PRIMARY ]] && csv="${GROUP_SOURCES_CSV}" || csv="${backup_csv}"
     [[ -n "${csv}" ]] || continue
     echo; echo "${label} 源域名解析$([[ "${label}" == "${active_role}" ]] && echo '（当前用于同步）' || true)："
+    printf '%-4s %-45s %-6s %-60s\n' "序号" "源域名" "数量" "IPv4结果"
+    printf '%-4s %-45s %-6s %-60s\n' "----" "---------------------------------------------" "------" "------------------------------------------------------------"
     parse_sources_to_array "${csv}"; i=0
     for domain in "${SOURCES_ARRAY[@]}"; do
       i=$((i+1)); ips="$(ui_resolve_domain_ipv4 "${domain}")"
@@ -3568,9 +3746,7 @@ view_group_current_ips() {
         [[ "${label}" == "${active_role}" ]] && sed '/^$/d' <<< "${ips}" >> "${tmp_all}"
       fi
       [[ -n "${joined}" ]] || joined="-"
-      echo
-      printf '[%d] %s\n' "${i}" "${domain}"
-      printf '  IPv4 数量：%s\n  结果：%s\n' "${count}" "${joined}"
+      printf '%-4s %-45s %-6s %-60s\n' "${i}" "${domain}" "${count}" "${joined:0:60}"
     done
   done
 
@@ -3956,6 +4132,8 @@ show_runstate() {
     return
   fi
 
+  printf '%-16s %-20s\n' "组名" "上次执行时间"
+  printf '%-16s %-20s\n' "----------------" "--------------------"
   tmp="$(mktemp)" || { echo "无法创建临时文件"; return 1; }
   if ! sort -t $'\t' -k1,1 "${RUNSTATE_FILE}" > "${tmp}" 2>/dev/null; then
     rm -f "${tmp}"
@@ -3966,7 +4144,7 @@ show_runstate() {
     [[ -n "${group}" && "${epoch}" =~ ^[0-9]+$ ]] || continue
     readable="$(date -d "@${epoch}" '+%F %T' 2>/dev/null || true)"
     [[ -n "${readable}" ]] || continue
-    printf '[%s] %s\n' "${group}" "${readable}"
+    printf '%-16s %-20s\n' "${group:0:16}" "${readable}"
     shown=$((shown+1))
   done < "${tmp}"
   rm -f "${tmp}"
@@ -4132,9 +4310,17 @@ collect_recent_history_to_file() {
 print_history_header() {
   local record_mode="$1"
   if [[ "${record_mode}" == "all" ]]; then
-    echo "显示字段：时间、组、动作、IP、源域名、模式、目标"
+    printf '%-20s %-14s %-8s %-16s %-28s %-10s %-30s\n' \
+      "Time" "Group" "Action" "IP" "SourceDomain" "Mode" "Target"
+    printf '%-20s %-14s %-8s %-16s %-28s %-10s %-30s\n' \
+      "--------------------" "--------------" "--------" "----------------" \
+      "----------------------------" "----------" "------------------------------"
   else
-    echo "显示字段：时间、组、删除的 IP、源域名、模式、目标"
+    printf '%-20s %-14s %-16s %-28s %-10s %-30s\n' \
+      "Time" "Group" "DeletedIP" "SourceDomain" "Mode" "Target"
+    printf '%-20s %-14s %-16s %-28s %-10s %-30s\n' \
+      "--------------------" "--------------" "----------------" \
+      "----------------------------" "----------" "------------------------------"
   fi
 }
 
@@ -4147,13 +4333,14 @@ render_history_data_file() {
     [[ -z "${extra:-}" ]] || continue
     target="${metadata%%|*}"
     if [[ "${record_mode}" == "all" ]]; then
-      printf '\n[%s] %s\n' "${record_time}" "${group}"
-      printf '  动作：%s  IP：%s  模式：%s\n' "${action}" "${ip}" "${mode}"
+      printf '%-20s %-14s %-8s %-16s %-28s %-10s %-30s\n' \
+        "${record_time:0:20}" "${group:0:14}" "${action:0:8}" "${ip:0:16}" \
+        "${source_domain:0:28}" "${mode:0:10}" "${target:0:30}"
     else
-      printf '\n[%s] %s\n' "${record_time}" "${group}"
-      printf '  删除的 IP：%s  模式：%s\n' "${ip}" "${mode}"
+      printf '%-20s %-14s %-16s %-28s %-10s %-30s\n' \
+        "${record_time:0:20}" "${group:0:14}" "${ip:0:16}" \
+        "${source_domain:0:28}" "${mode:0:10}" "${target:0:30}"
     fi
-    printf '  源域名：%s\n  目标：%s\n' "${source_domain}" "${target}"
     shown=$((shown+1))
   done < "${input}"
 
@@ -4311,14 +4498,15 @@ history_files_menu() {
       return
     fi
 
+    printf '%-5s %-8s %-12s %-19s %s\n' "序号" "类型" "大小(字节)" "修改时间" "文件"
+    printf '%-5s %-8s %-12s %-19s %s\n' "-----" "--------" "------------" "-------------------" "------------------------------"
     for index in "${!HISTORY_FILES[@]}"; do
       file="${HISTORY_FILES[${index}]}"
       kind="$(managed_history_file_kind "${file}" 2>/dev/null)" || continue
       size="$(stat -c '%s' "${file}" 2>/dev/null || printf '?')"
       modified="$(stat -c '%y' "${file}" 2>/dev/null || printf '?')"
       [[ "${kind}" == "current" ]] && kind="当前" || kind="轮转"
-      printf '[%d] %s\n' "$((index+1))" "${file##*/}"
-      printf '  类型：%s  大小：%s 字节  修改时间：%s\n' "${kind}" "${size}" "${modified:0:19}"
+      printf '%-5s %-8s %-12s %-19s %s\n' "$((index+1))" "${kind}" "${size}" "${modified:0:19}" "${file##*/}"
     done
     echo
     echo "选择一个文件后，可查看其最新 200 条，或在二次确认后删除；当前文件执行安全清空。"
@@ -4536,7 +4724,10 @@ self_check() {
     [[ "${fo_stable}" =~ ^[0-9]+$ && "${fo_fast}" =~ ^[0-9]+$ && "${fo_stable}" -ge 60 && "${fo_fast}" -ge 60 && "${fo_stable}" -ge "${fo_fast}" ]] || check_fail "组 ${fo_group}: 稳定/快速周期非法"
     [[ "${fo_pf}" =~ ^[0-9]+$ && "${fo_bs}" =~ ^[0-9]+$ && "${fo_pr}" =~ ^[0-9]+$ && "${fo_pf}" -ge 1 && "${fo_bs}" -ge 1 && "${fo_pr}" -ge 1 ]] || check_fail "组 ${fo_group}: 阈值非法"
     if [[ "${fo_enabled}" == true && "${group_enabled_map["${fo_group}"]:-false}" == true && "${fo_fast}" =~ ^[0-9]+$ && "${fo_stable}" =~ ^[0-9]+$ && "${fo_fast}" -gt 0 && "${fo_stable}" -gt 0 ]]; then
-      worst_fast=$(( (3600 + fo_fast - 1) / fo_fast )); worst_stable=$(( 2 * ((3600 + fo_stable - 1) / fo_stable) )); group_worst=${worst_fast}; (( worst_stable > group_worst )) && group_worst=${worst_stable}; theoretical_total=$((theoretical_total + group_worst))
+      # PRIMARY 快速失败达到阈值后，每轮会追加一次 BACKUP 预切换验证，因此最坏为快速周期的两倍。
+      worst_fast=$(( 2 * ((3600 + fo_fast - 1) / fo_fast) ))
+      worst_stable=$(( 2 * ((3600 + fo_stable - 1) / fo_stable) ))
+      group_worst=${worst_fast}; (( worst_stable > group_worst )) && group_worst=${worst_stable}; theoretical_total=$((theoretical_total + group_worst))
     fi
   done < "${FAILOVER_FILE}"
   [[ "${failover_count}" -gt 0 ]] && check_ok "故障转移配置数量：${failover_count}（启用${failover_enabled_count}）" || check_ok "未配置故障转移；现有组继续按PRIMARY兼容运行"
@@ -4801,20 +4992,38 @@ menu() {
   run_init_wizard
   while true; do
     title
-    echo "-- 组配置 --"
-    printf ' %2d. %s\n' 1 "查看全部组" 2 "新增组" 3 "删除组" 4 "编辑组基础信息"
-    printf ' %2d. %s\n' 5 "管理 PRIMARY 源域名" 6 "切换组启用状态" 7 "设置组检测周期" 8 "测试 Cloudflare API Token"
-    printf ' %2d. %s\n' 9 "测试源域名解析" 10 "查看组当前解析 IP" 11 "组上移" 12 "组下移"
-    echo
-    echo "-- 服务与诊断 --"
-    printf ' %2d. %s\n' 13 "设置日志等级" 14 "启动" 15 "停止" 16 "重启"
-    printf ' %2d. %s\n' 17 "强制同步全部组" 18 "强制同步单个组" 19 "查看项目运行日志" 20 "实时查看项目日志"
-    printf ' %2d. %s\n' 21 "查看单组运行日志" 22 "查看 service/timer 状态" 23 "查看依赖状态" 24 "脚本自检"
-    printf ' %2d. %s\n' 25 "一键修复" 26 "查看各组上次检测时间"
-    echo
-    echo "-- 历史、故障转移与维护 --"
-    printf ' %2d. %s\n' 27 "查看或删除域名 IP 历史" 28 "清理项目日志" 29 "编辑原始配置文件"
-    printf ' %2d. %s\n' 30 "彻底卸载" 31 "Globalping 中国节点故障转移" 0 "退出"
+    echo "  1.  📦 查看全部组（List Groups / 查看组）"
+    echo "  2.  ➕ 新增组（Add Group / 新增组）"
+    echo "  3.  🗑️  删除组（Delete Group / 删除组）"
+    echo "  4.  📝 编辑组基础信息（Edit Group / 编辑组）"
+    echo "  5.  🌐 管理组内源域名（Manage Sources / 源域名管理）"
+    echo "  6.  🔘 切换组启用状态（Enable/Disable / 启用禁用）"
+    echo "  7.  ⏱️  设置组检测周期（Set Interval / 最短5秒）"
+    echo "  8.  🔑 测试组 API Token（Test Token / 测试令牌）"
+    echo "  9.  🧪 测试组源域名解析（Test Sources DNS / 解析测试）"
+    echo " 10.  📡 查看组别当前解析 IP（Current IPs / 当前IP）"
+    echo " 11.  ⬆️  组上移（Move Up / 上移）"
+    echo " 12.  ⬇️  组下移（Move Down / 下移）"
+    echo " 13.  🔊 设置日志等级（Log Level / 日志等级）"
+    echo " 14.  ▶️  启动（Start / 启动）"
+    echo " 15.  ⏹️  停止（Stop / 停止）"
+    echo " 16.  🔄 重启（Restart / 重启）"
+    echo " 17.  🚀 手动强制同步全部组（Sync All / 全部同步）"
+    echo " 18.  🎯 手动强制同步单个组（Sync One / 单组同步）"
+    echo " 19.  📄 查看项目运行日志（含轮转/压缩日志）"
+    echo " 20.  👀 实时查看项目日志（Follow Logs / 实时日志）"
+    echo " 21.  📌 查看单组运行日志（含轮转/压缩日志）"
+    echo " 22.  🩺 查看 service/timer 状态（Status / 状态）"
+    echo " 23.  🧰 查看依赖状态（Dependencies / 依赖）"
+    echo " 24.  🔎 脚本自检（Self Check / 自检）"
+    echo " 25.  🧯 一键修复（Repair / 修复）"
+    echo " 26.  🕓 查看各组上次检测时间（Run State / 执行状态）"
+    echo " 27.  📜 查看/删除域名 IP 历史记录（History / 历史记录）"
+    echo " 28.  🧹 清理项目日志（Clean Logs / 7天或30天）"
+    echo " 29.  🛠️  编辑原始配置文件（Edit Raw Files / 原始配置）"
+    echo " 30.  💣 彻底卸载（Uninstall / 卸载）"
+    echo " 31.  🌏 Globalping 中国节点故障转移（Failover / PRIMARY-BACKUP）"
+    echo "  0.  🚪 退出（Exit / 退出）"
     line
     read -rp "请选择: " choice || exit 0
     case "${choice}" in

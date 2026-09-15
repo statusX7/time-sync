@@ -3,18 +3,18 @@ set -euo pipefail
 
 ############################################
 # DoH Manager PRO (All-in-One + allowlist.txt)
-# Version: v2.6.4
+# Version: v2.6.5
 #
-# v2.6.4 修复：
-# 1) P0: 单层短 TTL 缓存、禁用过期回答、禁止 HTTP 缓存；兼容迁移旧状态
-# 2) 应用时校验最终生效配置和本机 DNS 报文；失败恢复，禁止伪成功
-# 3) 所有交互确认统一为数字；现有白名单域名支持编号、翻页选择
-# 4) 保留 v2.6.3 主菜单布局/编号及已有功能；没有周期性重启或清缓存任务
-# 范围: 控制本机缓存；不能强制上游递归或客户端提前清除其缓存。
-# 总行数: 2565（含注释和空行；LF 换行）
+# v2.6.5 修复：
+# 1) 修复拒绝分支合成 SOA 的 TTL=300：仅对拒绝响应限制 TTL，不遮盖上游异常
+# 2) 分层校验 Unbound、mosdns、Nginx 的真实 A/AAAA、GET/POST 与拒绝响应
+# 3) 校验进程配置路径、加载身份和实际报文；记录检查阶段、SOA 和失败证据
+# 4) 保留 30 秒正记录/5 秒负缓存上限、原菜单和数字交互、备份及失败回滚
+# 范围: 本机缓存与合成响应；不能强制上游递归或客户端清除既有缓存。
+# 总行数: 2762（含注释和空行；LF 换行）
 ############################################
 
-SCRIPT_VERSION="v2.6.4"
+SCRIPT_VERSION="v2.6.5"
 SCRIPT_NAME="DoH Manager PRO"
 MOSDNS_UNIT="mosdns"
 NGINX_UNIT="nginx"
@@ -102,7 +102,7 @@ NGINX_SSL_DIR=""
 FIRST_RUN="no"
 
 # P0 policy: these are local upper bounds, not an authoritative-DNS propagation SLA.
-FRESHNESS_POLICY_REVISION="1"
+FRESHNESS_POLICY_REVISION="2"
 FRESHNESS_MAX_TTL=30
 FRESHNESS_NEGATIVE_TTL=5
 FRESHNESS_MIGRATION_NEEDED="no"
@@ -253,6 +253,10 @@ CORE_REQUIRED_FUNCTIONS=(
   dns_wire
   dns_backend_smoke
   offer_freshness_upgrade
+  negative_response_cap
+  doh_probe
+  runtime_config_identity
+  validate_running_freshness
 )
 
 c_ok() { printf '\033[1;32m[OK]\033[0m %s\n' "$*"; }
@@ -1067,10 +1071,11 @@ build_domain_rules_from_allowlist() {
   return "$result"
 }
 write_mosdns_config() {
-  local dir domain_rules log_block deny_action=_new_refused_response
+  local dir domain_rules log_block deny_action=_new_refused_response deny_cap
   enforce_freshness_policy && validate_runtime_values || return 1
   domain_rules="$(build_domain_rules_from_allowlist)" || return 1
   log_block="$(mos_native_log)" || return 1
+  deny_cap="$(negative_response_cap)" || return 1
   [[ "$DENY_MODE" != nxdomain ]] || deny_action=_new_nxdomain_response
   mkdir -p -- "$CONF_DIR" || return 1
   dir="$(new_workdir)" || return 1
@@ -1094,6 +1099,13 @@ ${domain_rules}
         - addr: "tcp://127.0.0.1:${UNBOUND_PORT}"
           trusted: true
 
+  # Built-in rejection replies contain a synthetic SOA (normally TTL=300).
+  # This plugin is executed ONLY after local rejection, never on forwarded data.
+  - tag: deny_response_ttl
+    type: ttl
+    args:
+      maximum_ttl: ${deny_cap}
+
   - tag: main_sequence
     type: sequence
     args:
@@ -1101,6 +1113,7 @@ ${domain_rules}
         - if: "! allow_list"
           exec:
             - ${deny_action}
+            - deny_response_ttl
             - _return
         # Unbound is the only DNS cache. Never cache its stale/negative reply here.
         - forward_local_unbound
@@ -1585,7 +1598,7 @@ apply_all() {
   done
   c_info "生成配置并应用（本次部署会重载服务；以后 TTL 到期后的查询重新请求上游）..."
   if ! write_unbound_forward || ! write_mosdns_config || ! write_nginx_site || ! reload_services || \
-     ! assert_unbound_freshness /etc/unbound/unbound.conf || ! dns_backend_smoke || ! save_state || ! mark_freshness_applied; then rc=1; fi
+     ! validate_running_freshness "$dir" || ! save_state || ! mark_freshness_applied; then rc=1; fi
   if (( rc != 0 )); then
     c_err "应用失败，开始恢复应用前的配置和服务状态"
     for idx in "${!paths[@]}"; do
@@ -1603,8 +1616,10 @@ apply_all() {
         systemctl stop "$svc" || { c_err "$svc 未能恢复停止状态，保留备份: $dir"; return 1; }
       fi
     done
-    rm -rf -- "$dir"
+    # Keep mode-0700 transaction snapshots and raw validation replies for diagnosis.
     c_err "未应用 P0 修复；旧运行配置已恢复。请处理错误后重新选择 17。"
+    c_info "备份及分层验证原始报文保留于: $dir"
+    log_action "apply failed; rollback complete; evidence=$dir"
     return 1
   fi
   rm -rf -- "$dir"
@@ -1675,8 +1690,7 @@ show_ports_summary() {
   return "$failed"
 }
 health_check_summary() {
-  local dir homepage_code doh_code domain failed=0 content_type qtype target method endpoint encoded
-  local -a route_args=() request_args=()
+  local dir homepage_code domain failed=0 qtype target method
   echo "==================== 健康检查 ===================="
   have_cmd curl && have_cmd python3 || { c_err "缺少 curl/python3，请先执行安装/修复环境"; return 1; }
   normalize_hostname "$DOMAIN" >/dev/null && valid_doh_path "$DOH_PATH" || { c_err "域名或路径无效"; return 1; }
@@ -1685,70 +1699,31 @@ health_check_summary() {
   if ! normalize_allowlist_file "$ALLOWLIST_FILE" "$dir/list"; then rm -rf -- "$dir"; return 1; fi
   if ! select_allowlist_domain "$dir/list" "选择健康检查域名"; then rm -rf -- "$dir"; return 0; fi
   domain="$SELECTED_DOMAIN"
-  if freshness_profile_ready; then
-    c_ok "P0 缓存策略应用记录及当前配置一致。"
-  else
-    c_warn "尚未确认 P0 缓存修复已经应用，或配置被外部修改；请先选择 17。"
-    failed=1
-  fi
+  if freshness_profile_ready; then c_ok "P0 缓存策略应用记录及当前配置一致。"
+  else c_warn "尚未确认本版缓存策略已应用，或配置被外部修改；请先选择 17。"; failed=1; fi
   if homepage_code="$(curl --noproxy '*' -sS --connect-timeout 5 --max-time 12 -o /dev/null -w '%{http_code}' "https://$DOMAIN/" 2> "$dir/home.err")" && \
     [[ "$homepage_code" =~ ^(200|301|302|404)$ ]]; then
     c_ok "伪装页访问正常，HTTP_CODE=$homepage_code（已验证 HTTPS 证书）"
   else
-    c_err "伪装页访问异常，HTTP_CODE=${homepage_code:-000}"
-    cat "$dir/home.err" >&2; failed=1
+    c_err "伪装页访问异常，HTTP_CODE=${homepage_code:-000}"; cat "$dir/home.err" >&2; failed=1
   fi
   for qtype in 1 28; do
-    if ! dns_wire make "$domain" "$dir/query" "$qtype" stable; then rm -rf -- "$dir"; return 1; fi
+    dns_wire make "$domain" "$dir/query-$qtype" "$qtype" stable || return 1
     c_info "检查本机 Unbound（QTYPE=$qtype；1=A，28=AAAA）"
-    if ! dns_wire tcp "$dir/query" "$dir/unbound-answer" 127.0.0.1 "$UNBOUND_PORT" || \
-       ! dns_wire check "$dir/query" "$dir/unbound-answer" "$FRESHNESS_MAX_TTL" answer; then
-      failed=1
-    fi
-    for target in local public; do
-      route_args=()
-      if [[ "$target" == local ]]; then
-        route_args=(--resolve "$DOMAIN:443:127.0.0.1")
-        c_info "检查本机 HTTPS→mosdns→Unbound（绕过 CDN/域名调度）"
-      else
-        c_info "检查公网域名的 DoH 入口（使用本机 DNS 解析入口域名）"
-      fi
-      encoded="$(dns_wire url "$dir/query")" || { rm -rf -- "$dir"; return 1; }
+    if ! dns_wire tcp "$dir/query-$qtype" "$dir/unbound-$qtype.answer" 127.0.0.1 "$UNBOUND_PORT" || \
+       ! dns_wire check "$dir/query-$qtype" "$dir/unbound-$qtype.answer" "$UB_MAX_TTL" answer; then failed=1; fi
+    for target in mosdns local public; do
       for method in POST GET; do
-        endpoint="https://$DOMAIN$DOH_PATH"
-        request_args=()
-        if [[ "$method" == POST ]]; then
-          request_args=(-H 'Content-Type: application/dns-message' --data-binary "@$dir/query")
-        else
-          endpoint="$endpoint?dns=$encoded"
-        fi
-        c_info "HTTP $method 查询（不添加绕过缓存参数）"
-        if doh_code="$(curl --noproxy '*' -sS --connect-timeout 5 --max-time 12 \
-          ${route_args[@]+"${route_args[@]}"} ${request_args[@]+"${request_args[@]}"} -H 'Accept: application/dns-message' \
-          -D "$dir/headers" -o "$dir/answer" -w '%{http_code}' \
-          "$endpoint" 2> "$dir/doh.err")" && [[ "$doh_code" == 200 ]]; then
-          content_type="$(awk 'tolower($1)=="content-type:" {$1=""; print tolower($0)}' "$dir/headers")"
-          if [[ "$content_type" != *application/dns-message* ]]; then
-            c_err "HTTP 200 但不是 DNS 报文，不能判断正常。"; failed=1
-          elif ! dns_wire check "$dir/query" "$dir/answer" "$FRESHNESS_MAX_TTL" answer; then
-            failed=1
-          fi
-          if ! grep -Ei '^cache-control:.*no-store' "$dir/headers" >/dev/null || \
-             grep -Ei '^age:[[:space:]]*[1-9]|^cf-cache-status:[[:space:]]*(HIT|STALE|UPDATING)' "$dir/headers" >/dev/null; then
-            c_warn "响应缺少 no-store 或显示命中 HTTP 缓存，请检查 Nginx/CDN 是否仍使用旧规则。"; failed=1
-          fi
-        else
-          c_err "DoH 路径访问异常，HTTP_CODE=${doh_code:-000}（$target/$method）"
-          cat "$dir/doh.err" >&2; failed=1
-        fi
+        if ! doh_probe "$dir/query-$qtype" "$dir/allow-$qtype-$target-$method" "$target" "$method" answer; then failed=1; fi
       done
     done
   done
-  rm -rf -- "$dir"
   if (( failed == 0 )); then
+    rm -rf -- "$dir" || return 1
     c_ok "结论：所测域名的本机 DNS、HTTPS 和公网 DoH 响应及 TTL 检查通过。"
   else
     c_warn "结论：存在配置、证书、DNS 或网络异常，具体原因见上方各层结果。"
+    c_info "原始响应及检查证据保留于: $dir"
   fi
   c_info "NXDOMAIN/NODATA 表示该次没有对应地址；TTL 合规不等于权威已更新，多个上游也可能暂时答复不同 IP。"
   return "$failed"
@@ -2253,7 +2228,7 @@ assert_unbound_freshness() {
     value="$(unbound-checkconf -o "$key" "$config" 2>/dev/null)" || { c_err "无法读取有效 Unbound 选项: $key"; return 1; }
     case "$key" in
       cache-min-ttl) [[ "$value" == 0 ]] || { c_err "$key 被其他配置改为 $value，已阻止应用"; return 1; } ;;
-      cache-max-ttl) valid_uint "$value" && (( value > 0 && value <= FRESHNESS_MAX_TTL )) || { c_err "$key=$value 超出 P0 上限，已阻止应用"; return 1; } ;;
+      cache-max-ttl) valid_uint "$value" && (( value > 0 && value <= FRESHNESS_MAX_TTL && value == UB_MAX_TTL )) || { c_err "$key=$value 与本次配置 $UB_MAX_TTL 不一致或超出 P0 上限，已阻止应用"; return 1; } ;;
       cache-max-negative-ttl) valid_uint "$value" && (( value <= FRESHNESS_NEGATIVE_TTL )) || { c_err "$key=$value 超出负缓存上限，已阻止应用"; return 1; } ;;
       serve-expired) [[ "$value" == no ]] || { c_err "其他配置重新开启了过期回答，已阻止应用"; return 1; } ;;
       prefetch) [[ "$value" == yes ]] || { c_err "其他配置关闭了预取，已阻止应用"; return 1; } ;;
@@ -2311,7 +2286,7 @@ offer_freshness_upgrade() {
   if freshness_profile_ready; then return 0; fi
   c_warn "检测到旧版/未确认的运行配置。仅下载新脚本不能清除正在运行的旧缓存。"
   c_info "本次部署会重载 mosdns/Unbound 并迁移旧缓存参数；以后按 TTL 自动更新，不会安装周期性重启任务。"
-  if confirm_numeric "是否现在应用 v2.6.4 的 P0 缓存修复（等同菜单 17）？"; then
+  if confirm_numeric "是否现在应用 v2.6.5 的 P0 缓存修复（等同菜单 17）？"; then
     run_action apply_all
   else
     c_warn "已取消应用，现有服务未改动；P0 修复尚未生效，可稍后选择 17。"
@@ -2323,8 +2298,8 @@ offer_freshness_upgrade() {
 # It validates real DNS messages instead of accepting HTTP 200/400 as DNS success.
 dns_wire() {
   have_cmd python3 || { c_err "缺少 python3，不能验证 DNS 报文"; return 1; }
-  python3 - "$@" <<'PYDNS'
-import base64, ipaddress, json, os, socket, struct, sys
+  DOH_NEGATIVE_TTL_CAP="$FRESHNESS_NEGATIVE_TTL" python3 - "$@" <<'PYDNS'
+import base64, ipaddress, json, os, re, socket, struct, sys
 
 def name_at(data, offset):
     labels, seen, end = [], set(), None
@@ -2338,7 +2313,10 @@ def name_at(data, offset):
                 raise ValueError('压缩指针不完整')
             if end is None:
                 end = offset + 2
-            offset = ((n & 63) << 8) | data[offset+1]
+            target = ((n & 63) << 8) | data[offset+1]
+            if target >= offset:
+                raise ValueError('DNS 压缩指针必须指向先前的名称')
+            offset = target
             continue
         if n & 0xc0:
             raise ValueError('DNS 标签类型无效')
@@ -2352,6 +2330,10 @@ def name_at(data, offset):
         labels.append(data[offset:offset+n])
         offset += n
 
+def display_name(name):
+    # Escape non-printable bytes; never send DNS-controlled terminal escapes to the UI.
+    return name.decode('ascii', errors='backslashreplace').encode('unicode_escape').decode('ascii') or '.'
+
 def recv_exact(sock, n):
     data = bytearray()
     while len(data) < n:
@@ -2361,22 +2343,57 @@ def recv_exact(sock, n):
         data.extend(chunk)
     return bytes(data)
 
+def inspect_headers(path, require_no_store):
+    raw = open(path, 'rb').read().decode('iso-8859-1')
+    headers, status = {}, None
+    for line in raw.splitlines():
+        if re.match(r'^HTTP/\S+\s+\d{3}(?:\s|$)', line):
+            status = int(line.split()[1]); headers = {}
+        elif ':' in line and status is not None:
+            key, value = line.split(':', 1)
+            headers.setdefault(key.strip().lower(), []).append(value.strip())
+    if status != 200:
+        raise ValueError('HTTP 响应头缺失或最终状态不是 200')
+    types = headers.get('content-type', [])
+    if not types or any(x.split(';', 1)[0].strip().lower() != 'application/dns-message' for x in types):
+        raise ValueError('HTTP 200 但 Content-Type 不是 application/dns-message')
+    if any(x.lower() not in ('identity', '') for x in headers.get('content-encoding', [])):
+        raise ValueError('未解码的 HTTP 压缩报文，不能按 DNS 原始报文验证')
+    # Direct mosdns HTTP is not the public cache boundary. nginx must enforce no-store.
+    if require_no_store:
+        tokens = [v.strip().lower() for x in headers.get('cache-control', []) for v in x.split(',')]
+        if 'no-store' not in tokens:
+            raise ValueError('HTTPS DoH 响应缺少有效 no-store 指令')
+        for age in headers.get('age', []):
+            if not age.isdigit() or int(age) != 0:
+                raise ValueError('HTTP Age={}，疑似命中缓存或响应头无效'.format(age))
+        for value in headers.get('cf-cache-status', []):
+            if value.upper() in ('HIT', 'STALE', 'UPDATING'):
+                raise ValueError('HTTP 缓存状态为 {}'.format(value))
+    print('[OK] HTTP 状态、DNS 媒体类型{}检查通过'.format('、no-store/缓存状态' if require_no_store else ''))
+
 try:
     mode = sys.argv[1]
     if mode == 'make':
         name, dest = sys.argv[2:4]
         qtype = int(sys.argv[4]) if len(sys.argv) > 4 else 1
         labels = name.rstrip('.').encode('ascii').split(b'.')
-        if not labels or any(not x or len(x) > 63 for x in labels) or sum(map(len, labels))+len(labels)>254:
-            raise ValueError('查询域名格式无效')
+        if not 1 <= qtype <= 65535 or not labels or any(not x or len(x) > 63 for x in labels) or sum(map(len, labels))+len(labels)>254:
+            raise ValueError('查询域名或类型无效')
         q = b''.join(bytes([len(x)])+x for x in labels)+b'\0'+struct.pack('!HH', qtype, 1)
         with open(dest, 'wb') as f:
             ident = b'\0\0' if len(sys.argv) > 5 and sys.argv[5] == 'stable' else os.urandom(2)
             f.write(ident+struct.pack('!HHHHH', 0x0100, 1, 0, 0, 0)+q)
     elif mode == 'url':
         print(base64.urlsafe_b64encode(open(sys.argv[2], 'rb').read()).rstrip(b'=').decode('ascii'))
+    elif mode == 'headers':
+        if sys.argv[3] not in ('yes', 'no'):
+            raise ValueError('HTTP 检查模式无效')
+        inspect_headers(sys.argv[2], sys.argv[3] == 'yes')
     elif mode == 'tcp':
         query = open(sys.argv[2], 'rb').read()
+        if not 12 <= len(query) <= 65535:
+            raise ValueError('DNS 查询长度无效')
         with socket.create_connection((sys.argv[4], int(sys.argv[5])), timeout=8) as sock:
             sock.settimeout(8)
             sock.sendall(struct.pack('!H', len(query))+query)
@@ -2387,63 +2404,113 @@ try:
     elif mode == 'check':
         query, data = open(sys.argv[2], 'rb').read(), open(sys.argv[3], 'rb').read()
         cap, expected = int(sys.argv[4]), sys.argv[5]
-        if len(query) < 12 or not 12 <= len(data) <= 65535:
+        if not 1 <= cap <= 30 or expected not in ('answer', 'deny3', 'deny5'):
+            raise ValueError('TTL 上限或检查模式无效，禁止放宽 P0 上限')
+        neg_cap = min(cap, int(os.environ['DOH_NEGATIVE_TTL_CAP']))
+        if not 1 <= neg_cap <= 5:
+            raise ValueError('负缓存上限必须在 1 至 5 秒以内')
+        if not 12 <= len(query) <= 65535 or not 12 <= len(data) <= 65535:
             raise ValueError('DNS 报文长度无效')
+        qheader = struct.unpack('!HHHHHH', query[:12])
+        if qheader[1] & 0xf800 or qheader[2:] != (1, 0, 0, 0):
+            raise ValueError('原始 DNS 查询头无效')
         ident, flags, qd, an, ns, ar = struct.unpack('!HHHHHH', data[:12])
-        if data[:2] != query[:2] or not flags & 0x8000 or flags & 0x7800 or flags & 0x0200 or qd != 1:
+        if ident != qheader[0] or not flags & 0x8000 or flags & 0x7800 or flags & 0x0200 or qd != 1:
             raise ValueError('DNS ID/响应头无效或报文截断')
         qname, qe = name_at(query, 12)
         name, offset = name_at(data, 12)
-        if name != qname or len(data) < offset+4 or data[offset:offset+4] != query[qe:qe+4]:
+        if qe+4 != len(query) or name != qname or len(data) < offset+4 or data[offset:offset+4] != query[qe:qe+4]:
             raise ValueError('DNS question 不匹配')
-        qtype = struct.unpack('!H', query[qe:qe+2])[0]
+        qtype, qclass = struct.unpack('!HH', query[qe:qe+4])
         offset += 4
-        rr, ttls, extended_rcode = [], [], 0
+        answers, records, ttls, extended_rcode, opt_seen = [], [], [], 0, False
         for index in range(an+ns+ar):
+            section = 'Answer' if index < an else ('Authority' if index < an+ns else 'Additional')
             owner, offset = name_at(data, offset)
             if offset+10 > len(data):
                 raise ValueError('资源记录头不完整')
             kind, cls, ttl, size = struct.unpack('!HHIH', data[offset:offset+10])
             offset += 10
-            if offset+size > len(data):
+            end = offset+size
+            if end > len(data):
                 raise ValueError('资源记录数据不完整')
             if kind == 41:
+                if opt_seen or section != 'Additional' or owner != b'':
+                    raise ValueError('OPT 记录位置、数量或名称无效')
+                opt_seen = True
                 extended_rcode = (ttl >> 24) << 4
-            else:
-                ttls.append(ttl)
-                if ttl > cap:
-                    raise ValueError('响应 TTL={} 超过本地上限 {}；可能仍运行旧缓存/配置或命中其他 DoH 实例'.format(ttl, cap))
-            text = None
-            if index < an and cls == 1:
-                if kind in (1, 28):
-                    if size != (4 if kind == 1 else 16):
-                        raise ValueError('A/AAAA 记录长度无效')
-                    text = str(ipaddress.ip_address(data[offset:offset+size]))
-                elif kind == 5:
-                    target, target_end = name_at(data, offset)
-                    if target_end != offset+size:
-                        raise ValueError('CNAME 数据长度无效')
-                    text = target.decode('ascii')
-                if text is not None:
-                    rr.append({'owner': owner.decode('ascii'), 'type': kind, 'value': text, 'ttl': ttl})
-            offset += size
+                if (ttl >> 16) & 255:
+                    raise ValueError('不支持的 EDNS 版本')
+                pos = offset
+                while pos < end:
+                    if pos+4 > end:
+                        raise ValueError('EDNS 选项头不完整')
+                    length = struct.unpack('!H', data[pos+2:pos+4])[0]
+                    pos += 4+length
+                    if pos > end:
+                        raise ValueError('EDNS 选项数据不完整')
+                # OPT's TTL-shaped field is flags/RCODE, not a resource-record TTL.
+                offset = end
+                continue
+            item = {'section':section, 'owner':display_name(owner), 'type':kind, 'class':cls, 'ttl':ttl}
+            ttls.append(ttl)
+            if kind in (1, 28):
+                if size != (4 if kind == 1 else 16):
+                    raise ValueError('A/AAAA 记录长度无效')
+                item['value'] = str(ipaddress.ip_address(data[offset:end]))
+            elif kind in (2, 5, 12, 39):
+                target, target_end = name_at(data, offset)
+                if target_end != end:
+                    raise ValueError('名称类型资源记录长度无效')
+                item['value'] = display_name(target)
+            elif kind == 6:
+                mname, pos = name_at(data, offset)
+                rname, pos = name_at(data, pos)
+                if pos+20 != end:
+                    raise ValueError('SOA 数据长度无效')
+                serial, refresh, retry, expire, minimum = struct.unpack('!IIIII', data[pos:end])
+                item.update(mname=display_name(mname), rname=display_name(rname), minimum=minimum,
+                            negative_ttl=min(ttl, minimum))
+            records.append(item)
+            if section == 'Answer' and cls == qclass and kind in (1,28,5,39):
+                answers.append(item)
+            offset = end
         if offset != len(data):
             raise ValueError('DNS 报文含多余数据')
         rcode = (flags & 15) | extended_rcode
+        description = 'QNAME={} QTYPE={} RCODE={} 检查={}'.format(display_name(name), {1:'A',28:'AAAA'}.get(qtype,qtype), rcode, expected)
         if expected.startswith('deny'):
-            wanted = int(expected[4:])
-            if rcode != wanted:
-                raise ValueError('非白名单查询未按策略拒绝，RCODE={}'.format(rcode))
+            if rcode != int(expected[4:]) or an != 0:
+                raise ValueError('{}；非白名单查询未按策略拒绝或包含 Answer'.format(description))
         elif rcode not in (0, 3):
-            raise ValueError('RCODE={} (2=SERVFAIL, 5=REFUSED)'.format(rcode))
-        print('[OK] DNS 响应有效: {}，{}，RCODE={}，最大 TTL={}秒'.format(name.decode('ascii'), {1:'A',28:'AAAA'}.get(qtype,str(qtype)), rcode, max(ttls) if ttls else 0))
-        for item in rr:
-            print('  {} {} {}  TTL={}秒'.format(item['owner'], {1:'A',28:'AAAA',5:'CNAME'}[item['type']], item['value'], item['ttl']))
-        if not expected.startswith('deny') and not any(x['type'] == qtype for x in rr):
-            print('[!] DNS 已答复，但没有所查询的地址记录（NXDOMAIN/NODATA）；不据此判断对应节点可连接。')
+            raise ValueError('{}；解析失败 (2=SERVFAIL, 5=REFUSED)'.format(description))
+        soa = [r for r in records if r['section']=='Authority' and r['type']==6 and r['class']==qclass]
+        address_present = any(r['type']==qtype for r in answers)
+        negative = rcode==3 or (rcode==0 and not address_present)
+        if expected=='answer' and rcode==0 and negative and not soa and any(r['section']=='Authority' and r['type']==2 for r in records):
+            raise ValueError('{}；返回的是转介而不是最终递归回答'.format(description))
+        violations = []
+        for r in records:
+            allowed = neg_cap if expected.startswith('deny') or (negative and r['section']=='Authority' and r['type']==6) else cap
+            if r['ttl'] > allowed:
+                detail = '{} OWNER={} TYPE={} TTL={} 超过上限 {}'.format(r['section'],r['owner'],{1:'A',28:'AAAA',5:'CNAME',6:'SOA'}.get(r['type'],r['type']),r['ttl'],allowed)
+                if r['type']==6:
+                    detail += '；SOA.MINIMUM={}，有效负 TTL={}'.format(r['minimum'],r['negative_ttl'])
+                    if expected.startswith('deny'):
+                        detail += '（本地拒绝合成记录，不可据此认定 Unbound 缓存失效）'
+                violations.append(detail)
+        if violations:
+            raise ValueError(description+'；'+'；'.join(violations[:5]))
+        print('[OK] DNS 响应有效: {}；最大 RR TTL={}秒'.format(description,max(ttls) if ttls else 0))
+        for item in answers:
+            print('  {} {} {} TTL={}秒'.format(item['owner'],{1:'A',28:'AAAA',5:'CNAME',39:'DNAME'}[item['type']],item['value'],item['ttl']))
+        for item in soa:
+            print('  Authority SOA {} RR-TTL={}秒 MINIMUM={} 有效负TTL={}秒'.format(item['owner'],item['ttl'],item['minimum'],item['negative_ttl']))
+        if expected=='answer' and not address_present:
+            print('[!] DNS 已答复，但没有所查询的地址记录（NXDOMAIN/NODATA）；不据此判断节点可连接。')
         if len(sys.argv) > 6:
             with open(sys.argv[6], 'w') as f:
-                json.dump({'rcode':rcode, 'answers':rr, 'max_ttl':max(ttls) if ttls else 0}, f)
+                json.dump({'rcode':rcode,'answers':answers,'records':records,'max_ttl':max(ttls) if ttls else 0,'qname':display_name(name),'qtype':qtype},f)
     else:
         raise ValueError('未知 DNS 检查模式')
 except Exception as exc:
@@ -2453,49 +2520,179 @@ PYDNS
 }
 
 dns_backend_smoke() {
-  local dir name code expected=deny5 type
-  dir="$(new_workdir)" || return 1
-  # .invalid is reserved and the generated name must NOT be allowed by any rule.
+  local dir name expected=deny5 qtype route method sample failed=0 own_dir=no
+  if [[ $# -gt 0 ]]; then
+    dir="$1"
+    [[ ! -e "$dir" && ! -L "$dir" ]] && mkdir -m 700 -- "$dir" || return 1
+  else
+    dir="$(new_workdir)" || return 1
+    own_dir=yes
+  fi
+  if ! normalize_allowlist_file "$ALLOWLIST_FILE" "$dir/list"; then return 1; fi
   name="doh-check-${BASHPID}-${RANDOM}.invalid"
-  if ! normalize_allowlist_file "$ALLOWLIST_FILE" "$dir/list"; then rm -rf -- "$dir"; return 1; fi
   if awk -v n="$name" 'n==$0 || (length(n)>length($0) && substr(n,length(n)-length($0),1)=="." && substr(n,length(n)-length($0)+1)==$0) {found=1} END {exit !found}' "$dir/list"; then
-    c_err "健康检查专用域名意外命中白名单，无法验证拒绝策略。"; rm -rf -- "$dir"; return 1
+    c_err "自检域名意外命中白名单，无法验证拒绝策略；证据: $dir"; return 1
   fi
   [[ "$DENY_MODE" != nxdomain ]] || expected=deny3
-  if ! dns_wire make "$name" "$dir/query"; then rm -rf -- "$dir"; return 1; fi
-  # Verify local HTTPS + nginx + the newly started mosdns pipeline, not a CDN copy.
-  if ! code="$(curl --noproxy '*' -sS --connect-timeout 3 --max-time 8 \
-    --resolve "$DOMAIN:443:127.0.0.1" -H 'Content-Type: application/dns-message' -H 'Accept: application/dns-message' \
-    --data-binary "@$dir/query" -D "$dir/headers" -o "$dir/answer" -w '%{http_code}' "https://$DOMAIN$DOH_PATH")" || [[ "$code" != 200 ]]; then
-    c_err "本机 HTTPS DoH 自检失败（HTTP=${code:-000}）；不是仅凭进程启动判定成功。"
-    rm -rf -- "$dir"; return 1
-  fi
-  type="$(awk 'tolower($1)=="content-type:" {$1="";print tolower($0)}' "$dir/headers")"
-  if [[ "$type" != *application/dns-message* ]] || ! grep -Ei '^cache-control:.*no-store' "$dir/headers" >/dev/null || \
-    ! dns_wire check "$dir/query" "$dir/answer" "$FRESHNESS_MAX_TTL" "$expected"; then
-    c_err "本机 DoH 拒绝策略、报文格式或 no-store 检查失败。"; rm -rf -- "$dir"; return 1
-  fi
-  # Check one real admitted query as well: REFUSED alone never reaches Unbound.
+  # Rejection must be short-TTL at mosdns itself; it never traverses Unbound.
+  for qtype in 1 28; do
+    dns_wire make "$name" "$dir/deny-$qtype.query" "$qtype" stable || return 1
+    for route in mosdns local; do
+      for method in POST GET; do
+        if ! doh_probe "$dir/deny-$qtype.query" "$dir/deny-$qtype-$route-$method" "$route" "$method" "$expected"; then
+          c_err "非白名单拒绝分支验证失败（不等于 Unbound 缓存失效）；证据: $dir"; return 1
+        fi
+      done
+    done
+  done
   name="$(sed -n '1p' "$dir/list")"
-  [[ -n "$name" ]] || { c_err "白名单为空，无法验证实际解析链"; rm -rf -- "$dir"; return 1; }
-  if ! dns_wire make "$name" "$dir/query" || \
-     ! dns_wire tcp "$dir/query" "$dir/ub-answer" 127.0.0.1 "$UNBOUND_PORT" || \
-     ! dns_wire check "$dir/query" "$dir/ub-answer" "$FRESHNESS_MAX_TTL" answer; then
-    c_err "本机 Unbound 实际查询/TTL 验证失败，未把启动成功当作缓存修复成功。"
-    rm -rf -- "$dir"; return 1
-  fi
+  [[ -n "$name" ]] || { c_err "白名单为空，无法验证实际解析链"; return 1; }
+  for qtype in 1 28; do
+    dns_wire make "$name" "$dir/allow-$qtype.query" "$qtype" stable || return 1
+    # Both first and subsequent answers are tested. There is no downstream TTL
+    # clamp on this branch: an old/misloaded Unbound still fails the same limit.
+    for sample in first repeat; do
+      c_info "$(date '+%T') Unbound TCP/$UNBOUND_PORT: $name QTYPE=$qtype ($sample)"
+      if ! dns_wire tcp "$dir/allow-$qtype.query" "$dir/ub-$qtype-$sample.answer" 127.0.0.1 "$UNBOUND_PORT" || \
+         ! dns_wire check "$dir/allow-$qtype.query" "$dir/ub-$qtype-$sample.answer" "$UB_MAX_TTL" answer "$dir/ub-$qtype-$sample.json" > "$dir/ub-$qtype-$sample.check" 2>&1; then
+        [[ ! -f "$dir/ub-$qtype-$sample.check" ]] || cat "$dir/ub-$qtype-$sample.check" >&2
+        c_err "Unbound 实际回答/TTL 检查失败；未由 mosdns 降 TTL 掩盖；证据: $dir"; return 1
+      fi
+      cat "$dir/ub-$qtype-$sample.check"
+    done
+    for route in mosdns local; do
+      for method in POST GET; do
+        if ! doh_probe "$dir/allow-$qtype.query" "$dir/allow-$qtype-$route-$method" "$route" "$method" answer; then
+          c_err "白名单解析分支验证失败；证据: $dir"; return 1
+        fi
+      done
+    done
+  done
+  if [[ "$own_dir" == yes ]]; then rm -rf -- "$dir" || return 1; fi
+  c_ok "本机 A/AAAA、GET/POST、Unbound 首次/重复回答、拒绝分支及 HTTPS no-store 全部通过。"
+}
+
+# v2.6.5: denial TTL is constrained at its source, not by forgiving the checker.
+negative_response_cap() {
+  valid_uint "$UB_MAX_TTL" && (( UB_MAX_TTL > 0 && UB_MAX_TTL <= FRESHNESS_MAX_TTL )) || return 1
+  if (( UB_MAX_TTL < FRESHNESS_NEGATIVE_TTL )); then printf '%s\n' "$UB_MAX_TTL"
+  else printf '%s\n' "$FRESHNESS_NEGATIVE_TTL"; fi
+}
+
+doh_probe() {
+  local query="$1" prefix="$2" route="$3" method="$4" expected="$5" code endpoint encoded need_store=yes
+  local -a routing=() request=()
+  case "$route" in
+    mosdns) endpoint="http://$MOSDNS_HTTP_ADDR$DOH_PATH"; need_store=no ;;
+    local) endpoint="https://$DOMAIN$DOH_PATH"; routing=(--resolve "$DOMAIN:443:127.0.0.1") ;;
+    public) endpoint="https://$DOMAIN$DOH_PATH" ;;
+    *) c_err "未知 DoH 检查层: $route"; return 1 ;;
+  esac
+  case "$method" in
+    POST) request=(-H 'Content-Type: application/dns-message' --data-binary "@$query") ;;
+    GET) encoded="$(dns_wire url "$query")" || return 1; endpoint="$endpoint?dns=$encoded" ;;
+    *) c_err "未知 DoH 检查方法: $method"; return 1 ;;
+  esac
+  printf 'time=%s\nroute=%s\nmethod=%s\nexpected=%s\nurl=%s\n' "$(date -Is)" "$route" "$method" "$expected" "$endpoint" > "$prefix.meta" || return 1
+  c_info "$(date '+%T') DNS 自检: $route / $method / $expected"
+  log_action "DNS validation start route=$route method=$method expected=$expected evidence=$prefix"
+  # No insecure TLS, no cache-busting query parameters and no automatic retry of a bad TTL.
   if ! code="$(curl --noproxy '*' -sS --connect-timeout 3 --max-time 12 \
-    --resolve "$DOMAIN:443:127.0.0.1" -H 'Content-Type: application/dns-message' -H 'Accept: application/dns-message' \
-    --data-binary "@$dir/query" -D "$dir/headers" -o "$dir/answer" -w '%{http_code}' "https://$DOMAIN$DOH_PATH")" || [[ "$code" != 200 ]]; then
-    c_err "白名单内域名的本机 DoH 查询失败（HTTP=${code:-000}）。"; rm -rf -- "$dir"; return 1
+    ${routing[@]+"${routing[@]}"} ${request[@]+"${request[@]}"} \
+    -H 'Accept: application/dns-message' -D "$prefix.headers" -o "$prefix.answer" \
+    -w '%{http_code}' "$endpoint" 2> "$prefix.curl-error")" || [[ "$code" != 200 ]]; then
+    c_err "$route/$method DoH 请求失败（HTTP=${code:-000}）"
+    cat "$prefix.curl-error" >&2
+    log_action "DNS validation HTTP failed route=$route method=$method HTTP=${code:-000} evidence=$prefix"
+    return 1
   fi
-  type="$(awk 'tolower($1)=="content-type:" {$1="";print tolower($0)}' "$dir/headers")"
-  if [[ "$type" != *application/dns-message* ]] || ! grep -Ei '^cache-control:.*no-store' "$dir/headers" >/dev/null || \
-     ! dns_wire check "$dir/query" "$dir/answer" "$FRESHNESS_MAX_TTL" answer; then
-    c_err "本机 DoH 实际解析/TTL/no-store 验证失败。"; rm -rf -- "$dir"; return 1
+  if ! dns_wire headers "$prefix.headers" "$need_store" > "$prefix.header-check" 2>&1; then
+    cat "$prefix.header-check" >&2
+    c_err "$route/$method HTTP 头检查失败，未进入成功状态"; return 1
   fi
-  rm -rf -- "$dir"
-  c_ok "本机 HTTPS→mosdns→Unbound 实际查询、TTL 上限和白名单拦截自检通过。"
+  if ! dns_wire check "$query" "$prefix.answer" "$UB_MAX_TTL" "$expected" "$prefix.json" > "$prefix.dns-check" 2>&1; then
+    cat "$prefix.dns-check" >&2
+    c_err "$route/$method DNS 报文检查失败（$expected），原始数据: $prefix.answer"
+    log_action "DNS validation wire failed route=$route method=$method expected=$expected evidence=$prefix"
+    return 1
+  fi
+  cat "$prefix.header-check" "$prefix.dns-check"
+  log_action "DNS validation passed route=$route method=$method expected=$expected"
+}
+
+runtime_config_identity() {
+  local unbound_pid mosdns_pid
+  unbound_pid="$(systemctl show -p MainPID "$UNBOUND_UNIT")" || return 1
+  mosdns_pid="$(systemctl show -p MainPID "$MOSDNS_UNIT")" || return 1
+  unbound_pid="${unbound_pid#MainPID=}"; mosdns_pid="${mosdns_pid#MainPID=}"
+  [[ "$unbound_pid" =~ ^[1-9][0-9]*$ && "$mosdns_pid" =~ ^[1-9][0-9]*$ ]] || { c_err "无法读取运行服务 MainPID"; return 1; }
+  python3 - "$unbound_pid" "$mosdns_pid" /etc/unbound/unbound.conf "$CONF_DIR/config.yaml" <<'PYRUN'
+import hashlib, json, os, re, subprocess, sys
+
+def config_arg(argv, kind):
+    found = []
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a == '-c' or (kind == 'mosdns' and a == '--config'):
+            i += 1
+            if i >= len(argv):
+                raise ValueError('进程 -c/--config 缺少参数')
+            found.append(argv[i])
+        elif kind == 'mosdns' and a.startswith('--config='):
+            found.append(a.split('=',1)[1])
+        elif a.startswith('-c') and len(a)>2:
+            found.append(a[2:].lstrip('='))
+        i += 1
+    if len(found)>1:
+        raise ValueError('进程存在多个 config 参数，不能确认运行配置')
+    return found[0] if found else None
+
+try:
+    for kind, pid, expected in [('unbound',sys.argv[1],sys.argv[3]),('mosdns',sys.argv[2],sys.argv[4])]:
+        proc = '/proc/'+pid
+        executable = os.readlink(proc+'/exe')
+        if os.path.basename(executable) not in ({'unbound'} if kind=='unbound' else {'mosdns','mosdns-x'}):
+            raise ValueError('{} MainPID 对应的程序不是预期二进制: {}'.format(kind,executable))
+        if kind=='mosdns' and not os.path.samefile(proc+'/exe','/usr/local/bin/mosdns'):
+            raise ValueError('mosdns 运行二进制与 /usr/local/bin/mosdns 不一致')
+        argv = [os.fsdecode(x) for x in open(proc+'/cmdline','rb').read().split(b'\0') if x]
+        actual = config_arg(argv,kind)
+        if actual is None and kind=='unbound':
+            # Stock units often omit -c. Read this binary's compiled-in default, not a guess.
+            help_output = subprocess.run([proc+'/exe','-h'],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=5).stdout.decode('utf-8',errors='replace')
+            match = re.search(r'config file to read instead of\s+(\S+)',help_output)
+            if match:
+                actual = match.group(1)
+        if not actual or not os.path.isabs(actual):
+            raise ValueError('{} 无法确认绝对配置路径；请核对 unit 的 -c 参数'.format(kind))
+        if os.path.realpath(actual) != os.path.realpath(expected):
+            raise ValueError('{} 实际配置 {} 不是本次写入的 {}；未修改自定义服务'.format(kind,actual,expected))
+        # proc start ticks detect a restart during validation even if a PID is reused.
+        start_ticks = open(proc+'/stat').read().rsplit(')',1)[1].split()[19]
+        digest = hashlib.sha256(open(expected,'rb').read()).hexdigest()
+        print(json.dumps({'service':kind,'pid':int(pid),'start_ticks':start_ticks,'executable':executable,'config':actual,'sha256':digest},sort_keys=True))
+except Exception as exc:
+    print('[-] 运行配置身份检查失败: {}'.format(exc),file=sys.stderr)
+    sys.exit(1)
+PYRUN
+}
+
+validate_running_freshness() {
+  local dir="$1" before after
+  c_info "$(date '+%T') 核对合并配置、运行进程和分层 DNS 响应"
+  assert_unbound_freshness /etc/unbound/unbound.conf || return 1
+  before="$(freshness_fingerprint)" || return 1
+  runtime_config_identity > "$dir/runtime.before" || return 1
+  cat "$dir/runtime.before"
+  dns_backend_smoke "$dir/validation" || return 1
+  assert_unbound_freshness /etc/unbound/unbound.conf || return 1
+  runtime_config_identity > "$dir/runtime.after" || return 1
+  after="$(freshness_fingerprint)" || return 1
+  if ! cmp -s "$dir/runtime.before" "$dir/runtime.after" || [[ "$before" != "$after" ]]; then
+    c_err "验证过程中服务重启或配置发生变化；不能把不同运行实例的结果合并为成功"; return 1
+  fi
+  c_ok "运行配置身份与检查期间进程保持一致；实际 DNS 自检通过。"
 }
 
 main() {

@@ -3,18 +3,18 @@ set -euo pipefail
 
 ############################################
 # DoH Manager PRO (All-in-One + allowlist.txt)
-# Version: v2.6.3
+# Version: v2.6.4
 #
-# v2.6.3 修复：
-# 1) 修复白名单清洗误删字母 r（.org 变 .og）和规则格式解析错误
-# 2) 修复日志等级兼容、实时日志中断和服务检测问题
-# 3) 修复失败仍报成功、配置部分覆盖及证书签发破坏 HTTPS 的问题
-# 4) 修复状态文件、临时文件、输入校验、健康检查和卸载逻辑
-# 保留 v2.6.2 的菜单、布局、选项与解析架构；不增加功能入口。
-# 总行数: 2230（含注释和空行；LF 换行）
+# v2.6.4 修复：
+# 1) P0: 单层短 TTL 缓存、禁用过期回答、禁止 HTTP 缓存；兼容迁移旧状态
+# 2) 应用时校验最终生效配置和本机 DNS 报文；失败恢复，禁止伪成功
+# 3) 所有交互确认统一为数字；现有白名单域名支持编号、翻页选择
+# 4) 保留 v2.6.3 主菜单布局/编号及已有功能；没有周期性重启或清缓存任务
+# 范围: 控制本机缓存；不能强制上游递归或客户端提前清除其缓存。
+# 总行数: 2565（含注释和空行；LF 换行）
 ############################################
 
-SCRIPT_VERSION="v2.6.3"
+SCRIPT_VERSION="v2.6.4"
 SCRIPT_NAME="DoH Manager PRO"
 MOSDNS_UNIT="mosdns"
 NGINX_UNIT="nginx"
@@ -55,10 +55,10 @@ DEFAULT_UPSTREAM_DOT=(
 
 DEFAULT_UB_MSG_CACHE="64m"
 DEFAULT_UB_RRSET_CACHE="128m"
-DEFAULT_UB_MIN_TTL="60"
-DEFAULT_UB_MAX_TTL="86400"
+DEFAULT_UB_MIN_TTL="0"
+DEFAULT_UB_MAX_TTL="30"
 DEFAULT_UB_PREFETCH="yes"
-DEFAULT_UB_SERVE_EXPIRED="yes"
+DEFAULT_UB_SERVE_EXPIRED="no"
 DEFAULT_UB_SERVE_EXPIRED_TTL="3600"
 DEFAULT_UB_SERVE_EXPIRED_REPLY_TTL="30"
 DEFAULT_UB_DO_IP6="no"
@@ -100,6 +100,13 @@ NGX_BURST=""
 
 NGINX_SSL_DIR=""
 FIRST_RUN="no"
+
+# P0 policy: these are local upper bounds, not an authoritative-DNS propagation SLA.
+FRESHNESS_POLICY_REVISION="1"
+FRESHNESS_MAX_TTL=30
+FRESHNESS_NEGATIVE_TTL=5
+FRESHNESS_MIGRATION_NEEDED="no"
+SELECTED_DOMAIN=""
 
 MENU_REQUIRED_FUNCTIONS=(
   ensure_environment
@@ -236,6 +243,16 @@ CORE_REQUIRED_FUNCTIONS=(
   cert_valid
   mos_native_log
   run_action
+  confirm_numeric
+  select_allowlist_domain
+  enforce_freshness_policy
+  assert_unbound_freshness
+  freshness_fingerprint
+  freshness_profile_ready
+  mark_freshness_applied
+  dns_wire
+  dns_backend_smoke
+  offer_freshness_upgrade
 )
 
 c_ok() { printf '\033[1;32m[OK]\033[0m %s\n' "$*"; }
@@ -434,11 +451,12 @@ load_state() {
   if [[ -z "${UPSTREAM_DOT[*]-}" ]]; then UPSTREAM_DOT=("${DEFAULT_UPSTREAM_DOT[@]}"); fi
   DOMAIN="$(normalize_hostname "$DOMAIN")" || { c_err "状态文件 DOMAIN 不合法"; return 1; }
   NGINX_SSL_DIR="/etc/nginx/ssl/$DOMAIN"
-  validate_runtime_values
+  validate_runtime_values || return 1
+  enforce_freshness_policy
 }
 save_state() {
   local tmp key value u
-  validate_runtime_values || return 1
+  enforce_freshness_policy && validate_runtime_values || return 1
   [[ ! -L "$STATE_FILE" && ! -L "$CONF_DIR" ]] || return 1
   mkdir -p -- "$(dirname -- "$STATE_FILE")" || return 1
   tmp="$(mktemp "${STATE_FILE}.tmp.XXXXXX")" || return 1
@@ -497,22 +515,30 @@ show_brief_runtime_status() {
   echo " 当前域名: ${DOMAIN}"
   echo " 当前路径: ${DOH_PATH}"
   echo " allowlist 条数: $(allowlist_count)"
+  if freshness_profile_ready; then
+    c_ok "缓存策略: 已应用 P0 修复（短 TTL、禁用过期回答，无周期性重启）。"
+  elif [[ -f "$CONF_DIR/config.yaml" ]]; then
+    c_warn "缓存策略: 未确认 v2.6.4 修复已应用，选择 17 生效；只运行新版脚本不会改变旧进程。"
+  fi
   echo "=============================================================="
 }
 
 show_allowlist() {
+  local dir total
   ensure_allowlist_file || return 1
-  local total
-  total="$(allowlist_count)" || return 1
+  dir="$(new_workdir)" || return 1
+  if ! normalize_allowlist_file "$ALLOWLIST_FILE" "$dir/list"; then rm -rf -- "$dir"; return 1; fi
+  total="$(wc -l < "$dir/list")"
   echo "==================== allowlist.txt ===================="
   echo "路径: ${ALLOWLIST_FILE}"
   echo "条数: ${total}"
   echo "--------------------------------------------------------"
-  awk '!/^[[:space:]]*(#|$)/ {n++; if(n<=200) print " - " $0}' "$ALLOWLIST_FILE" || return 1
+  awk '{if(NR<=200) printf " [%d] %s\n", NR, $0}' "$dir/list" || { rm -rf -- "$dir"; return 1; }
   if (( total > 200 )); then
     echo "..."
-    echo "(仅显示前200条，总计 ${total} 条)"
+    echo "(仅预览前200条；删除/健康检查的选择列表支持数字翻页，共 ${total} 条)"
   fi
+  rm -rf -- "$dir"
   echo "========================================================"
 }
 edit_allowlist_vim() {
@@ -560,19 +586,21 @@ add_allowlist_one() {
 remove_allowlist_one() {
   local s dir
   ensure_allowlist_file || return 1
-  show_allowlist || return 1
-  read -r -p "请输入要删除的域名/后缀（完整匹配）: " s || return 0
-  [[ -n "$s" ]] || { c_warn "未输入，取消"; return 0; }
-  s="$(normalize_domain_line "$s")" && [[ -n "$s" ]] || { c_err "域名格式无效"; return 1; }
   dir="$(new_workdir)" || return 1
   if ! normalize_allowlist_file "$ALLOWLIST_FILE" "$dir/list"; then rm -rf -- "$dir"; return 1; fi
-  if ! grep -qxF -- "$s" "$dir/list"; then c_warn "未找到: $s"; rm -rf -- "$dir"; return 0; fi
+  if ! select_allowlist_domain "$dir/list" "选择要删除的域名"; then rm -rf -- "$dir"; return 0; fi
+  s="$SELECTED_DOMAIN"
+  # A second editor must not make the displayed index refer to different data.
+  if ! normalize_allowlist_file "$ALLOWLIST_FILE" "$dir/current" || ! cmp -s "$dir/list" "$dir/current"; then
+    c_err "选择期间白名单被其他程序修改，请重新选择；没有覆盖外部改动。"
+    rm -rf -- "$dir"; return 1
+  fi
   if ! awk -v target="$s" '$0 != target' "$dir/list" > "$dir/new" || ! commit_allowlist "$dir/new"; then
     rm -rf -- "$dir"; return 1
   fi
   rm -rf -- "$dir"
   c_ok "已删除: $s"
-  c_info "修改仅保存至白名单；选择 17 后应用，空白名单会阻止应用。"
+  c_info "白名单修改在选择 17 后应用；不需要重新输入域名确认，空白名单会阻止应用。"
   log_action "allowlist remove $s"
 }
 normalize_domain_line() {
@@ -659,6 +687,9 @@ show_config() {
   echo "NGINX_SITE_DIR: ${NGINX_SITE_DIR}"
   echo "UNBOUND_CONF_DIR: ${UNBOUND_CONF_DIR}"
   echo "MOS_LOG_LEVEL: ${MOS_LOG_LEVEL}"
+  echo "缓存策略: 本地正缓存上限 ${UB_MAX_TTL} 秒 / 负缓存上限 ${FRESHNESS_NEGATIVE_TTL} 秒 / 不返回过期记录"
+  echo "以上为管理器当前设置；保存/加载设置不等于修改运行中的服务，需要通过 17 应用。"
+  echo "此上限不等于权威 DNS 到所有客户端的全链路更新时间保证。"
   echo
   echo "UPSTREAM_DOT:"
   local u
@@ -733,7 +764,8 @@ remove_upstream() {
   local idx n target
   local -a previous=("${UPSTREAM_DOT[@]}")
   list_upstreams
-  read -r -p "请输入要删除的序号: " idx || return 0
+  read -r -p "请输入要删除的序号（0或回车取消）: " idx || return 0
+  [[ -n "$idx" && "$idx" != 0 ]] || return 0
   [[ "$idx" =~ ^[0-9]{1,5}$ ]] || { c_err "请输入数字"; return 1; }
   idx=$((10#$idx)); n=${#UPSTREAM_DOT[@]}
   (( idx >= 1 && idx <= n )) || { c_err "超出范围"; return 1; }
@@ -765,6 +797,7 @@ quick_setup_wizard() {
   dir="$(new_workdir)" || return 1
   snapshot_file "$dir" state "$STATE_FILE" && snapshot_file "$dir" allow "$ALLOWLIST_FILE" || { rm -rf -- "$dir"; return 1; }
   if ! normalize_allowlist_file "$ALLOWLIST_FILE" "$dir/list"; then rm -rf -- "$dir"; return 1; fi
+  input_domains="${input_domains//，/,}"
   IFS=',' read -r -a domains_arr <<< "$input_domains"
   for item in "${domains_arr[@]}"; do
     item="$(normalize_domain_line "$item")" && [[ -n "$item" ]] || { c_err "输入含无效域名；未清空原白名单"; rm -rf -- "$dir"; return 1; }
@@ -789,8 +822,7 @@ quick_setup_wizard() {
   c_info "开始自动尝试为当前 DOMAIN 签发证书..."
   if issue_cert; then c_ok "证书已准备完成"; else c_warn "签发失败，未启用新 HTTPS 配置，请稍后手动重试"; return 1; fi
   echo
-  read -r -p "是否立即应用配置？(y/n): " apply_now || return 0
-  case "$apply_now" in y|Y) apply_all ;; *) c_info "已跳过立即应用配置" ;; esac
+  if confirm_numeric "是否立即应用配置？"; then apply_all; else c_info "已跳过立即应用配置"; fi
 }
 doh_path_conflict_check() {
   c_info "DoH 路径冲突检测"
@@ -843,7 +875,7 @@ download_and_install_mosdnsx() {
   local json name url dir bin target_tmp digest actual
   c_info "安装/更新 mosdns-x"
   json="$(curl -fsSL --connect-timeout 10 --max-time 40 --retry 2 https://api.github.com/repos/pmkol/mosdns-x/releases/latest)" || { c_err "无法读取 mosdns-x 发行信息"; return 1; }
-  name="$(printf '%s' "$json" | jq -er --arg arch "$ARCH_KEY" '[.assets[] | select((.name|ascii_downcase|test("linux")) and (.name|ascii_downcase|test($arch)) and ((.name|endswith(".zip")) or (.name|endswith(".tar.gz"))))][0].name // error("asset not found")')" || return 1
+  name="$(printf '%s' "$json" | jq -er --arg arch "$ARCH_KEY" '[.assets[] | select(.name == ("mosdns-linux-"+$arch+".zip") or .name == ("mosdns-linux-"+$arch+".tar.gz") or .name == ("mosdns-x-linux-"+$arch+".zip") or .name == ("mosdns-x-linux-"+$arch+".tar.gz"))][0].name // error("generic asset not found")')" || return 1
   [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || { c_err "发行包名称无效"; return 1; }
   url="$(printf '%s' "$json" | jq -er --arg n "$name" '.assets[]|select(.name==$n)|.browser_download_url')" || return 1
   [[ "$url" == https://github.com/pmkol/mosdns-x/releases/download/* ]] || { c_err "发行包地址无效"; return 1; }
@@ -946,8 +978,8 @@ ensure_environment() {
   log_action "ensure environment done"
 }
 write_unbound_forward() {
-  local dir main_conf=/etc/unbound/unbound.conf ca u port interfaces
-  validate_runtime_values || return 1
+  local dir main_conf=/etc/unbound/unbound.conf ca u port interfaces original_ttl="" negative_min=""
+  enforce_freshness_policy && validate_runtime_values || return 1
   have_cmd unbound-checkconf || { c_err "缺少 unbound-checkconf，请先安装/修复环境"; return 1; }
   [[ -f "$main_conf" && ! -L "$main_conf" ]] || { c_err "Unbound 主配置不存在或为符号链接: $main_conf"; return 1; }
   ca="$(ca_bundle_path)" || return 1
@@ -955,7 +987,15 @@ write_unbound_forward() {
   mkdir -p -- "$UNBOUND_CONF_DIR" || { rm -rf -- "$dir"; return 1; }
   snapshot_file "$dir" snippet "$UNBOUND_SNIPPET" && snapshot_file "$dir" main "$main_conf" || { rm -rf -- "$dir"; return 1; }
   c_info "写入 Unbound 配置: $UNBOUND_SNIPPET"
+  # The option was added after very old releases: disable explicitly when supported.
+  if unbound-checkconf -o serve-original-ttl "$main_conf" >/dev/null 2>&1; then
+    original_ttl="  serve-original-ttl: no"
+  fi
+  if unbound-checkconf -o cache-min-negative-ttl "$main_conf" >/dev/null 2>&1; then
+    negative_min="  cache-min-negative-ttl: 0"
+  fi
   cat > "$dir/config" <<EOF2 || { rm -rf -- "$dir"; return 1; }
+# DOH-MANAGER-FRESHNESS: ${FRESHNESS_POLICY_REVISION}
 server:
   interface: 127.0.0.1
   port: ${UNBOUND_PORT}
@@ -964,6 +1004,9 @@ server:
   rrset-cache-size: ${UB_RRSET_CACHE}
   cache-min-ttl: ${UB_MIN_TTL}
   cache-max-ttl: ${UB_MAX_TTL}
+  cache-max-negative-ttl: ${FRESHNESS_NEGATIVE_TTL}
+${negative_min}
+${original_ttl}
   prefetch: ${UB_PREFETCH}
   prefetch-key: ${UB_PREFETCH}
   serve-expired: ${UB_SERVE_EXPIRED}
@@ -1004,8 +1047,12 @@ EOF2
     restore_file "$dir" snippet "$UNBOUND_SNIPPET" && restore_file "$dir" main "$main_conf" || { c_err "恢复失败，备份: $dir"; return 1; }
     rm -rf -- "$dir"; return 1
   fi
+  if ! assert_unbound_freshness "$main_conf"; then
+    restore_file "$dir" snippet "$UNBOUND_SNIPPET" && restore_file "$dir" main "$main_conf" || { c_err "恢复失败，备份: $dir"; return 1; }
+    rm -rf -- "$dir"; return 1
+  fi
   rm -rf -- "$dir"
-  c_ok "Unbound 配置 OK"
+  c_ok "Unbound 配置 OK（单层缓存上限 ${UB_MAX_TTL} 秒，不返回过期记录）"
   log_action "write unbound config"
 }
 build_domain_rules_from_allowlist() {
@@ -1021,7 +1068,7 @@ build_domain_rules_from_allowlist() {
 }
 write_mosdns_config() {
   local dir domain_rules log_block deny_action=_new_refused_response
-  validate_runtime_values || return 1
+  enforce_freshness_policy && validate_runtime_values || return 1
   domain_rules="$(build_domain_rules_from_allowlist)" || return 1
   log_block="$(mos_native_log)" || return 1
   [[ "$DENY_MODE" != nxdomain ]] || deny_action=_new_nxdomain_response
@@ -1029,6 +1076,7 @@ write_mosdns_config() {
   dir="$(new_workdir)" || return 1
   c_info "写入 mosdns 配置: ${CONF_DIR}/config.yaml"
   cat > "$dir/config" <<EOF2 || { rm -rf -- "$dir"; return 1; }
+# DOH-MANAGER-FRESHNESS: ${FRESHNESS_POLICY_REVISION}
 log:
 ${log_block}
 
@@ -1043,8 +1091,6 @@ ${domain_rules}
     type: fast_forward
     args:
       upstream:
-        - addr: "udp://127.0.0.1:${UNBOUND_PORT}"
-          trusted: true
         - addr: "tcp://127.0.0.1:${UNBOUND_PORT}"
           trusted: true
 
@@ -1056,7 +1102,7 @@ ${domain_rules}
           exec:
             - ${deny_action}
             - _return
-        - _default_cache
+        # Unbound is the only DNS cache. Never cache its stale/negative reply here.
         - forward_local_unbound
 
 servers:
@@ -1094,6 +1140,7 @@ write_nginx_site() {
   if [[ ! -f "$STATIC_ROOT/index.html" ]]; then printf '%s\n' "$TEMPLATE_SIMPLE" > "$STATIC_ROOT/index.html" || { rm -rf -- "$dir"; return 1; }; fi
   c_info "写入 Nginx 配置: $nginx_site"
   cat > "$dir/config" <<EOF2 || { rm -rf -- "$dir"; return 1; }
+# DOH-MANAGER-FRESHNESS: ${FRESHNESS_POLICY_REVISION}
 ${limit_req_block}
 server {
   listen 80;
@@ -1125,6 +1172,13 @@ ${limit_req_apply}
     proxy_set_header X-Real-IP \$remote_addr;
     proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
     proxy_buffering off;
+    proxy_cache off;
+    proxy_cache_bypass 1;
+    proxy_no_cache 1;
+    proxy_hide_header Cache-Control;
+    proxy_hide_header Expires;
+    expires off;
+    add_header Cache-Control "no-store, max-age=0" always;
     proxy_pass http://${MOSDNS_HTTP_ADDR};
   }
 
@@ -1160,7 +1214,8 @@ validate_mos_log_level() {
   case "$1" in none|error|warning|warn|info|debug) return 0 ;; *) return 1 ;; esac
 }
 apply_mosdns_log_level() {
-  local dir config="$CONF_DIR/config.yaml" running=no native="$MOS_LOG_LEVEL" rc=0
+  local dir config="$CONF_DIR/config.yaml" running=no native="$MOS_LOG_LEVEL" rc=0 freshness_was_ready=no
+  freshness_profile_ready && freshness_was_ready=yes
   validate_mos_log_level "$MOS_LOG_LEVEL" || { c_err "非法日志等级: $MOS_LOG_LEVEL"; return 1; }
   if [[ ! -f "$config" ]]; then
     save_state || return 1
@@ -1207,6 +1262,9 @@ apply_mosdns_log_level() {
     c_warn "日志等级已写入配置；非 systemd 进程需要由原启动方式重启"
   fi
   if [[ "$MOS_LOG_LEVEL" == none ]]; then c_info "none 只抑制 mosdns 运行日志；不删除历史日志和 systemd 的启停记录。"; fi
+  if [[ "$freshness_was_ready" == yes ]]; then
+    mark_freshness_applied || { c_err "日志已更新，但缓存策略确认记录未能写入；请重新执行 17 检查。"; return 1; }
+  fi
   log_action "set MOS_LOG_LEVEL=$MOS_LOG_LEVEL"
 }
 set_mosdns_log_level_menu() {
@@ -1487,8 +1545,7 @@ stop_services() {
   local svc failed=0 confirm
   c_info "停止服务: ${MOSDNS_UNIT} / ${UNBOUND_UNIT} / ${NGINX_UNIT}"
   c_warn "此操作会停止这三个系统服务；同机共用 Nginx/Unbound 的站点或解析也会中断。"
-  read -r -p "请输入 YES 确认停止: " confirm || return 0
-  [[ "$confirm" == YES ]] || { c_warn "已取消"; return 0; }
+  confirm_numeric "确认停止上述服务？" || { c_warn "已取消"; return 0; }
   for svc in "$MOSDNS_UNIT" "$UNBOUND_UNIT" "$NGINX_UNIT"; do
     if ! service_exists "$svc"; then c_warn "$svc 服务不存在"; continue; fi
     if ! systemctl stop "$svc" || service_active "$svc"; then service_error "$svc"; failed=1; fi
@@ -1502,8 +1559,7 @@ restart_services() {
   local svc confirm
   c_info "重启服务: ${UNBOUND_UNIT} / ${MOSDNS_UNIT} / ${NGINX_UNIT}"
   c_warn "重启会短暂中断 DoH，并影响同机共用的 Nginx/Unbound。"
-  read -r -p "请输入 YES 确认重启: " confirm || return 0
-  [[ "$confirm" == YES ]] || { c_warn "已取消"; return 0; }
+  confirm_numeric "确认重启上述服务？" || { c_warn "已取消"; return 0; }
   check_domain_cert_before_apply && nginx -t && unbound-checkconf || return 1
   for svc in "$UNBOUND_UNIT" "$MOSDNS_UNIT" "$NGINX_UNIT"; do
     if ! service_exists "$svc" || ! systemctl restart "$svc" || ! wait_service "$svc"; then service_error "$svc"; return 1; fi
@@ -1513,10 +1569,11 @@ restart_services() {
 }
 apply_all() {
   local dir svc idx rc=0
-  local -a paths=("$UNBOUND_SNIPPET" /etc/unbound/unbound.conf "$CONF_DIR/config.yaml" "$NGINX_SITE_DIR/doh_${DOMAIN}.conf")
+  local -a paths=("$UNBOUND_SNIPPET" /etc/unbound/unbound.conf "$CONF_DIR/config.yaml" "$NGINX_SITE_DIR/doh_${DOMAIN}.conf" "$STATE_FILE" "$CONF_DIR/freshness.applied")
   local -a was_running=() services=("$UNBOUND_UNIT" "$MOSDNS_UNIT" "$NGINX_UNIT")
-  validate_runtime_values && doh_path_conflict_check && check_domain_cert_before_apply || return 1
+  enforce_freshness_policy && validate_runtime_values && doh_path_conflict_check && check_domain_cert_before_apply || return 1
   [[ -x /usr/local/bin/mosdns ]] && service_exists "$MOSDNS_UNIT" || { c_err "mosdns 或服务定义缺失，请先安装/修复环境"; return 1; }
+  have_cmd python3 && have_cmd curl || { c_err "缺少 python3/curl，请先安装/修复环境"; return 1; }
   [[ -f "$ALLOWLIST_FILE" ]] && (( $(allowlist_count) > 0 )) || { c_err "allowlist.txt 为空，已阻止应用"; return 1; }
   if [[ "$USE_NGINX_LINK" == yes ]]; then paths+=("$NGINX_LINK_DIR/doh_${DOMAIN}.conf"); fi
   dir="$(new_workdir)" || return 1
@@ -1526,8 +1583,9 @@ apply_all() {
   for svc in "${services[@]}"; do
     if service_active "$svc"; then was_running+=(yes); else was_running+=(no); fi
   done
-  c_info "生成配置并应用..."
-  if ! write_unbound_forward || ! write_mosdns_config || ! write_nginx_site || ! reload_services; then rc=1; fi
+  c_info "生成配置并应用（本次部署会重载服务；以后 TTL 到期后的查询重新请求上游）..."
+  if ! write_unbound_forward || ! write_mosdns_config || ! write_nginx_site || ! reload_services || \
+     ! assert_unbound_freshness /etc/unbound/unbound.conf || ! dns_backend_smoke || ! save_state || ! mark_freshness_applied; then rc=1; fi
   if (( rc != 0 )); then
     c_err "应用失败，开始恢复应用前的配置和服务状态"
     for idx in "${!paths[@]}"; do
@@ -1546,12 +1604,14 @@ apply_all() {
       fi
     done
     rm -rf -- "$dir"
-    c_err "未应用新配置；已恢复旧运行配置，编辑中的参数仍保存在状态文件中。"
+    c_err "未应用 P0 修复；旧运行配置已恢复。请处理错误后重新选择 17。"
     return 1
   fi
   rm -rf -- "$dir"
-  c_ok "本机应用完成"
-  log_action "apply all done"
+  FRESHNESS_MIGRATION_NEEDED=no
+  c_ok "本机应用完成：本地正缓存最多 ${UB_MAX_TTL} 秒、负缓存最多 ${FRESHNESS_NEGATIVE_TTL} 秒，过期回答已关闭。"
+  c_info "以后按 TTL 到期后的查询自动获取上游结果；这不是定时轮询。上游和客户端既有缓存仍须到期。"
+  log_action "apply all done; freshness policy=$FRESHNESS_POLICY_REVISION ttl=$UB_MAX_TTL stale=no"
 }
 service_status_summary() {
   local failed=0 svc sub
@@ -1615,125 +1675,82 @@ show_ports_summary() {
   return "$failed"
 }
 health_check_summary() {
-  local dir homepage_code doh_code domain failed=0 content_type
+  local dir homepage_code doh_code domain failed=0 content_type qtype target method endpoint encoded
+  local -a route_args=() request_args=()
   echo "==================== 健康检查 ===================="
   have_cmd curl && have_cmd python3 || { c_err "缺少 curl/python3，请先执行安装/修复环境"; return 1; }
   normalize_hostname "$DOMAIN" >/dev/null && valid_doh_path "$DOH_PATH" || { c_err "域名或路径无效"; return 1; }
   [[ "$DOMAIN" != example.com ]] || { c_err "当前仍是默认示例域名，不能据此检查你的服务"; return 1; }
   dir="$(new_workdir)" || return 1
-  if ! normalize_allowlist_file "$ALLOWLIST_FILE" "$dir/list" || [[ ! -s "$dir/list" ]]; then
-    c_err "白名单为空或无效，没有可用于健康检查的域名"; rm -rf -- "$dir"; return 1
+  if ! normalize_allowlist_file "$ALLOWLIST_FILE" "$dir/list"; then rm -rf -- "$dir"; return 1; fi
+  if ! select_allowlist_domain "$dir/list" "选择健康检查域名"; then rm -rf -- "$dir"; return 0; fi
+  domain="$SELECTED_DOMAIN"
+  if freshness_profile_ready; then
+    c_ok "P0 缓存策略应用记录及当前配置一致。"
+  else
+    c_warn "尚未确认 P0 缓存修复已经应用，或配置被外部修改；请先选择 17。"
+    failed=1
   fi
-  IFS= read -r domain < "$dir/list" || { rm -rf -- "$dir"; return 1; }
-  if homepage_code="$(curl --noproxy '*' -sS --connect-timeout 5 --max-time 15 -o /dev/null -w '%{http_code}' "https://$DOMAIN/" 2> "$dir/home.err")" && \
+  if homepage_code="$(curl --noproxy '*' -sS --connect-timeout 5 --max-time 12 -o /dev/null -w '%{http_code}' "https://$DOMAIN/" 2> "$dir/home.err")" && \
     [[ "$homepage_code" =~ ^(200|301|302|404)$ ]]; then
     c_ok "伪装页访问正常，HTTP_CODE=$homepage_code（已验证 HTTPS 证书）"
   else
     c_err "伪装页访问异常，HTTP_CODE=${homepage_code:-000}"
     cat "$dir/home.err" >&2; failed=1
   fi
-  if ! python3 - "$domain" "$dir/query" <<'PY'
-import struct, sys
-name = sys.argv[1].rstrip('.')
-try:
-    labels = name.encode('ascii').split(b'.')
-    if any(not label or len(label) > 63 for label in labels):
-        raise ValueError('invalid DNS labels')
-    question = b''.join(bytes([len(label)]) + label for label in labels) + b'\0' + struct.pack('!HH', 1, 1)
-    with open(sys.argv[2], 'wb') as stream:
-        stream.write(struct.pack('!HHHHHH', 0, 0x0100, 1, 0, 0, 0) + question)
-except Exception as exc:
-    print('无法构造 DNS 查询: {}'.format(exc), file=sys.stderr)
-    sys.exit(1)
-PY
-  then rm -rf -- "$dir"; return 1; fi
-  if doh_code="$(curl --noproxy '*' -sS --connect-timeout 5 --max-time 20 \
-    -H 'Content-Type: application/dns-message' -H 'Accept: application/dns-message' \
-    --data-binary "@$dir/query" -D "$dir/headers" -o "$dir/answer" -w '%{http_code}' \
-    "https://$DOMAIN$DOH_PATH" 2> "$dir/doh.err")" && [[ "$doh_code" == 200 ]]; then
-    content_type="$(awk 'tolower($1)=="content-type:" {$1=""; print tolower($0)}' "$dir/headers" | tr -d '\r')"
-    if [[ "$content_type" != *application/dns-message* ]]; then
-      c_err "HTTP 200 但返回的不是 DNS 报文，不能判定 DoH 正常"; failed=1
-    elif python3 - "$dir/query" "$dir/answer" <<'PY'
-import struct, sys
-
-def read_name(data, offset):
-    labels, seen, end = [], set(), None
-    while True:
-        if offset >= len(data) or offset in seen:
-            raise ValueError('invalid DNS name/pointer')
-        seen.add(offset)
-        length = data[offset]
-        if length & 0xc0 == 0xc0:
-            if offset + 1 >= len(data):
-                raise ValueError('truncated DNS pointer')
-            if end is None:
-                end = offset + 2
-            offset = ((length & 0x3f) << 8) | data[offset + 1]
-            continue
-        if length & 0xc0 or length > 63:
-            raise ValueError('invalid DNS label length')
-        offset += 1
-        if length == 0:
-            return b'.'.join(labels).lower(), end if end is not None else offset
-        if offset + length > len(data):
-            raise ValueError('truncated DNS label')
-        labels.append(data[offset:offset + length])
-        offset += length
-        if len(seen) > 255:
-            raise ValueError('DNS name too long')
-try:
-    query = open(sys.argv[1], 'rb').read()
-    data = open(sys.argv[2], 'rb').read()
-    if not 12 <= len(data) <= 65535:
-        raise ValueError('not a complete DNS message')
-    ident, flags, qd, an, ns, ar = struct.unpack('!HHHHHH', data[:12])
-    if ident != struct.unpack('!H', query[:2])[0] or not (flags & 0x8000) or flags & 0x7800 or qd != 1:
-        raise ValueError('DNS response ID/header mismatch')
-    qname, qend = read_name(query, 12)
-    name, offset = read_name(data, 12)
-    if name != qname or data[offset:offset+4] != query[qend:qend+4]:
-        raise ValueError('DNS question mismatch')
-    offset += 4
-    address_answers = 0
-    for index in range(an + ns + ar):
-        owner, offset = read_name(data, offset)
-        if offset + 10 > len(data):
-            raise ValueError('truncated resource record')
-        rtype, rclass, ttl, length = struct.unpack('!HHIH', data[offset:offset+10])
-        offset += 10
-        if offset + length > len(data):
-            raise ValueError('truncated record data')
-        if index < an and rtype == 1 and rclass == 1 and length == 4:
-            address_answers += 1
-        offset += length
-    if offset != len(data) or flags & 0x0200:
-        raise ValueError('truncated DNS response or trailing data')
-    rcode = flags & 15
-    if rcode != 0:
-        raise ValueError('DNS RCODE={} (3=NXDOMAIN, 2=SERVFAIL, 5=REFUSED)'.format(rcode))
-    if not address_answers:
-        raise ValueError('NOERROR but no A record; protocol responded, target address not verified')
-    print('[OK] DoH 查询成功: {}，A记录 {} 条'.format(name.decode('ascii'), address_answers))
-except Exception as exc:
-    print('[-] DNS 检查未通过: {}'.format(exc), file=sys.stderr)
-    sys.exit(1)
-PY
-    then
-      c_ok "DoH 路径访问正常，HTTP_CODE=$doh_code"
-    else
+  for qtype in 1 28; do
+    if ! dns_wire make "$domain" "$dir/query" "$qtype" stable; then rm -rf -- "$dir"; return 1; fi
+    c_info "检查本机 Unbound（QTYPE=$qtype；1=A，28=AAAA）"
+    if ! dns_wire tcp "$dir/query" "$dir/unbound-answer" 127.0.0.1 "$UNBOUND_PORT" || \
+       ! dns_wire check "$dir/query" "$dir/unbound-answer" "$FRESHNESS_MAX_TTL" answer; then
       failed=1
     fi
-  else
-    c_err "DoH 路径访问异常，HTTP_CODE=${doh_code:-000}"
-    cat "$dir/doh.err" >&2; failed=1
-  fi
+    for target in local public; do
+      route_args=()
+      if [[ "$target" == local ]]; then
+        route_args=(--resolve "$DOMAIN:443:127.0.0.1")
+        c_info "检查本机 HTTPS→mosdns→Unbound（绕过 CDN/域名调度）"
+      else
+        c_info "检查公网域名的 DoH 入口（使用本机 DNS 解析入口域名）"
+      fi
+      encoded="$(dns_wire url "$dir/query")" || { rm -rf -- "$dir"; return 1; }
+      for method in POST GET; do
+        endpoint="https://$DOMAIN$DOH_PATH"
+        request_args=()
+        if [[ "$method" == POST ]]; then
+          request_args=(-H 'Content-Type: application/dns-message' --data-binary "@$dir/query")
+        else
+          endpoint="$endpoint?dns=$encoded"
+        fi
+        c_info "HTTP $method 查询（不添加绕过缓存参数）"
+        if doh_code="$(curl --noproxy '*' -sS --connect-timeout 5 --max-time 12 \
+          ${route_args[@]+"${route_args[@]}"} ${request_args[@]+"${request_args[@]}"} -H 'Accept: application/dns-message' \
+          -D "$dir/headers" -o "$dir/answer" -w '%{http_code}' \
+          "$endpoint" 2> "$dir/doh.err")" && [[ "$doh_code" == 200 ]]; then
+          content_type="$(awk 'tolower($1)=="content-type:" {$1=""; print tolower($0)}' "$dir/headers")"
+          if [[ "$content_type" != *application/dns-message* ]]; then
+            c_err "HTTP 200 但不是 DNS 报文，不能判断正常。"; failed=1
+          elif ! dns_wire check "$dir/query" "$dir/answer" "$FRESHNESS_MAX_TTL" answer; then
+            failed=1
+          fi
+          if ! grep -Ei '^cache-control:.*no-store' "$dir/headers" >/dev/null || \
+             grep -Ei '^age:[[:space:]]*[1-9]|^cf-cache-status:[[:space:]]*(HIT|STALE|UPDATING)' "$dir/headers" >/dev/null; then
+            c_warn "响应缺少 no-store 或显示命中 HTTP 缓存，请检查 Nginx/CDN 是否仍使用旧规则。"; failed=1
+          fi
+        else
+          c_err "DoH 路径访问异常，HTTP_CODE=${doh_code:-000}（$target/$method）"
+          cat "$dir/doh.err" >&2; failed=1
+        fi
+      done
+    done
+  done
   rm -rf -- "$dir"
   if (( failed == 0 )); then
-    c_ok "结论：本次健康检查正常（HTTPS 与所测域名 DNS 响应）；不等于所有域名和网络均已验证"
+    c_ok "结论：所测域名的本机 DNS、HTTPS 和公网 DoH 响应及 TTL 检查通过。"
   else
-    c_warn "结论：健康检查存在异常，请检查上面的证书、网络或 DNS 具体错误"
+    c_warn "结论：存在配置、证书、DNS 或网络异常，具体原因见上方各层结果。"
   fi
+  c_info "NXDOMAIN/NODATA 表示该次没有对应地址；TTL 合规不等于权威已更新，多个上游也可能暂时答复不同 IP。"
   return "$failed"
 }
 uninstall_all() {
@@ -1755,8 +1772,7 @@ uninstall_all() {
   if [[ "$ALLOWLIST_FILE" != "$CONF_DIR/"* ]]; then echo " - ${ALLOWLIST_FILE}"; fi
   c_warn "仅清理当前部署；保留共享的 nginx/unbound 软件包、acme.sh、其他站点、静态目录和管理日志。"
   echo
-  read -r -p "请输入 YES 确认彻底卸载: " confirm || return 0
-  [[ "$confirm" == YES ]] || { c_warn "已取消卸载"; return 0; }
+  confirm_numeric "确认卸载当前 DoH 部署及上述文件？" || { c_warn "已取消卸载"; return 0; }
   if ! service_exists "$MOSDNS_UNIT" && mosdns_process_exists; then
     c_err "存在非 systemd 管理的 mosdns 进程；请先由原启动方式停止，防止删除后仍在运行"; return 1
   fi
@@ -1903,7 +1919,7 @@ validate_runtime_values() {
     value="${!key}"
     valid_uint "$value" || { c_err "$key 必须是非负十进制整数"; return 1; }
   done
-  (( UB_MIN_TTL <= UB_MAX_TTL && NGX_RPS > 0 )) || { c_err "缓存 TTL 或 Nginx 请求速率无效"; return 1; }
+  (( UB_MIN_TTL <= UB_MAX_TTL && UB_MAX_TTL > 0 && UB_MAX_TTL <= 4294967295 && NGX_RPS > 0 )) || { c_err "缓存 TTL 或 Nginx 请求速率无效"; return 1; }
   for key in UB_MSG_CACHE UB_RRSET_CACHE; do
     [[ "${!key}" =~ ^[1-9][0-9]*[kKmMgG]?$ ]] || { c_err "$key 大小格式无效"; return 1; }
   done
@@ -2007,6 +2023,8 @@ restore_file() {
 
 normalize_allowlist_file() {
   local input="$1" output="$2" raw normalized line_no=0 bad=0
+  [[ -f "$input" && -r "$input" ]] || { c_err "白名单文件不存在或不可读取: $input"; return 1; }
+  [[ "$input" != "$output" && ! "$input" -ef "$output" ]] || { c_err "禁止把白名单清洗结果直接覆盖输入文件"; return 1; }
   : > "$output" || return 1
   while IFS= read -r raw || [[ -n "$raw" ]]; do
     line_no=$((line_no+1))
@@ -2165,6 +2183,321 @@ run_action() {
 }
 
 
+# ==========================================================
+# v2.6.4 P0 cache policy and numeric-only selection helpers
+# ==========================================================
+confirm_numeric() {
+  local answer
+  printf '%s\n' "$1"
+  printf ' 1. 确认执行    0. 取消（默认）\n'
+  read -r -p "请选择: " answer || return 1
+  case "$answer" in
+    1) return 0 ;;
+    0|'') return 1 ;;
+    *) c_warn "无效选项，已取消；只有数字 1 会执行。"; return 1 ;;
+  esac
+}
+
+select_allowlist_domain() {
+  local file="$1" title="${2:-选择域名}" total page=0 size=25 first last idx number next previous
+  SELECTED_DOMAIN=""
+  [[ -f "$file" ]] || { c_err "域名列表不存在"; return 1; }
+  total="$(wc -l < "$file")" || return 1
+  (( total > 0 )) || { c_warn "白名单为空，没有可选择的域名。"; return 1; }
+  next=$((total+1)); previous=$((total+2))
+  while true; do
+    first=$((page*size+1)); last=$((first+size-1))
+    printf '\n==================== %s ====================\n' "$title"
+    printf '第 %d/%d 页，共 %d 个域名；编号按完整列表顺序。\n' "$((page+1))" "$(((total+size-1)/size))" "$total"
+    awk -v a="$first" -v b="$last" 'NR>=a && NR<=b {printf " [%d] %s\n", NR, $0}' "$file" || return 1
+    printf ' [0] 取消（默认）'
+    if (( last < total )); then printf '    [%d] 下一页' "$next"; fi
+    if (( page > 0 )); then printf '    [%d] 上一页' "$previous"; fi
+    printf '\n'
+    read -r -p "请输入数字编号: " idx || return 1
+    [[ -n "$idx" ]] || return 1
+    if [[ ! "$idx" =~ ^[0-9]{1,9}$ ]]; then c_warn "请输入列表中的数字编号。"; continue; fi
+    number=$((10#$idx))
+    (( number != 0 )) || return 1
+    if (( number == next && last < total )); then page=$((page+1)); continue; fi
+    if (( number == previous && page > 0 )); then page=$((page-1)); continue; fi
+    if (( number < 1 || number > total )); then c_warn "编号超出范围。"; continue; fi
+    SELECTED_DOMAIN="$(sed -n "${number}p" "$file")" || return 1
+    valid_domain "$SELECTED_DOMAIN" || { c_err "所选域名格式无效，未执行操作。"; return 1; }
+    c_info "已选择 [$number] $SELECTED_DOMAIN"
+    return 0
+  done
+}
+
+enforce_freshness_policy() {
+  # Loading old state otherwise silently reintroduces min=60/max=86400/stale=yes.
+  # Never lower a record's original short TTL to a fixed value or raise it to 30.
+  valid_uint "$UB_MAX_TTL" && (( UB_MAX_TTL > 0 )) || { c_err "缓存 TTL 配置无效"; return 1; }
+  if [[ "$UB_MIN_TTL" != 0 || "$UB_SERVE_EXPIRED" != no || "$UB_PREFETCH" != yes ]] || (( UB_MAX_TTL > FRESHNESS_MAX_TTL )); then
+    FRESHNESS_MIGRATION_NEEDED=yes
+  fi
+  UB_MIN_TTL=0
+  if (( UB_MAX_TTL > FRESHNESS_MAX_TTL )); then UB_MAX_TTL="$FRESHNESS_MAX_TTL"; fi
+  UB_SERVE_EXPIRED=no
+  UB_PREFETCH=yes
+  # Old serve-expired-* fields are retained in state for backward compatibility,
+  # but are ineffective while serve-expired is no. Do not set expiry TTL=0:
+  # in Unbound, zero means unlimited stale retention, NOT "disable stale".
+  return 0
+}
+
+assert_unbound_freshness() {
+  local config="${1:-/etc/unbound/unbound.conf}" key value
+  have_cmd unbound-checkconf || { c_err "缺少 unbound-checkconf，无法验证缓存策略"; return 1; }
+  for key in cache-min-ttl cache-max-ttl cache-max-negative-ttl serve-expired prefetch; do
+    value="$(unbound-checkconf -o "$key" "$config" 2>/dev/null)" || { c_err "无法读取有效 Unbound 选项: $key"; return 1; }
+    case "$key" in
+      cache-min-ttl) [[ "$value" == 0 ]] || { c_err "$key 被其他配置改为 $value，已阻止应用"; return 1; } ;;
+      cache-max-ttl) valid_uint "$value" && (( value > 0 && value <= FRESHNESS_MAX_TTL )) || { c_err "$key=$value 超出 P0 上限，已阻止应用"; return 1; } ;;
+      cache-max-negative-ttl) valid_uint "$value" && (( value <= FRESHNESS_NEGATIVE_TTL )) || { c_err "$key=$value 超出负缓存上限，已阻止应用"; return 1; } ;;
+      serve-expired) [[ "$value" == no ]] || { c_err "其他配置重新开启了过期回答，已阻止应用"; return 1; } ;;
+      prefetch) [[ "$value" == yes ]] || { c_err "其他配置关闭了预取，已阻止应用"; return 1; } ;;
+    esac
+  done
+  if value="$(unbound-checkconf -o cache-min-negative-ttl "$config" 2>/dev/null)"; then
+    [[ "$value" == 0 ]] || { c_err "cache-min-negative-ttl 可能抬高负缓存期限，已阻止应用"; return 1; }
+  fi
+  if value="$(unbound-checkconf -o serve-original-ttl "$config" 2>/dev/null)"; then
+    [[ "$value" == no ]] || { c_err "serve-original-ttl 会破坏下发 TTL 上限，已阻止应用"; return 1; }
+  fi
+  value="$(unbound-checkconf -o module-config "$config" 2>/dev/null)" || { c_err "无法读取 Unbound module-config"; return 1; }
+  if [[ "$value" == *cachedb* ]]; then
+    c_err "当前 Unbound 启用了额外 cachedb 缓存，无法确认单层缓存策略；未擅自修改共享模块。"
+    return 1
+  fi
+  return 0
+}
+
+freshness_fingerprint() {
+  local hash
+  local -a files=("$UNBOUND_SNIPPET" /etc/unbound/unbound.conf "$CONF_DIR/config.yaml" "$NGINX_SITE_DIR/doh_${DOMAIN}.conf")
+  local file
+  for file in "${files[@]}"; do [[ -f "$file" ]] || return 1; done
+  hash="$( { printf '%s\n' "policy=$FRESHNESS_POLICY_REVISION"; sha256sum -- "${files[@]}"; } | sha256sum)" || return 1
+  printf '%s\n' "${hash%% *}"
+}
+
+freshness_profile_ready() {
+  local expected actual file
+  [[ -f "$CONF_DIR/freshness.applied" && ! -L "$CONF_DIR/freshness.applied" ]] || return 1
+  IFS= read -r expected < "$CONF_DIR/freshness.applied" || return 1
+  [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || return 1
+  actual="$(freshness_fingerprint)" || return 1
+  [[ "$expected" == "$actual" ]] || return 1
+  for file in "$UNBOUND_SNIPPET" "$CONF_DIR/config.yaml" "$NGINX_SITE_DIR/doh_${DOMAIN}.conf"; do
+    grep -qxF -- "# DOH-MANAGER-FRESHNESS: $FRESHNESS_POLICY_REVISION" "$file" || return 1
+  done
+  assert_unbound_freshness /etc/unbound/unbound.conf >/dev/null 2>&1 || return 1
+  # An applied receipt establishes config identity, not public DNS freshness or uptime.
+  return 0
+}
+
+mark_freshness_applied() {
+  local dir hash
+  hash="$(freshness_fingerprint)" || return 1
+  dir="$(new_workdir)" || return 1
+  if ! printf '%s\n' "$hash" > "$dir/fingerprint" || ! atomic_copy "$dir/fingerprint" "$CONF_DIR/freshness.applied" 0644; then
+    rm -rf -- "$dir"; return 1
+  fi
+  rm -rf -- "$dir"
+}
+
+offer_freshness_upgrade() {
+  if freshness_profile_ready; then return 0; fi
+  c_warn "检测到旧版/未确认的运行配置。仅下载新脚本不能清除正在运行的旧缓存。"
+  c_info "本次部署会重载 mosdns/Unbound 并迁移旧缓存参数；以后按 TTL 自动更新，不会安装周期性重启任务。"
+  if confirm_numeric "是否现在应用 v2.6.4 的 P0 缓存修复（等同菜单 17）？"; then
+    run_action apply_all
+  else
+    c_warn "已取消应用，现有服务未改动；P0 修复尚未生效，可稍后选择 17。"
+  fi
+  return 0
+}
+
+# DNS wire-format helper, using only Python's standard library.
+# It validates real DNS messages instead of accepting HTTP 200/400 as DNS success.
+dns_wire() {
+  have_cmd python3 || { c_err "缺少 python3，不能验证 DNS 报文"; return 1; }
+  python3 - "$@" <<'PYDNS'
+import base64, ipaddress, json, os, socket, struct, sys
+
+def name_at(data, offset):
+    labels, seen, end = [], set(), None
+    while True:
+        if offset >= len(data) or offset in seen or len(seen) > 255:
+            raise ValueError('DNS 名称或压缩指针无效')
+        seen.add(offset)
+        n = data[offset]
+        if n & 0xc0 == 0xc0:
+            if offset + 1 >= len(data):
+                raise ValueError('压缩指针不完整')
+            if end is None:
+                end = offset + 2
+            offset = ((n & 63) << 8) | data[offset+1]
+            continue
+        if n & 0xc0:
+            raise ValueError('DNS 标签类型无效')
+        offset += 1
+        if n == 0:
+            if sum(map(len, labels)) + len(labels) > 254:
+                raise ValueError('DNS 名称过长')
+            return b'.'.join(labels).lower(), (offset if end is None else end)
+        if offset + n > len(data):
+            raise ValueError('DNS 标签不完整')
+        labels.append(data[offset:offset+n])
+        offset += n
+
+def recv_exact(sock, n):
+    data = bytearray()
+    while len(data) < n:
+        chunk = sock.recv(n-len(data))
+        if not chunk:
+            raise ValueError('DNS TCP 响应提前关闭')
+        data.extend(chunk)
+    return bytes(data)
+
+try:
+    mode = sys.argv[1]
+    if mode == 'make':
+        name, dest = sys.argv[2:4]
+        qtype = int(sys.argv[4]) if len(sys.argv) > 4 else 1
+        labels = name.rstrip('.').encode('ascii').split(b'.')
+        if not labels or any(not x or len(x) > 63 for x in labels) or sum(map(len, labels))+len(labels)>254:
+            raise ValueError('查询域名格式无效')
+        q = b''.join(bytes([len(x)])+x for x in labels)+b'\0'+struct.pack('!HH', qtype, 1)
+        with open(dest, 'wb') as f:
+            ident = b'\0\0' if len(sys.argv) > 5 and sys.argv[5] == 'stable' else os.urandom(2)
+            f.write(ident+struct.pack('!HHHHH', 0x0100, 1, 0, 0, 0)+q)
+    elif mode == 'url':
+        print(base64.urlsafe_b64encode(open(sys.argv[2], 'rb').read()).rstrip(b'=').decode('ascii'))
+    elif mode == 'tcp':
+        query = open(sys.argv[2], 'rb').read()
+        with socket.create_connection((sys.argv[4], int(sys.argv[5])), timeout=8) as sock:
+            sock.settimeout(8)
+            sock.sendall(struct.pack('!H', len(query))+query)
+            size = struct.unpack('!H', recv_exact(sock, 2))[0]
+            answer = recv_exact(sock, size)
+        with open(sys.argv[3], 'wb') as f:
+            f.write(answer)
+    elif mode == 'check':
+        query, data = open(sys.argv[2], 'rb').read(), open(sys.argv[3], 'rb').read()
+        cap, expected = int(sys.argv[4]), sys.argv[5]
+        if len(query) < 12 or not 12 <= len(data) <= 65535:
+            raise ValueError('DNS 报文长度无效')
+        ident, flags, qd, an, ns, ar = struct.unpack('!HHHHHH', data[:12])
+        if data[:2] != query[:2] or not flags & 0x8000 or flags & 0x7800 or flags & 0x0200 or qd != 1:
+            raise ValueError('DNS ID/响应头无效或报文截断')
+        qname, qe = name_at(query, 12)
+        name, offset = name_at(data, 12)
+        if name != qname or len(data) < offset+4 or data[offset:offset+4] != query[qe:qe+4]:
+            raise ValueError('DNS question 不匹配')
+        qtype = struct.unpack('!H', query[qe:qe+2])[0]
+        offset += 4
+        rr, ttls, extended_rcode = [], [], 0
+        for index in range(an+ns+ar):
+            owner, offset = name_at(data, offset)
+            if offset+10 > len(data):
+                raise ValueError('资源记录头不完整')
+            kind, cls, ttl, size = struct.unpack('!HHIH', data[offset:offset+10])
+            offset += 10
+            if offset+size > len(data):
+                raise ValueError('资源记录数据不完整')
+            if kind == 41:
+                extended_rcode = (ttl >> 24) << 4
+            else:
+                ttls.append(ttl)
+                if ttl > cap:
+                    raise ValueError('响应 TTL={} 超过本地上限 {}；可能仍运行旧缓存/配置或命中其他 DoH 实例'.format(ttl, cap))
+            text = None
+            if index < an and cls == 1:
+                if kind in (1, 28):
+                    if size != (4 if kind == 1 else 16):
+                        raise ValueError('A/AAAA 记录长度无效')
+                    text = str(ipaddress.ip_address(data[offset:offset+size]))
+                elif kind == 5:
+                    target, target_end = name_at(data, offset)
+                    if target_end != offset+size:
+                        raise ValueError('CNAME 数据长度无效')
+                    text = target.decode('ascii')
+                if text is not None:
+                    rr.append({'owner': owner.decode('ascii'), 'type': kind, 'value': text, 'ttl': ttl})
+            offset += size
+        if offset != len(data):
+            raise ValueError('DNS 报文含多余数据')
+        rcode = (flags & 15) | extended_rcode
+        if expected.startswith('deny'):
+            wanted = int(expected[4:])
+            if rcode != wanted:
+                raise ValueError('非白名单查询未按策略拒绝，RCODE={}'.format(rcode))
+        elif rcode not in (0, 3):
+            raise ValueError('RCODE={} (2=SERVFAIL, 5=REFUSED)'.format(rcode))
+        print('[OK] DNS 响应有效: {}，{}，RCODE={}，最大 TTL={}秒'.format(name.decode('ascii'), {1:'A',28:'AAAA'}.get(qtype,str(qtype)), rcode, max(ttls) if ttls else 0))
+        for item in rr:
+            print('  {} {} {}  TTL={}秒'.format(item['owner'], {1:'A',28:'AAAA',5:'CNAME'}[item['type']], item['value'], item['ttl']))
+        if not expected.startswith('deny') and not any(x['type'] == qtype for x in rr):
+            print('[!] DNS 已答复，但没有所查询的地址记录（NXDOMAIN/NODATA）；不据此判断对应节点可连接。')
+        if len(sys.argv) > 6:
+            with open(sys.argv[6], 'w') as f:
+                json.dump({'rcode':rcode, 'answers':rr, 'max_ttl':max(ttls) if ttls else 0}, f)
+    else:
+        raise ValueError('未知 DNS 检查模式')
+except Exception as exc:
+    print('[-] DNS 检查未通过: {}'.format(exc), file=sys.stderr)
+    sys.exit(1)
+PYDNS
+}
+
+dns_backend_smoke() {
+  local dir name code expected=deny5 type
+  dir="$(new_workdir)" || return 1
+  # .invalid is reserved and the generated name must NOT be allowed by any rule.
+  name="doh-check-${BASHPID}-${RANDOM}.invalid"
+  if ! normalize_allowlist_file "$ALLOWLIST_FILE" "$dir/list"; then rm -rf -- "$dir"; return 1; fi
+  if awk -v n="$name" 'n==$0 || (length(n)>length($0) && substr(n,length(n)-length($0),1)=="." && substr(n,length(n)-length($0)+1)==$0) {found=1} END {exit !found}' "$dir/list"; then
+    c_err "健康检查专用域名意外命中白名单，无法验证拒绝策略。"; rm -rf -- "$dir"; return 1
+  fi
+  [[ "$DENY_MODE" != nxdomain ]] || expected=deny3
+  if ! dns_wire make "$name" "$dir/query"; then rm -rf -- "$dir"; return 1; fi
+  # Verify local HTTPS + nginx + the newly started mosdns pipeline, not a CDN copy.
+  if ! code="$(curl --noproxy '*' -sS --connect-timeout 3 --max-time 8 \
+    --resolve "$DOMAIN:443:127.0.0.1" -H 'Content-Type: application/dns-message' -H 'Accept: application/dns-message' \
+    --data-binary "@$dir/query" -D "$dir/headers" -o "$dir/answer" -w '%{http_code}' "https://$DOMAIN$DOH_PATH")" || [[ "$code" != 200 ]]; then
+    c_err "本机 HTTPS DoH 自检失败（HTTP=${code:-000}）；不是仅凭进程启动判定成功。"
+    rm -rf -- "$dir"; return 1
+  fi
+  type="$(awk 'tolower($1)=="content-type:" {$1="";print tolower($0)}' "$dir/headers")"
+  if [[ "$type" != *application/dns-message* ]] || ! grep -Ei '^cache-control:.*no-store' "$dir/headers" >/dev/null || \
+    ! dns_wire check "$dir/query" "$dir/answer" "$FRESHNESS_MAX_TTL" "$expected"; then
+    c_err "本机 DoH 拒绝策略、报文格式或 no-store 检查失败。"; rm -rf -- "$dir"; return 1
+  fi
+  # Check one real admitted query as well: REFUSED alone never reaches Unbound.
+  name="$(sed -n '1p' "$dir/list")"
+  [[ -n "$name" ]] || { c_err "白名单为空，无法验证实际解析链"; rm -rf -- "$dir"; return 1; }
+  if ! dns_wire make "$name" "$dir/query" || \
+     ! dns_wire tcp "$dir/query" "$dir/ub-answer" 127.0.0.1 "$UNBOUND_PORT" || \
+     ! dns_wire check "$dir/query" "$dir/ub-answer" "$FRESHNESS_MAX_TTL" answer; then
+    c_err "本机 Unbound 实际查询/TTL 验证失败，未把启动成功当作缓存修复成功。"
+    rm -rf -- "$dir"; return 1
+  fi
+  if ! code="$(curl --noproxy '*' -sS --connect-timeout 3 --max-time 12 \
+    --resolve "$DOMAIN:443:127.0.0.1" -H 'Content-Type: application/dns-message' -H 'Accept: application/dns-message' \
+    --data-binary "@$dir/query" -D "$dir/headers" -o "$dir/answer" -w '%{http_code}' "https://$DOMAIN$DOH_PATH")" || [[ "$code" != 200 ]]; then
+    c_err "白名单内域名的本机 DoH 查询失败（HTTP=${code:-000}）。"; rm -rf -- "$dir"; return 1
+  fi
+  type="$(awk 'tolower($1)=="content-type:" {$1="";print tolower($0)}' "$dir/headers")"
+  if [[ "$type" != *application/dns-message* ]] || ! grep -Ei '^cache-control:.*no-store' "$dir/headers" >/dev/null || \
+     ! dns_wire check "$dir/query" "$dir/answer" "$FRESHNESS_MAX_TTL" answer; then
+    c_err "本机 DoH 实际解析/TTL/no-store 验证失败。"; rm -rf -- "$dir"; return 1
+  fi
+  rm -rf -- "$dir"
+  c_ok "本机 HTTPS→mosdns→Unbound 实际查询、TTL 上限和白名单拦截自检通过。"
+}
+
 main() {
   local opt first_run_wizard
   need_root
@@ -2184,9 +2517,11 @@ main() {
   show_brief_runtime_status
   if [[ "$FIRST_RUN" == yes ]]; then
     echo
-    if read -r -p "检测到首次运行，是否进入快速初始化向导？(y/n): " first_run_wizard; then
-      case "$first_run_wizard" in y|Y) run_action quick_setup_wizard ;; *) c_info "已跳过快速初始化向导" ;; esac
-    else return 0; fi
+    if confirm_numeric "检测到首次运行，是否进入快速初始化向导？"; then
+      run_action quick_setup_wizard
+    else c_info "已跳过快速初始化向导"; fi
+  elif [[ -f "$CONF_DIR/config.yaml" ]]; then
+    offer_freshness_upgrade
   fi
   while true; do
     show_menu

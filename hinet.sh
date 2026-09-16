@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# hinet-gfw-changeip-v2.4.sh
+# hinet-gfw-changeip-v2.5.sh
 # HiNet 被墙检测 + Globalping 中国节点 ping 弱检测 + 双 API 自动换 IP
 # v2.4：systemd timer 调用独立 worker，worker 内部直接完成 Globalping 检测、连续失败计数和自动换 IP，不再依赖主脚本 check-once 分发
 # 适合上传 GitHub：脚本本身不包含任何敏感信息，敏感 API 写入 /etc 配置文件
@@ -9,7 +9,7 @@
 set -u -o pipefail
 
 APP_NAME="hinet-gfw-changeip"
-APP_VERSION="hinet-gfw-changeip-v2.4"
+APP_VERSION="hinet-gfw-changeip-v2.5"
 INSTALL_PATH="/usr/local/bin/${APP_NAME}"
 CONF_DIR="/etc/${APP_NAME}"
 CONF_FILE="${CONF_DIR}/config.env"
@@ -262,6 +262,20 @@ resolve_target_ip() {
 get_current_ip_from_api() {
     load_config
     local body ip
+    if [[ "$SHOW_IP_API_URL" =~ ^([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]([A-Za-z0-9-]*[A-Za-z0-9])?\.?$ ]]; then
+        body=""
+        if has_cmd dig; then
+            body="$(dig +short A "$SHOW_IP_API_URL" "@${DNS_RESOLVER:-$DEFAULT_RESOLVER}" 2>/dev/null | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' || true)"
+        fi
+        ip="$(extract_public_ipv4 "$body" 2>/dev/null || true)"
+        if [[ -z "$ip" ]] && has_cmd getent; then
+            body="$(getent ahostsv4 "$SHOW_IP_API_URL" 2>/dev/null | awk '{print $1}' | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' || true)"
+            ip="$(extract_public_ipv4 "$body" 2>/dev/null || true)"
+        fi
+        if [[ -n "$ip" ]]; then printf '%s' "$ip"; return 0; fi
+        log "❌ 获取当前 IP API 未返回公网 IPv4。返回摘要：$(shorten "$body")" >&2
+        return 1
+    fi
     body="$(curl_get "$SHOW_IP_API_URL" "$CURL_TIMEOUT")"
     ip="$(extract_public_ipv4 "$body" 2>/dev/null || true)"
     if [[ -n "$ip" ]]; then
@@ -473,7 +487,19 @@ test_show_ip_api() {
     load_config
     [[ -n "$SHOW_IP_API_URL" ]] || { err "获取当前 IP API 未配置。"; return 1; }
     local body ip
-    body="$(curl_get "$SHOW_IP_API_URL" "$CURL_TIMEOUT")"
+    if [[ "$SHOW_IP_API_URL" =~ ^([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]([A-Za-z0-9-]*[A-Za-z0-9])?\.?$ ]]; then
+        body=""
+        if has_cmd dig; then
+            body="$(dig +short A "$SHOW_IP_API_URL" "@${DNS_RESOLVER:-$DEFAULT_RESOLVER}" 2>/dev/null | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' || true)"
+        fi
+        ip="$(extract_public_ipv4 "$body" 2>/dev/null || true)"
+        if [[ -z "$ip" ]] && has_cmd getent; then
+            body="$(getent ahostsv4 "$SHOW_IP_API_URL" 2>/dev/null | awk '{print $1}' | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' || true)"
+            ip="$(extract_public_ipv4 "$body" 2>/dev/null || true)"
+        fi
+    else
+        body="$(curl_get "$SHOW_IP_API_URL" "$CURL_TIMEOUT")"
+    fi
     ip="$(extract_public_ipv4 "$body" 2>/dev/null || true)"
     cecho "🔎 获取当前 IP API 测试"
     cecho "----------------------------------------"
@@ -571,7 +597,7 @@ write_runner() {
 # Globalping CN 检测 -> 连续失败计数 -> 达阈值自动调用更换 IP API。
 set +e
 APP_NAME="hinet-gfw-changeip"
-APP_VERSION="hinet-gfw-changeip-v2.4-worker"
+APP_VERSION="hinet-gfw-changeip-v2.5-worker"
 CONF_FILE="/etc/hinet-gfw-changeip/config.env"
 STATE_DIR="/var/lib/hinet-gfw-changeip"
 LOG_DIR="/var/log/hinet-gfw-changeip"
@@ -720,6 +746,20 @@ resolve_target_ip() {
 }
 get_current_ip_from_api() {
     local body ip
+    if [[ "$SHOW_IP_API_URL" =~ ^([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]([A-Za-z0-9-]*[A-Za-z0-9])?\.?$ ]]; then
+        body=""
+        if has_cmd dig; then
+            body="$(dig +short A "$SHOW_IP_API_URL" "@${DNS_RESOLVER:-$DEFAULT_RESOLVER}" 2>/dev/null | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' || true)"
+        fi
+        ip="$(extract_public_ipv4 "$body" 2>/dev/null || true)"
+        if [[ -z "$ip" ]] && has_cmd getent; then
+            body="$(getent ahostsv4 "$SHOW_IP_API_URL" 2>/dev/null | awk '{print $1}' | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' || true)"
+            ip="$(extract_public_ipv4 "$body" 2>/dev/null || true)"
+        fi
+        if [[ -n "$ip" ]]; then printf '%s' "$ip"; return 0; fi
+        wlog "❌ 获取当前 IP API 未返回公网 IPv4。返回摘要：$(shorten "$body")" >&2
+        return 1
+    fi
     body="$(curl_get "$SHOW_IP_API_URL" "$CURL_TIMEOUT")"
     ip="$(extract_public_ipv4 "$body" 2>/dev/null || true)"
     if [[ -n "$ip" ]]; then printf '%s' "$ip"; return 0; fi
@@ -1056,12 +1096,12 @@ quick_init() {
     cecho "🚀 ${APP_VERSION} 快速初始化"
     cecho "----------------------------------------"
     warn "请输入你的真实 API 地址。脚本不会内置示例 URL，也不会把敏感信息上传 GitHub。"
-    warn "v2.4 使用 systemd timer + 独立 worker。worker 会直接执行 Globalping 检测、失败计数和自动换 IP。"
+    warn "v2.5 使用 systemd timer + 独立 worker。worker 会直接执行 Globalping 检测、失败计数和自动换 IP。"
     cecho ""
 
     local show_api change_api target interval probes threshold packets wait cooldown timeout post_wait min_api resolver start_now
-    read -r -p "🔎 请输入【获取当前 IP API】地址：" show_api
-    while [[ -z "$show_api" ]]; do read -r -p "🔎 获取当前 IP API 地址不能为空，请重新输入：" show_api; done
+    read -r -p "🔎 请输入【获取当前 IP API / 域名】（API 地址或裸域名）：" show_api
+    while [[ -z "$show_api" ]]; do read -r -p "🔎 获取当前 IP API / 域名不能为空，请重新输入：" show_api; done
     read -r -p "🔁 请输入【真正更换 IP API】地址：" change_api
     while [[ -z "$change_api" ]]; do read -r -p "🔁 更换 IP API 地址不能为空，请重新输入：" change_api; done
     warn_if_showip_action "$change_api"
@@ -1123,7 +1163,7 @@ edit_config() {
     cecho "🛠️ 修改已有配置：直接回车保留原值"
     cecho "----------------------------------------"
     local v
-    read -r -p "🔎 获取当前 IP API [$(mask_url "$SHOW_IP_API_URL")]：" v; [[ -n "$v" ]] && SHOW_IP_API_URL="$v"
+    read -r -p "🔎 获取当前 IP API / 域名 [$(mask_url "$SHOW_IP_API_URL")]：" v; [[ -n "$v" ]] && SHOW_IP_API_URL="$v"
     read -r -p "🔁 真正更换 IP API [$(mask_url "$CHANGE_IP_API_URL")]：" v; [[ -n "$v" ]] && CHANGE_IP_API_URL="$v"
     warn_if_showip_action "$CHANGE_IP_API_URL"
     if [[ "$SHOW_IP_API_URL" == "$CHANGE_IP_API_URL" ]]; then warn "获取 IP API 和更换 IP API 完全相同，请确认没有填错。"; fi

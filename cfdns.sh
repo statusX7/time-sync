@@ -2,11 +2,11 @@
 set -euo pipefail
 umask 077
 
-# cfdns v2.9 installer
-# Cloudflare DNS multi-group A-record incremental sync tool
+# cfdns v3.0 installer
+# Cloudflare DNS multi-group A/AAAA incremental sync tool
 
 APP_NAME="cf-dns-sync"
-APP_VERSION="2.9"
+APP_VERSION="3.0"
 INSTALL_DIR="/opt/cfdns"
 INSTALL_COPY="${INSTALL_DIR}/cfdns-installer.sh"
 BASE_DIR="/etc/${APP_NAME}"
@@ -160,7 +160,8 @@ validate_settings_file() {
 write_groups() {
   if [[ ! -f "${GROUPS_FILE}" ]]; then
     cat > "${GROUPS_FILE}" <<'TSV'
-# group_name<TAB>enabled<TAB>interval_sec<TAB>api_token<TAB>zone_id<TAB>target_fqdn<TAB>ttl<TAB>proxied<TAB>mode<TAB>source_domains_csv
+# group_name<TAB>enabled<TAB>interval_sec<TAB>api_token<TAB>zone_id<TAB>target_fqdn<TAB>ttl<TAB>proxied<TAB>mode<TAB>source_domains_csv<TAB>address_family
+# 旧10字段默认IPV4；第11字段可为IPV4/IPV6/DUAL_STACK。
 # 示例：
 # group-a	true	60	please_fill_api_token	please_fill_zone_id	tiktokeu.example.com	60	false	ALL_IPS	src1.example.com,src2.example.com
 TSV
@@ -261,7 +262,7 @@ write_sync_script() {
 set -uo pipefail
 umask 077
 
-APP_VERSION="2.9"
+APP_VERSION="3.0"
 BASE_DIR="/etc/cf-dns-sync"
 VAR_DIR="/var/lib/cf-dns-sync"
 SETTINGS_FILE="${BASE_DIR}/settings.conf"
@@ -367,6 +368,7 @@ FAILOVER_PRE_SWITCH_STATE=""
 FAILOVER_PENDING_STATE=""
 FAILOVER_RECOVERY_PENDING=0
 FAILOVER_RECOVERY_GROUP=""
+SYNC_ADDRESS_FAMILY="IPV4"
 
 # 自动任务不等待锁；人工同步/测试/切换最多等待30秒，避免“实际未执行却提示成功”。
 if ! exec 9>"${LOCK_FILE}"; then
@@ -514,7 +516,7 @@ cf_api() {
 
 
 valid_health_target() {
-  valid_ipv4 "${1:-}" || valid_domain "${1:-}"
+  valid_domain "${1:-}" || normalize_ip "${1:-}" >/dev/null
 }
 
 split_tsv_line() {
@@ -526,6 +528,77 @@ split_tsv_line() {
   done
   TSV_FIELDS+=("${rest}")
 }
+
+
+
+# IPv6统一为八组小写十六进制，避免等价表示被误判为不同记录。
+normalize_ip() {
+  local value="${1:-}"
+  [[ -n "${value}" && "${#value}" -le 45 && "${value}" != *$'\n'* && "${value}" != *$'\r'* ]] || return 1
+  awk -v ip="${value}" '
+    function ipv4(s, a,n,i) {
+      n=split(s,a,"."); if(n!=4) return ""
+      for(i=1;i<=4;i++) if(a[i]!~/^[0-9]+$/ || length(a[i])>3 || a[i]+0>255) return ""
+      return sprintf("%d.%d.%d.%d",a[1],a[2],a[3],a[4])
+    }
+    function hex(s, i,v,c) {
+      v=0; for(i=1;i<=length(s);i++){c=index("0123456789abcdef",substr(s,i,1))-1; if(c<0) return -1; v=v*16+c}
+      return v
+    }
+    BEGIN {
+      ip=tolower(ip)
+      if(index(ip,":")==0){v=ipv4(ip); if(v=="") exit 1; print v; exit}
+      if(ip !~ /^[0-9a-f:.]+$/) exit 1
+      if(index(ip,".")){
+        if(!match(ip,/[0-9.]+$/)) exit 1
+        tail=substr(ip,RSTART); v=ipv4(tail); if(v=="") exit 1
+        split(v,a,"."); ip=substr(ip,1,RSTART-1) sprintf("%x:%x",a[1]*256+a[2],a[3]*256+a[4])
+      }
+      p=index(ip,"::")
+      if(p){
+        left=substr(ip,1,p-1); right=substr(ip,p+2)
+        if(index(right,"::")) exit 1
+        nl=(left==""?0:split(left,l,":")); nr=(right==""?0:split(right,r,":"))
+        if(nl+nr>=8) exit 1
+        for(i=1;i<=nl;i++) parts[++n]=l[i]
+        for(i=1;i<=8-nl-nr;i++) parts[++n]="0"
+        for(i=1;i<=nr;i++) parts[++n]=r[i]
+      } else {n=split(ip,parts,":"); if(n!=8) exit 1}
+      out=""
+      for(i=1;i<=8;i++){
+        if(parts[i]=="" || length(parts[i])>4 || parts[i]!~/^[0-9a-f]+$/) exit 1
+        out=out (i==1?"":":") sprintf("%04x",hex(parts[i]))
+      }
+      print out
+    }
+  '
+}
+
+normalize_record_ip() {
+  local ip="$1" type="$2"
+  case "${type}" in A) [[ "${ip}" != *:* ]] || return 1 ;; AAAA) [[ "${ip}" == *:* ]] || return 1 ;; *) return 1 ;; esac
+  normalize_ip "${ip}"
+}
+
+valid_address_family() {
+  case "${1:-}" in IPV4|IPV6|DUAL_STACK) return 0 ;; *) return 1 ;; esac
+}
+
+record_types_for_family() {
+  case "${1:-IPV4}" in IPV4) echo A ;; IPV6) echo AAAA ;; DUAL_STACK) printf 'A\nAAAA\n' ;; *) return 1 ;; esac
+}
+
+health_ip_version() {
+  [[ "${1:-IPV4}" == IPV6 ]] && echo 6 || echo 4
+}
+
+valid_health_target_for_family() {
+  local value="$1" family="${2:-IPV4}" normalized
+  valid_domain "${value}" && return 0
+  normalized="$(normalize_ip "${value}")" || return 1
+  if [[ "${family}" == IPV6 ]]; then [[ "${normalized}" == *:* ]]; else [[ "${normalized}" != *:* ]]; fi
+}
+
 
 gp_api() {
   local method="$1" endpoint="$2" data="${3:-}"
@@ -620,15 +693,19 @@ globalping_record_usage() {
 
 globalping_health_check() {
   local group="$1" role="$2" target="$3" check_type="$4" port="$5" location="$6"
-  local payload create_resp create_http measurement_id probes_count start now resp status result_status failure_source
+  local ip_version normalized payload create_resp create_http measurement_id probes_count start now resp status result_status failure_source
   local rcv loss probe_country probe_city resolved raw budget_rc usage_tests uncertain_usage_recorded=0
 
+  ip_version="$(health_ip_version "${SYNC_ADDRESS_FAMILY:-IPV4}")"
   GP_CHECK_CLASS="UNKNOWN"
   GP_CHECK_DETAIL=""
   GP_MEASUREMENT_ID=""
   GP_PROBE=""
   GP_RESOLVED_ADDRESS=""
 
+  if ! valid_health_target_for_family "${target}" "${SYNC_ADDRESS_FAMILY:-IPV4}"; then
+    GP_CHECK_DETAIL="健康检测目标与组地址族不匹配"; return 0
+  fi
   globalping_budget_available
   budget_rc=$?
   case "${budget_rc}" in
@@ -647,14 +724,16 @@ globalping_health_check() {
 
   if [[ "${check_type}" == "PING_TCP" ]]; then
     payload="$(jq -nc --arg target "${target}" --arg location "${location}" \
-      --argjson timeout "${GLOBALPING_MEASUREMENT_TIMEOUT_SEC}" --argjson port "${port}" \
-      '{type:"ping",target:$target,locations:[{magic:$location,limit:1}],timeout:$timeout,measurementOptions:{protocol:"TCP",port:$port,packets:3,ipVersion:4}}')"
+      --argjson ipVersion "${ip_version}" --argjson timeout "${GLOBALPING_MEASUREMENT_TIMEOUT_SEC}" --argjson port "${port}" \
+      '{type:"ping",target:$target,locations:[{magic:$location,limit:1}],timeout:$timeout,measurementOptions:{protocol:"TCP",port:$port,packets:3,ipVersion:$ipVersion}}')"
   else
     payload="$(jq -nc --arg target "${target}" --arg location "${location}" \
-      --argjson timeout "${GLOBALPING_MEASUREMENT_TIMEOUT_SEC}" \
-      '{type:"ping",target:$target,locations:[{magic:$location,limit:1}],timeout:$timeout,measurementOptions:{protocol:"ICMP",packets:3,ipVersion:4}}')"
+      --argjson ipVersion "${ip_version}" --argjson timeout "${GLOBALPING_MEASUREMENT_TIMEOUT_SEC}" \
+      '{type:"ping",target:$target,locations:[{magic:$location,limit:1}],timeout:$timeout,measurementOptions:{protocol:"ICMP",packets:3,ipVersion:$ipVersion}}')"
   fi
 
+  # 官方只允许对域名指定ipVersion；直接IP目标已按组地址族校验。
+  if ! valid_domain "${target}"; then payload="$(jq 'del(.measurementOptions.ipVersion)' <<< "${payload}")"; fi
   create_resp="$(gp_api POST /measurements "${payload}")"
   create_http="$(jq -r '._http_status // 0' <<< "${create_resp}" 2>/dev/null || echo 0)"
   [[ "${create_http}" =~ ^[0-9]+$ ]] || create_http=0
@@ -730,6 +809,12 @@ globalping_health_check() {
   raw="$(tr '\r\n\t' '   ' <<< "${raw}" | sed 's/[[:space:]]\+/ /g' | cut -c1-240)"
   GP_PROBE="${probe_country}${probe_city:+/${probe_city}}"
   GP_RESOLVED_ADDRESS="${resolved}"
+  if [[ -n "${resolved}" ]]; then
+    normalized="$(normalize_ip "${resolved}")" || { GP_CHECK_DETAIL="探针返回非法解析地址"; return 0; }
+    if [[ "${ip_version}" == 6 && "${normalized}" != *:* ]] || [[ "${ip_version}" == 4 && "${normalized}" == *:* ]]; then
+      GP_CHECK_DETAIL="探针返回地址与请求地址族不匹配"; return 0
+    fi
+  fi
 
   case "${location,,}" in
     china|china+*|cn|cn+*)
@@ -812,8 +897,8 @@ validate_failover_config() {
     valid_domain "${domain}" || { log ERROR "组 ${group}: BACKUP源域名格式错误：${domain}"; return 1; }
     if csv_contains_value "${primary_sources}" "${domain}"; then log ERROR "组 ${group}: PRIMARY与BACKUP不能包含同一个源域名：${domain}"; return 1; fi
   done
-  valid_health_target "${FO_PRIMARY_TARGET}" || { log ERROR "组 ${group}: PRIMARY健康检测目标格式错误"; return 1; }
-  valid_health_target "${FO_BACKUP_TARGET}" || { log ERROR "组 ${group}: BACKUP健康检测目标格式错误"; return 1; }
+  valid_health_target_for_family "${FO_PRIMARY_TARGET}" "${SYNC_ADDRESS_FAMILY:-IPV4}" || { log ERROR "组 ${group}: PRIMARY健康检测目标格式或地址族错误"; return 1; }
+  valid_health_target_for_family "${FO_BACKUP_TARGET}" "${SYNC_ADDRESS_FAMILY:-IPV4}" || { log ERROR "组 ${group}: BACKUP健康检测目标格式或地址族错误"; return 1; }
   [[ "${FO_CHECK_TYPE}" == PING_ICMP || "${FO_CHECK_TYPE}" == PING_TCP ]] || { log ERROR "组 ${group}: 检测类型必须是PING_ICMP/PING_TCP"; return 1; }
   if [[ "${FO_CHECK_TYPE}" == PING_TCP ]]; then [[ "${FO_PORT}" =~ ^[0-9]+$ ]] && (( FO_PORT>=1 && FO_PORT<=65535 )) || { log ERROR "组 ${group}: TCP端口必须为1~65535"; return 1; }; else FO_PORT=0; fi
   [[ -n "${FO_LOCATION}" && "${FO_LOCATION}" != *$'\t'* && "${FO_LOCATION}" != *$'\n'* ]] || { log ERROR "组 ${group}: Globalping位置不能为空或包含TAB/换行"; return 1; }
@@ -958,19 +1043,21 @@ mark_group_sync_due() {
 }
 
 route_sources_ready_for_switch() {
-  local group="$1" role="$2" sources_csv="$3" domain ips
-  local failed=()
+  local group="$1" role="$2" sources_csv="$3" domain type ips types
+  local -a failed=()
   csv_to_sources_array "${sources_csv}"
-  (( ${#SOURCES_ARRAY[@]} >= 1 )) || { log ERROR "组 ${group}: ${role} 没有可用源域名，阻止线路切换"; return 1; }
+  (( ${#SOURCES_ARRAY[@]}>=1 )) || return 1
+  types="$(record_types_for_family "${SYNC_ADDRESS_FAMILY:-IPV4}")" || return 1
   for domain in "${SOURCES_ARRAY[@]}"; do
-    ips="$(resolve_domain_ipv4 "${domain}" | sort -u)"
-    [[ -n "${ips}" ]] || failed+=("${domain}")
+    while IFS= read -r type; do
+      ips="$(resolve_domain_addresses "${domain}" "${type}")"
+      [[ -n "${ips}" ]] || failed+=("${domain}(${type})")
+    done <<< "${types}"
   done
-  if (( ${#failed[@]} > 0 )); then
-    log ERROR "组 ${group}: ${role} 源域名未全部解析到IPv4，阻止线路切换：$(IFS=,; echo "${failed[*]}")"
+  if (( ${#failed[@]}>0 )); then
+    log ERROR "组 ${group}: ${role} 源域名地址族未全部就绪，阻止切换：$(IFS=,; echo "${failed[*]}")"
     return 1
   fi
-  return 0
 }
 
 failover_switch_role() {
@@ -1351,7 +1438,9 @@ find_group_record() {
 
 parse_group_record_for_failover() {
   split_tsv_line "$1"
-  (( ${#TSV_FIELDS[@]} == 10 )) || return 1
+  (( ${#TSV_FIELDS[@]} == 10 || ${#TSV_FIELDS[@]} == 11 )) || return 1
+  SYNC_ADDRESS_FAMILY="${TSV_FIELDS[10]:-IPV4}"
+  (( ${#TSV_FIELDS[@]} == 10 )) || valid_address_family "${TSV_FIELDS[10]}" || return 1
   MG_ENABLED="${TSV_FIELDS[1]}"
   MG_PRIMARY_SOURCES="${TSV_FIELDS[9]}"
 }
@@ -1449,46 +1538,47 @@ csv_to_sources_array() {
   IFS=',' read -r -a SOURCES_ARRAY <<< "${normalized}"
 }
 
-resolve_domain_ipv4() {
-  local domain="$1"
-  local -a args=(+short "+time=${DNS_QUERY_TIMEOUT_SEC}" +tries=1 A "${domain}")
-  if [[ -n "${DNS_SERVER}" ]]; then
-    args=("@${DNS_SERVER}" +short "+time=${DNS_QUERY_TIMEOUT_SEC}" +tries=1 A "${domain}")
-  fi
-  local ip
+resolve_domain_addresses() {
+  local domain="$1" type="$2" answer ip normalized found=0
+  local -a args=(+short "+time=${DNS_QUERY_TIMEOUT_SEC}" +tries=1 "${type}" "${domain}")
+  [[ -z "${DNS_SERVER}" ]] || args=("@${DNS_SERVER}" "${args[@]}")
+  answer="$(dig "${args[@]}" 2>/dev/null)" || return 1
   while IFS= read -r ip; do
     ip="${ip//$'\r'/}"
-    valid_ipv4 "${ip}" && printf '%s\n' "${ip}"
-  done < <(dig "${args[@]}" 2>/dev/null || true)
+    normalized="$(normalize_record_ip "${ip}" "${type}")" || continue
+    printf '%s\n' "${normalized}"; found=1
+  done <<< "${answer}"
+  (( found == 1 ))
 }
+
+resolve_domain_ipv4() { resolve_domain_addresses "$1" A; }
+resolve_domain_ipv6() { resolve_domain_addresses "$1" AAAA; }
 
 build_group_map() {
   local mode="$1" map_file="$2" failed_file="$3"
   shift 3
-  local domain ip picked ips
-  : > "${map_file}"
-  : > "${failed_file}"
-
+  local domain type picked ips types
+  types="$(record_types_for_family "${SYNC_ADDRESS_FAMILY:-IPV4}")" || return 1
+  : > "${map_file}" || return 1
+  : > "${failed_file}" || return 1
   for domain in "$@"; do
-    [[ -n "${domain}" ]] || continue
-    ips="$(resolve_domain_ipv4 "${domain}" | sort -u)"
-    if [[ -z "${ips}" ]]; then
-      printf '%s\n' "${domain}" >> "${failed_file}"
-      continue
-    fi
-
-    if [[ "${mode}" == "SINGLE_IP" ]]; then
-      picked="$(sed -n '1p' <<< "${ips}")"
-      [[ -n "${picked}" ]] && printf '%s\t%s\n' "${domain}" "${picked}" >> "${map_file}"
-    else
-      while IFS= read -r ip; do
-        [[ -n "${ip}" ]] && printf '%s\t%s\n' "${domain}" "${ip}" >> "${map_file}"
-      done <<< "${ips}"
-    fi
+    while IFS= read -r type; do
+      if ! ips="$(resolve_domain_addresses "${domain}" "${type}" | LC_ALL=C sort -u)" || [[ -z "${ips}" ]]; then
+        printf '%s(%s)\n' "${domain}" "${type}" >> "${failed_file}" || return 1
+        continue
+      fi
+      if [[ "${mode}" == SINGLE_IP ]]; then
+        picked="$(sed -n '1p' <<< "${ips}")"
+        printf '%s\t%s\n' "${domain}" "${picked}" >> "${map_file}" || return 1
+      else
+        while IFS= read -r picked; do
+          printf '%s\t%s\n' "${domain}" "${picked}" >> "${map_file}" || return 1
+        done <<< "${ips}"
+      fi
+    done <<< "${types}"
   done
-
-  sort -u -o "${map_file}" "${map_file}" || return 1
-  sort -u -o "${failed_file}" "${failed_file}" || return 1
+  LC_ALL=C sort -u -o "${map_file}" "${map_file}" || return 1
+  LC_ALL=C sort -u -o "${failed_file}" "${failed_file}"
 }
 
 get_table_value() {
@@ -1534,8 +1624,19 @@ reconcile_due() {
 }
 
 extract_group_state_map() {
-  local group="$1" out="$2"
-  awk -F '\t' -v g="${group}" '$1==g{print $2 "\t" $3}' "${STATE_FILE}" 2>/dev/null | sort -u > "${out}"
+  local group="$1" out="$2" family="${3:-IPV4}" domain ip normalized row rows
+  : > "${out}" || return 1
+  rows="$(awk -F '\t' -v g="${group}" '$1==g' "${STATE_FILE}")" || return 1
+  while IFS= read -r row; do
+    [[ -n "${row}" ]] || continue
+    split_tsv_line "${row}"
+    (( ${#TSV_FIELDS[@]} == 3 )) || return 1
+    domain="${TSV_FIELDS[1]}"; ip="${TSV_FIELDS[2]}"
+    normalized="$(normalize_ip "${ip}")" || return 1
+    if [[ "${family}" == IPV4 && "${normalized}" == *:* ]] || [[ "${family}" == IPV6 && "${normalized}" != *:* ]]; then continue; fi
+    printf '%s\t%s\n' "${domain}" "${normalized}" >> "${out}" || return 1
+  done <<< "${rows}"
+  LC_ALL=C sort -u -o "${out}" "${out}"
 }
 
 save_group_state() {
@@ -1565,13 +1666,13 @@ domains_by_ip_from_map() {
 }
 
 create_cf_record() {
-  local token="$1" zone="$2" target="$3" ttl="$4" proxied="$5" ip="$6" payload resp
-  payload="$(jq -nc --arg type A --arg name "${target}" --arg content "${ip}" \
+  local token="$1" zone="$2" target="$3" ttl="$4" proxied="$5" ip="$6" type="${7:-A}" payload resp
+  payload="$(jq -nc --arg type "${type}" --arg name "${target}" --arg content "${ip}" \
     --argjson ttl "${ttl}" --argjson proxied "${proxied}" \
     '{type:$type,name:$name,content:$content,ttl:$ttl,proxied:$proxied}')"
   resp="$(cf_api POST "${token}" "/zones/${zone}/dns_records" "${payload}")"
   if [[ "$(jq -r '.success // false' <<< "${resp}")" != "true" ]]; then
-    log ERROR "创建 A 记录失败: ${target} -> ${ip}: $(jq -c '{status:._http_status,errors:.errors}' <<< "${resp}" 2>/dev/null || echo API_ERROR)"
+    log ERROR "创建 ${type} 记录失败: ${target} -> ${ip}: $(jq -c '{status:._http_status,errors:.errors}' <<< "${resp}" 2>/dev/null || echo API_ERROR)"
     return 1
   fi
   return 0
@@ -1581,7 +1682,7 @@ delete_cf_record() {
   local token="$1" zone="$2" id="$3" resp
   resp="$(cf_api DELETE "${token}" "/zones/${zone}/dns_records/${id}")"
   if [[ "$(jq -r '.success // false' <<< "${resp}")" != "true" ]]; then
-    log ERROR "删除 A 记录失败: record_id=${id}: $(jq -c '{status:._http_status,errors:.errors}' <<< "${resp}" 2>/dev/null || echo API_ERROR)"
+    log ERROR "删除 DNS 地址记录失败: record_id=${id}: $(jq -c '{status:._http_status,errors:.errors}' <<< "${resp}" 2>/dev/null || echo API_ERROR)"
     return 1
   fi
   return 0
@@ -1592,280 +1693,164 @@ update_cf_record_attributes() {
   payload="$(jq -nc --argjson ttl "${ttl}" --argjson proxied "${proxied}" '{ttl:$ttl,proxied:$proxied}')"
   resp="$(cf_api PATCH "${token}" "/zones/${zone}/dns_records/${id}" "${payload}")"
   if [[ "$(jq -r '.success // false' <<< "${resp}")" != "true" ]]; then
-    log ERROR "更新 A 记录属性失败: record_id=${id}: $(jq -c '{status:._http_status,errors:.errors}' <<< "${resp}" 2>/dev/null || echo API_ERROR)"
+    log ERROR "更新 DNS 地址记录属性失败: record_id=${id}: $(jq -c '{status:._http_status,errors:.errors}' <<< "${resp}" 2>/dev/null || echo API_ERROR)"
     return 1
   fi
   return 0
 }
 
 fetch_cf_a_records() {
-  local group="$1" token="$2" zone="$3" target="$4" output="$5"
-  local encoded page=1 total_pages=1 resp api_status retry_after
+  local group="$1" token="$2" zone="$3" target="$4" output="$5" type="${6:-A}"
+  local encoded page=1 total_pages=1 resp row id ip record_ttl record_proxied normalized
   encoded="$(urlencode "${target}")"
-  : > "${output}"
-
+  : > "${output}" || return 1
   while (( page <= total_pages )); do
-    resp="$(cf_api GET "${token}" "/zones/${zone}/dns_records?type=A&name=${encoded}&page=${page}&per_page=100")"
-    if [[ "$(jq -r '.success // false' <<< "${resp}" 2>/dev/null)" != "true" ]]; then
-      api_status="$(jq -r '._http_status // 0' <<< "${resp}" 2>/dev/null || echo 0)"
-      retry_after="$(jq -r '._retry_after // 0' <<< "${resp}" 2>/dev/null || echo 0)"
-      log ERROR "组 ${group}: Cloudflare API 查询失败，HTTP=${api_status}，retry-after=${retry_after}s，详情=$(jq -c '.errors' <<< "${resp}" 2>/dev/null || echo unknown)"
+    resp="$(cf_api GET "${token}" "/zones/${zone}/dns_records?type=${type}&name=${encoded}&page=${page}&per_page=100")"
+    if ! jq -e --arg type "${type}" --arg name "${target}" '
+      .success == true and (.result|type) == "array" and
+      all(.result[]; (.id|type) == "string" and (.id|length)>0 and (.content|type) == "string"
+        and (.ttl|type)=="number" and (.proxied|type)=="boolean"
+        and ((.type // $type)==$type) and ((.name // $name)|rtrimstr(".")|ascii_downcase)==($name|rtrimstr(".")|ascii_downcase))
+    ' >/dev/null 2>&1 <<< "${resp}"; then
+      log ERROR "组 ${group}: Cloudflare ${type} 查询失败或数据结构异常，未操作任何记录"
       return 1
     fi
-
-    jq -r '.result[]? | [.id,.content,(.ttl | tostring),(.proxied | tostring)] | @tsv' <<< "${resp}" >> "${output}" || return 1
-    total_pages="$(jq -r '.result_info.total_pages // 1' <<< "${resp}" 2>/dev/null || echo 1)"
-    [[ "${total_pages}" =~ ^[0-9]+$ ]] || total_pages=1
-    (( total_pages >= 1 )) || total_pages=1
-    (( total_pages <= 1000 )) || {
-      log ERROR "组 ${group}: Cloudflare 返回异常分页数量=${total_pages}，为安全起见停止同步"
-      return 1
-    }
+    while IFS=$'\t' read -r id ip record_ttl record_proxied; do
+      [[ "${id}" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
+      normalized="$(normalize_record_ip "${ip}" "${type}")" || {
+        log ERROR "组 ${group}: Cloudflare ${type} 返回非法地址，已停止同步"; return 1;
+      }
+      # Cloudflare Enterprise远端记录可为30秒；组配置仍遵循原有60秒下限。
+      [[ "${record_ttl}" =~ ^[0-9]+$ ]] && (( record_ttl==1 || (record_ttl>=30 && record_ttl<=86400) )) || return 1
+      printf '%s\t%s\t%s\t%s\n' "${id}" "${normalized}" "${record_ttl}" "${record_proxied}" >> "${output}" || return 1
+    done < <(jq -r '.result[] | [.id,.content,(.ttl|tostring),(.proxied|tostring)] | @tsv' <<< "${resp}")
+    total_pages="$(jq -r '.result_info.total_pages // 1' <<< "${resp}")"
+    [[ "${total_pages}" =~ ^[0-9]+$ ]] && (( total_pages>=1 && total_pages<=1000 )) || return 1
     page=$((page+1))
   done
-
-  return 0
 }
 
 sync_one_group() {
   local group_name="$1" enabled="$2" interval_sec="$3" api_token="$4" zone_id="$5"
-  local target_fqdn="$6" ttl="$7" proxied="$8" mode="$9" sources_csv="${10}" active_route="${11:-PRIMARY}"
-
-  if ! valid_group_name "${group_name}"; then
-    log ERROR "组名为空、过长、以#开头或包含 TAB、换行、回车或反斜杠"
-    return 1
+  local target_fqdn="$6" ttl="$7" proxied="$8" mode="$9" sources_csv="${10}" active_route="${11:-PRIMARY}" family="${12:-IPV4}"
+  valid_group_name "${group_name}" || { log ERROR "组名格式不安全"; return 1; }
+  [[ "${enabled}" == true || "${enabled}" == false ]] || return 1
+  if [[ "${enabled}" == false ]]; then
+    [[ "${RUN_MODE}" == AUTO || "${TARGET_GROUP}" == ALL ]] && return 0
+    log ERROR "组 ${group_name}: 已禁用，未执行"; return 1
   fi
-
-  if [[ "${enabled}" != "true" && "${enabled}" != "false" ]]; then
-    log ERROR "组 ${group_name}: enabled 必须是 true 或 false"
-    return 1
-  fi
-  if [[ "${enabled}" == "false" ]]; then
-    [[ "${TARGET_GROUP}" == "${group_name}" ]] && log ERROR "组 ${group_name}: 已禁用，未执行"
-    [[ "${RUN_MODE}" == "AUTO" ]] && return 0 || return 1
-  fi
-
-  if [[ "${RUN_MODE}" == "AUTO" ]] && ! should_run_group "${group_name}" "${interval_sec}"; then
-    return 0
-  fi
-
-  if ! [[ "${interval_sec}" =~ ^[0-9]+$ ]] || (( interval_sec < 5 )); then
-    log ERROR "组 ${group_name}: 检测周期必须是 >=5 秒的数字"
-    return 1
-  fi
-  if ! valid_ttl "${ttl}"; then
-    log ERROR "组 ${group_name}: TTL 必须为 1（自动）或 60~86400 秒"
-    return 1
-  fi
-  if [[ -z "${api_token}" || -z "${zone_id}" || -z "${target_fqdn}" ]]; then
-    log ERROR "组 ${group_name}: API Token、Zone ID 或目标域名为空"
-    return 1
-  fi
-  if ! [[ "${zone_id}" =~ ^[a-fA-F0-9]{32}$ ]]; then
-    log ERROR "组 ${group_name}: Zone ID 格式错误，应为32位十六进制字符串"
-    return 1
-  fi
-  if ! valid_domain "${target_fqdn}"; then
-    log ERROR "组 ${group_name}: 目标域名格式错误：${target_fqdn}"
-    return 1
-  fi
-  if [[ "${proxied}" != "false" ]]; then
-    log ERROR "组 ${group_name}: 当前版本仅支持 DNS only（proxied=false）"
-    return 1
-  fi
-  if [[ "${mode}" != "ALL_IPS" && "${mode}" != "SINGLE_IP" ]]; then
-    log ERROR "组 ${group_name}: 解析模式必须是 ALL_IPS 或 SINGLE_IP"
-    return 1
-  fi
-
+  valid_address_family "${family}" || { log ERROR "组 ${group_name}: 地址族非法"; return 1; }
+  [[ "${interval_sec}" =~ ^[0-9]+$ ]] && (( interval_sec>=5 )) || return 1
+  valid_ttl "${ttl}" || return 1
+  [[ -n "${api_token}" && "${zone_id}" =~ ^[a-fA-F0-9]{32}$ ]] || return 1
+  valid_domain "${target_fqdn}" || return 1
+  [[ "${proxied}" == false ]] || { log ERROR "仅支持 DNS only（proxied=false）"; return 1; }
+  [[ "${mode}" == ALL_IPS || "${mode}" == SINGLE_IP ]] || return 1
+  if [[ "${RUN_MODE}" == AUTO ]] && ! should_run_group "${group_name}" "${interval_sec}"; then return 0; fi
   csv_to_sources_array "${sources_csv}"
-  local source_count="${#SOURCES_ARRAY[@]}" source_domain
-  if (( source_count < 1 || source_count > 20 )); then
-    log ERROR "组 ${group_name}: 源域名数量必须为 1~20，当前=${source_count}"
-    return 1
+  (( ${#SOURCES_ARRAY[@]}>=1 && ${#SOURCES_ARRAY[@]}<=20 )) || return 1
+  local domain type types ip id domains old_map map failed tmpdir current desired record_ttl record_proxied first_id
+  for domain in "${SOURCES_ARRAY[@]}"; do valid_domain "${domain}" || return 1; done
+  SYNC_ADDRESS_FAMILY="${family}"
+  types="$(record_types_for_family "${family}")" || return 1
+  tmpdir="$(mktemp -d)" || return 1
+  map="${tmpdir}/map"; failed="${tmpdir}/failed"; old_map="${tmpdir}/old"
+  log DEBUG "组 ${group_name}: 开始本机源域名检测，线路=${active_route}，地址族=${family}，模式=${mode}"
+  if ! build_group_map "${mode}" "${map}" "${failed}" "${SOURCES_ARRAY[@]}" ||
+    ! set_group_last_run "${group_name}" "$(now_ts)"; then rm -rf -- "${tmpdir}"; return 1; fi
+  if [[ -s "${failed}" || ! -s "${map}" ]]; then
+    log ERROR "组 ${group_name}: 源地址解析失败：$(paste -sd ',' "${failed}")；保留旧记录，未访问Cloudflare"
+    rm -rf -- "${tmpdir}"; return 1
   fi
-  for source_domain in "${SOURCES_ARRAY[@]}"; do
-    if ! valid_domain "${source_domain}"; then
-      log ERROR "组 ${group_name}: 源域名格式错误：${source_domain}"
-      return 1
+  if ! extract_group_state_map "${group_name}" "${old_map}" "${family}"; then
+    log ERROR "组 ${group_name}: 本地成功状态无法读取，已停止同步"
+    rm -rf -- "${tmpdir}"; return 1
+  fi
+  if cmp -s "${map}" "${old_map}" && [[ "${FORCE_FLAG}" != 1 ]] && ! reconcile_due "${group_name}"; then
+    log DEBUG "组 ${group_name}: 源IP无变化，未访问Cloudflare"
+    rm -rf -- "${tmpdir}"; return 0
+  fi
+  # 两族分别读取和比较；任一查询失败，在任何写操作之前退出。
+  while IFS= read -r type; do
+    current="${tmpdir}/current.${type}"; desired="${tmpdir}/desired.${type}"
+    if ! fetch_cf_a_records "${group_name}" "${api_token}" "${zone_id}" "${target_fqdn}" "${current}" "${type}"; then
+      rm -rf -- "${tmpdir}"; return 1
     fi
-  done
-
-  local tmpdir map_file failed_domains old_map desired current_records current_unique to_add to_del
-  tmpdir="$(mktemp -d)" || { log ERROR "组 ${group_name}: 无法创建临时目录"; return 1; }
-  map_file="${tmpdir}/map"; failed_domains="${tmpdir}/failed_domains"
-  old_map="${tmpdir}/old_map"; desired="${tmpdir}/desired"
-  current_records="${tmpdir}/records"; current_unique="${tmpdir}/current"
-  to_add="${tmpdir}/to_add"; to_del="${tmpdir}/to_del"
-
-  log DEBUG "组 ${group_name}: 开始本机检测 -> ${target_fqdn}，线路=${active_route}，周期=${interval_sec}s，源域名=${source_count}"
-  if ! build_group_map "${mode}" "${map_file}" "${failed_domains}" "${SOURCES_ARRAY[@]}"; then
-    log ERROR "组 ${group_name}: 无法生成源 IP 映射"
-    rm -rf "${tmpdir}"
-    return 1
-  fi
-  if ! set_group_last_run "${group_name}" "$(now_ts)"; then
-    log ERROR "组 ${group_name}: 无法更新本地执行时间，已停止本轮同步"
-    rm -rf "${tmpdir}"
-    return 1
-  fi
-
-  # 任意一个源域名解析失败都停止本轮同步，防止把暂时解析失败误判成IP下线。
-  if [[ -s "${failed_domains}" ]]; then
-    log ERROR "组 ${group_name}: 以下源域名未解析到 IPv4：$(paste -sd ',' "${failed_domains}")；为防误删，未访问 Cloudflare"
-    rm -rf "${tmpdir}"
-    return 1
-  fi
-
-  if [[ ! -s "${map_file}" ]]; then
-    log ERROR "组 ${group_name}: 未查询到任何源 IPv4；为防误删，未访问 Cloudflare"
-    rm -rf "${tmpdir}"
-    return 1
-  fi
-
-  if ! awk -F '\t' '{print $2}' "${map_file}" | sort -u > "${desired}"; then
-    log ERROR "组 ${group_name}: 无法生成目标 IP 集合"
-    rm -rf "${tmpdir}"
-    return 1
-  fi
-  if ! extract_group_state_map "${group_name}" "${old_map}"; then
-    log ERROR "组 ${group_name}: 无法读取本地成功状态，已停止本轮同步"
-    rm -rf "${tmpdir}"
-    return 1
-  fi
-
-  local local_changed=0 force_reconcile=0
-  cmp -s "${map_file}" "${old_map}" || local_changed=1
-  if [[ "${FORCE_FLAG}" == "1" ]] || reconcile_due "${group_name}" || [[ ! -s "${old_map}" ]]; then
-    force_reconcile=1
-  fi
-
-  if (( local_changed == 0 && force_reconcile == 0 )); then
-    log DEBUG "组 ${group_name}: 源 IP 无变化，未调用 Cloudflare API"
-    rm -rf "${tmpdir}"
-    return 0
-  fi
-
-  if (( local_changed == 1 )); then
-    local old_ips new_ips
-    old_ips="$(awk -F '\t' '{print $2}' "${old_map}" | sort -u | paste -sd ',' -)"
-    new_ips="$(paste -sd ',' "${desired}")"
-    log INFO "组 ${group_name}: 检测到源 IP 变化，旧集合=${old_ips:-空}，新集合=${new_ips:-空}"
-  else
-    log DEBUG "组 ${group_name}: 到达强制校准周期，开始核对 Cloudflare"
-  fi
-
-  if ! fetch_cf_a_records "${group_name}" "${api_token}" "${zone_id}" "${target_fqdn}" "${current_records}"; then
-    rm -rf "${tmpdir}"
-    return 1
-  fi
-  if ! cut -f2 "${current_records}" | sed '/^$/d' | sort -u > "${current_unique}"; then
-    log ERROR "组 ${group_name}: 无法生成 Cloudflare 当前 IP 集合"
-    rm -rf "${tmpdir}"
-    return 1
-  fi
-  if ! comm -23 "${desired}" "${current_unique}" > "${to_add}" || ! comm -13 "${desired}" "${current_unique}" > "${to_del}"; then
-    log ERROR "组 ${group_name}: 无法比较目标与 Cloudflare 当前 IP 集合"
-    rm -rf "${tmpdir}"
-    return 1
-  fi
-
-  local op_failed=0 add_failed=0 ip id domains first_id record_ttl record_proxied
-
-  # 可用性优先：先把所有新 IP 添加成功，再删除旧 IP。
-  # 任意新增失败时保留全部旧记录，避免在切换过程中造成目标域名无可用 A 记录。
-  while IFS= read -r ip; do
-    [[ -n "${ip}" ]] || continue
-    domains="$(domains_by_ip_from_map "${map_file}" "${ip}")"
-    [[ -n "${domains}" ]] || domains="unknown"
-    if create_cf_record "${api_token}" "${zone_id}" "${target_fqdn}" "${ttl}" "${proxied}" "${ip}"; then
-      write_history "${group_name}" ADD "${ip}" "${domains}" "${mode}" "${target_fqdn}" "route=${active_route};added_to_cloudflare"
-      log INFO "组 ${group_name}: 已新增 IP ${ip}"
-    else
-      add_failed=1
-      op_failed=1
-    fi
-  done < "${to_add}"
-
+    awk -F '\t' -v t="${type}" '(t=="AAAA" && index($2,":")) || (t=="A" && !index($2,":")) {print $2}' "${map}" | LC_ALL=C sort -u > "${desired}" || { rm -rf -- "${tmpdir}"; return 1; }
+    cut -f2 "${current}" | LC_ALL=C sort -u > "${tmpdir}/ips.${type}" || { rm -rf -- "${tmpdir}"; return 1; }
+    LC_ALL=C comm -23 "${desired}" "${tmpdir}/ips.${type}" > "${tmpdir}/add.${type}" || { rm -rf -- "${tmpdir}"; return 1; }
+    LC_ALL=C comm -13 "${desired}" "${tmpdir}/ips.${type}" > "${tmpdir}/del.${type}" || { rm -rf -- "${tmpdir}"; return 1; }
+  done <<< "${types}"
+  local op_failed=0 add_failed=0
+  # 全部启用地址族新增成功前，不删除任何旧记录。
+  while IFS= read -r type; do
+    while IFS= read -r ip; do
+      [[ -n "${ip}" ]] || continue
+      domains="$(domains_by_ip_from_map "${map}" "${ip}")"
+      if create_cf_record "${api_token}" "${zone_id}" "${target_fqdn}" "${ttl}" "${proxied}" "${ip}" "${type}"; then
+        write_history "${group_name}" ADD "${ip}" "${domains}" "${mode}" "${target_fqdn}" "route=${active_route};type=${type};added_to_cloudflare" || log ERROR "IP历史写入失败"
+        log INFO "组 ${group_name}: 已新增 ${type} ${ip}"
+      else add_failed=1; op_failed=1; fi
+    done < "${tmpdir}/add.${type}"
+  done <<< "${types}"
   if (( add_failed == 0 )); then
-    # 同一 IP 已存在时仍核对 TTL/proxied，避免菜单修改成功但远端属性永久漂移。
-    while IFS= read -r ip; do
-      [[ -n "${ip}" ]] || continue
-      id=""; record_ttl=""; record_proxied=""
-      IFS=$'\t' read -r id _ record_ttl record_proxied < <(awk -F '\t' -v ip="${ip}" '$2==ip{print; exit}' "${current_records}") || true
-      [[ -n "${id:-}" ]] || continue
-      if [[ "${record_ttl}" != "${ttl}" || "${record_proxied}" != "${proxied}" ]]; then
-        domains="$(domains_by_ip_from_map "${map_file}" "${ip}")"
-        [[ -n "${domains}" ]] || domains="unknown"
-        if update_cf_record_attributes "${api_token}" "${zone_id}" "${id}" "${ttl}" "${proxied}"; then
-          write_history "${group_name}" UPDATE "${ip}" "${domains}" "${mode}" "${target_fqdn}" \
-            "route=${active_route};attributes_updated;ttl=${record_ttl}->${ttl};proxied=${record_proxied}->${proxied}" || \
-            log ERROR "组 ${group_name}: A 记录属性已更新，但历史写入失败：${ip}"
-          log INFO "组 ${group_name}: 已修正 IP ${ip} 的记录属性（TTL=${ttl}, proxied=${proxied}）"
-        else
-          op_failed=1
+    while IFS= read -r type; do
+      current="${tmpdir}/current.${type}"; desired="${tmpdir}/desired.${type}"
+      while IFS= read -r ip; do
+        id=""; record_ttl=""; record_proxied=""
+        IFS=$'\t' read -r id _ record_ttl record_proxied < <(awk -F '\t' -v ip="${ip}" '$2==ip{print;exit}' "${current}") || true
+        [[ -n "${id}" ]] || continue
+        if [[ "${record_ttl}" != "${ttl}" || "${record_proxied}" != "${proxied}" ]]; then
+          if update_cf_record_attributes "${api_token}" "${zone_id}" "${id}" "${ttl}" "${proxied}"; then
+            domains="$(domains_by_ip_from_map "${map}" "${ip}")"
+            write_history "${group_name}" UPDATE "${ip}" "${domains}" "${mode}" "${target_fqdn}" "route=${active_route};type=${type};attributes_updated" || log ERROR "IP历史写入失败"
+          else op_failed=1; fi
         fi
-      fi
-    done < "${desired}"
-
-    # 只有全部新增成功后，才删除已不再需要的旧 IP。
-    while IFS=$'\t' read -r id ip _ _; do
-      [[ -n "${id}" && -n "${ip}" ]] || continue
-      if grep -Fxq "${ip}" "${to_del}"; then
-        domains="$(domains_by_ip_from_map "${old_map}" "${ip}")"
-        [[ -n "${domains}" ]] || domains="unknown"
-        if delete_cf_record "${api_token}" "${zone_id}" "${id}"; then
-          write_history "${group_name}" DELETE "${ip}" "${domains}" "${mode}" "${target_fqdn}" "route=${active_route};removed_from_cloudflare"
-          log INFO "组 ${group_name}: 已删除旧 IP ${ip}"
-        else
-          op_failed=1
-        fi
-      fi
-    done < "${current_records}"
-
-    # 清理同一目标域名下的重复 A 记录，每个 IP 只保留一条。
-    while IFS= read -r ip; do
-      [[ -n "${ip}" ]] || continue
-      first_id=""
-      while IFS=$'\t' read -r id _ _ _; do
-        [[ -n "${first_id}" ]] || { first_id="${id}"; continue; }
-        if delete_cf_record "${api_token}" "${zone_id}" "${id}"; then
-          domains="$(domains_by_ip_from_map "${map_file}" "${ip}")"
-          [[ -n "${domains}" ]] || domains="unknown"
-          write_history "${group_name}" DELETE "${ip}" "${domains}" "${mode}" "${target_fqdn}" "route=${active_route};duplicate_record_cleanup"
-          log INFO "组 ${group_name}: 已清理重复 A 记录 ${ip}"
-        else
-          op_failed=1
-        fi
-      done < <(awk -F '\t' -v ip="${ip}" '$2==ip{print $1 "\t" $2}' "${current_records}")
-    done < "${desired}"
-  else
-    log ERROR "组 ${group_name}: 新 IP 未全部添加成功，为保障可用性，本轮未删除任何旧 IP"
-  fi
-
-  if (( op_failed == 0 )); then
-    if ! save_group_state "${group_name}" "${map_file}" || ! set_group_last_reconcile "${group_name}" "$(now_ts)"; then
-      op_failed=1
-      log ERROR "组 ${group_name}: Cloudflare 已操作，但本地成功状态保存失败；下个周期会重新核对"
-    else
-      if [[ ! -s "${to_add}" && ! -s "${to_del}" ]]; then
-        log DEBUG "组 ${group_name}: Cloudflare 记录与源 IP 及属性一致"
-      else
-        log INFO "组 ${group_name}: 增量同步完成"
-      fi
+      done < "${desired}"
+    done <<< "${types}"
+    # 属性写入也失败时保留所有旧记录，避免部分线路变更被误认为完整成功。
+    if (( op_failed == 0 )); then
+      while IFS= read -r type; do
+        current="${tmpdir}/current.${type}"
+        while IFS=$'\t' read -r id ip _ _; do
+          [[ -n "${id}" ]] || continue
+          if grep -Fxq "${ip}" "${tmpdir}/del.${type}"; then
+            domains="$(domains_by_ip_from_map "${old_map}" "${ip}")"
+            if delete_cf_record "${api_token}" "${zone_id}" "${id}"; then
+              write_history "${group_name}" DELETE "${ip}" "${domains:-unknown}" "${mode}" "${target_fqdn}" "route=${active_route};type=${type};removed_from_cloudflare" || log ERROR "IP历史写入失败"
+            else op_failed=1; fi
+          fi
+        done < "${current}"
+        while IFS= read -r ip; do
+          first_id=""
+          while IFS= read -r id; do
+            [[ -n "${first_id}" ]] || { first_id="${id}"; continue; }
+            if delete_cf_record "${api_token}" "${zone_id}" "${id}"; then
+              domains="$(domains_by_ip_from_map "${map}" "${ip}")"
+              write_history "${group_name}" DELETE "${ip}" "${domains}" "${mode}" "${target_fqdn}" "route=${active_route};type=${type};duplicate_record_cleanup" || log ERROR "IP历史写入失败"
+            else op_failed=1; fi
+          done < <(awk -F '\t' -v ip="${ip}" '$2==ip{print $1}' "${current}")
+        done < "${tmpdir}/desired.${type}"
+      done <<< "${types}"
     fi
   fi
-  if (( op_failed != 0 )); then
-    log ERROR "组 ${group_name}: API 或本地状态操作失败，未推进本地成功状态；下个检测周期会重新核对并重试"
+  if (( op_failed == 0 )); then
+    if ! save_group_state "${group_name}" "${map}" || ! set_group_last_reconcile "${group_name}" "$(now_ts)"; then
+      op_failed=1; log ERROR "Cloudflare已操作，但本地成功状态保存失败"
+    else log INFO "组 ${group_name}: ${family} 同步完成，线路=${active_route}"; fi
+  else
+    log ERROR "组 ${group_name}: ${family} 部分失败，未推进成功状态或确认线路，下轮重新核对"
+    mark_group_sync_due "${group_name}" || log ERROR "无法安排失败后的立即复核"
   fi
-
-  rm -rf "${tmpdir}"
+  rm -rf -- "${tmpdir}"
   return "${op_failed}"
 }
 
 assign_group_config_line() {
   split_tsv_line "$1"
-  (( ${#TSV_FIELDS[@]} == 10 )) || return 1
+  (( ${#TSV_FIELDS[@]} == 10 || ${#TSV_FIELDS[@]} == 11 )) || return 1
+  address_family="${TSV_FIELDS[10]:-IPV4}"
+  (( ${#TSV_FIELDS[@]} == 10 )) || valid_address_family "${TSV_FIELDS[10]}" || return 1
   group_name="${TSV_FIELDS[0]}"; enabled="${TSV_FIELDS[1]}"; interval_sec="${TSV_FIELDS[2]}"
   api_token="${TSV_FIELDS[3]}"; zone_id="${TSV_FIELDS[4]}"; target_fqdn="${TSV_FIELDS[5]}"
   ttl="${TSV_FIELDS[6]}"; proxied="${TSV_FIELDS[7]}"; mode="${TSV_FIELDS[8]}"; sources_csv="${TSV_FIELDS[9]}"
@@ -1873,7 +1858,7 @@ assign_group_config_line() {
 
 main() {
   local configured=0 matched=0 enabled_count=0 failures=0 key row field_count
-  local group_name enabled interval_sec api_token zone_id target_fqdn ttl proxied mode sources_csv
+  local group_name enabled interval_sec api_token zone_id target_fqdn ttl proxied mode sources_csv address_family
   declare -A group_name_count=() target_key_count=()
 
   if [[ "${SPECIAL_MODE}" == "GPTEST" ]]; then
@@ -1914,12 +1899,13 @@ main() {
     fi
     matched=$((matched+1))
 
-    if (( field_count != 10 )); then
-      log ERROR "组 ${group_name:-<空组名>}: groups.tsv 字段数量应为10，实际=${field_count}，已跳过该组"
+    if (( field_count != 10 && field_count != 11 )); then
+      log ERROR "组 ${group_name:-<空组名>}: groups.tsv 字段数量应为10或11，实际=${field_count}，已跳过该组"
       rollback_failover_switch "${group_name}" || true
       failures=$((failures+1)); continue
     fi
-    assign_group_config_line "${row}" || { failures=$((failures+1)); continue; }
+    assign_group_config_line "${row}" || { log ERROR "组 ${group_name}: 地址族或配置非法"; failures=$((failures+1)); continue; }
+    SYNC_ADDRESS_FAMILY="${address_family}"
     [[ "${enabled}" == "true" ]] && enabled_count=$((enabled_count+1))
     if ! valid_group_name "${group_name}"; then
       log ERROR "组名为空、过长、以#开头或包含 TAB、换行、回车或反斜杠，已跳过该配置"
@@ -1956,7 +1942,7 @@ main() {
     fi
 
     if sync_one_group "${group_name}" "${enabled}" "${interval_sec}" "${api_token}" "${zone_id}" \
-      "${target_fqdn}" "${ttl}" "${proxied}" "${mode}" "${EFFECTIVE_SOURCES_CSV}" "${EFFECTIVE_ROUTE}"; then
+      "${target_fqdn}" "${ttl}" "${proxied}" "${mode}" "${EFFECTIVE_SOURCES_CSV}" "${EFFECTIVE_ROUTE}" "${address_family}"; then
       if ! finalize_failover_switch "${group_name}"; then
         failures=$((failures+1))
       fi
@@ -2001,7 +1987,7 @@ set -uo pipefail
 umask 077
 
 APP_NAME="cf-dns-sync"
-APP_VERSION="2.9"
+APP_VERSION="3.0"
 BASE_DIR="/etc/${APP_NAME}"
 VAR_DIR="/var/lib/${APP_NAME}"
 SETTINGS_FILE="${BASE_DIR}/settings.conf"
@@ -2094,7 +2080,8 @@ GLOBALPING_POLL_MAX_SEC="25"
 CFG
 
 [[ -f "${GROUPS_FILE}" ]] || cat > "${GROUPS_FILE}" <<'TSV'
-# group_name<TAB>enabled<TAB>interval_sec<TAB>api_token<TAB>zone_id<TAB>target_fqdn<TAB>ttl<TAB>proxied<TAB>mode<TAB>source_domains_csv
+# group_name<TAB>enabled<TAB>interval_sec<TAB>api_token<TAB>zone_id<TAB>target_fqdn<TAB>ttl<TAB>proxied<TAB>mode<TAB>source_domains_csv<TAB>address_family
+# 旧10字段默认IPV4；第11字段可为IPV4/IPV6/DUAL_STACK。
 TSV
 
 [[ -f "${FAILOVER_FILE}" ]] || cat > "${FAILOVER_FILE}" <<'TSV'
@@ -2157,8 +2144,22 @@ pause_wait() {
   read -n 1 -s -r -p "按任意键继续..." || true
 }
 
+backup_configuration() {
+  local dir="${VAR_DIR}/config-backups" archive
+  mkdir -p "${dir}" && chmod 700 "${dir}" || return 1
+  archive="$(mktemp "${dir}/config-$(date +%Y%m%d%H%M%S)-XXXXXX.tar.gz")" || return 1
+  if ! tar -C "${BASE_DIR}" --exclude='./.settings.*' --exclude='./.groups.*' --exclude='./.failover.*' -czf "${archive}" . ||
+    ! chmod 600 "${archive}"; then
+    rm -f -- "${archive}"
+    echo "配置备份失败，已取消修改。" >&2
+    return 1
+  fi
+  LAST_CONFIG_BACKUP="${archive}"
+}
+
 save_settings() {
   local tmp
+  backup_configuration || return 1
   tmp="$(mktemp "${BASE_DIR}/.settings.XXXXXX")" || return 1
   if ! {
     printf 'LOG_LEVEL=%q\n' "${LOG_LEVEL}"
@@ -2186,6 +2187,74 @@ split_tsv_line() {
     rest="${rest#*$'\t'}"
   done
   TSV_FIELDS+=("${rest}")
+}
+
+# IPv6统一为八组小写十六进制，避免等价表示被误判为不同记录。
+normalize_ip() {
+  local value="${1:-}"
+  [[ -n "${value}" && "${#value}" -le 45 && "${value}" != *$'\n'* && "${value}" != *$'\r'* ]] || return 1
+  awk -v ip="${value}" '
+    function ipv4(s, a,n,i) {
+      n=split(s,a,"."); if(n!=4) return ""
+      for(i=1;i<=4;i++) if(a[i]!~/^[0-9]+$/ || length(a[i])>3 || a[i]+0>255) return ""
+      return sprintf("%d.%d.%d.%d",a[1],a[2],a[3],a[4])
+    }
+    function hex(s, i,v,c) {
+      v=0; for(i=1;i<=length(s);i++){c=index("0123456789abcdef",substr(s,i,1))-1; if(c<0) return -1; v=v*16+c}
+      return v
+    }
+    BEGIN {
+      ip=tolower(ip)
+      if(index(ip,":")==0){v=ipv4(ip); if(v=="") exit 1; print v; exit}
+      if(ip !~ /^[0-9a-f:.]+$/) exit 1
+      if(index(ip,".")){
+        if(!match(ip,/[0-9.]+$/)) exit 1
+        tail=substr(ip,RSTART); v=ipv4(tail); if(v=="") exit 1
+        split(v,a,"."); ip=substr(ip,1,RSTART-1) sprintf("%x:%x",a[1]*256+a[2],a[3]*256+a[4])
+      }
+      p=index(ip,"::")
+      if(p){
+        left=substr(ip,1,p-1); right=substr(ip,p+2)
+        if(index(right,"::")) exit 1
+        nl=(left==""?0:split(left,l,":")); nr=(right==""?0:split(right,r,":"))
+        if(nl+nr>=8) exit 1
+        for(i=1;i<=nl;i++) parts[++n]=l[i]
+        for(i=1;i<=8-nl-nr;i++) parts[++n]="0"
+        for(i=1;i<=nr;i++) parts[++n]=r[i]
+      } else {n=split(ip,parts,":"); if(n!=8) exit 1}
+      out=""
+      for(i=1;i<=8;i++){
+        if(parts[i]=="" || length(parts[i])>4 || parts[i]!~/^[0-9a-f]+$/) exit 1
+        out=out (i==1?"":":") sprintf("%04x",hex(parts[i]))
+      }
+      print out
+    }
+  '
+}
+
+normalize_record_ip() {
+  local ip="$1" type="$2"
+  case "${type}" in A) [[ "${ip}" != *:* ]] || return 1 ;; AAAA) [[ "${ip}" == *:* ]] || return 1 ;; *) return 1 ;; esac
+  normalize_ip "${ip}"
+}
+
+valid_address_family() {
+  case "${1:-}" in IPV4|IPV6|DUAL_STACK) return 0 ;; *) return 1 ;; esac
+}
+
+record_types_for_family() {
+  case "${1:-IPV4}" in IPV4) echo A ;; IPV6) echo AAAA ;; DUAL_STACK) printf 'A\nAAAA\n' ;; *) return 1 ;; esac
+}
+
+health_ip_version() {
+  [[ "${1:-IPV4}" == IPV6 ]] && echo 6 || echo 4
+}
+
+valid_health_target_for_family() {
+  local value="$1" family="${2:-IPV4}" normalized
+  valid_domain "${value}" && return 0
+  normalized="$(normalize_ip "${value}")" || return 1
+  if [[ "${family}" == IPV6 ]]; then [[ "${normalized}" == *:* ]]; else [[ "${normalized}" != *:* ]]; fi
 }
 
 normalize_sources_csv() {
@@ -2235,6 +2304,7 @@ validate_sources_csv() {
 
 save_groups_with_tmp() {
   local tmp="$1" staged
+  backup_configuration || return 1
   staged="$(mktemp "${BASE_DIR}/.groups.XXXXXX")" || { rm -f "${tmp}"; return 1; }
   cat -- "${tmp}" > "${staged}" || { rm -f "${tmp}" "${staged}"; return 1; }
   chmod 600 "${staged}" || { rm -f "${tmp}" "${staged}"; return 1; }
@@ -2259,18 +2329,19 @@ urlencode() {
   jq -rn --arg v "$1" '$v|@uri'
 }
 
-ui_resolve_domain_ipv4() {
-  local domain="$1"
-  local -a args=(+short "+time=${DNS_QUERY_TIMEOUT_SEC}" +tries=1 A "${domain}")
-  [[ -n "${DNS_SERVER}" ]] && args=("@${DNS_SERVER}" +short "+time=${DNS_QUERY_TIMEOUT_SEC}" +tries=1 A "${domain}")
-  dig "${args[@]}" 2>/dev/null | awk -F. '
-    NF==4 {
-      ok=1
-      for(i=1;i<=4;i++) if($i !~ /^[0-9]+$/ || $i<0 || $i>255) ok=0
-      if(ok) print $0
-    }
-  ' | sort -u
+ui_resolve_domain_addresses() {
+  local domain="$1" type="$2" answer ip normalized found=0
+  local -a args=(+short "+time=${DNS_QUERY_TIMEOUT_SEC}" +tries=1 "${type}" "${domain}")
+  [[ -z "${DNS_SERVER}" ]] || args=("@${DNS_SERVER}" "${args[@]}")
+  answer="$(dig "${args[@]}" 2>/dev/null)" || return 1
+  while IFS= read -r ip; do
+    normalized="$(normalize_record_ip "${ip//$'\r'/}" "${type}")" || continue
+    printf '%s\n' "${normalized}"; found=1
+  done <<< "${answer}"
+  (( found==1 ))
 }
+
+ui_resolve_domain_ipv4() { ui_resolve_domain_addresses "$1" A; }
 
 ui_cf_get() {
   local url="$1" token="$2" resp rc
@@ -2343,24 +2414,24 @@ find_duplicate_target() {
 }
 
 list_groups_table() {
-  printf '%-4s %-14s %-8s %-10s %-28s %-10s %-8s %-10s %-6s\n' "序号" "组名" "启用" "周期(s)" "目标域名" "模式" "TTL" "Proxy" "源数"
-  printf '%-4s %-14s %-8s %-10s %-28s %-10s %-8s %-10s %-6s\n' "----" "--------------" "--------" "----------" "----------------------------" "----------" "--------" "----------" "------"
+  printf '%-4s %-14s %-8s %-10s %-28s %-10s %-8s %-10s %-6s %-12s\n' "序号" "组名" "启用" "周期(s)" "目标域名" "模式" "TTL" "Proxy" "源数" "地址族"
+  printf '%-4s %-14s %-8s %-10s %-28s %-10s %-8s %-10s %-6s %-12s\n' "----" "--------------" "--------" "----------" "----------------------------" "----------" "--------" "----------" "------" "------------"
 
   local i=0 row group_name enabled interval_sec target_fqdn ttl proxied mode sources_csv count
   while IFS= read -r row || [[ -n "${row}" ]]; do
     [[ -z "${row}" || "${row}" =~ ^# ]] && continue
     i=$((i+1))
     split_tsv_line "${row}"
-    if (( ${#TSV_FIELDS[@]} != 10 )); then
-      printf '%-4s %-14s %-8s %-10s %-28s %-10s %-8s %-10s %-6s\n' "${i}" "配置损坏" "-" "-" "字段应为10/实际${#TSV_FIELDS[@]}" "-" "-" "-" "-"
+    if (( ${#TSV_FIELDS[@]} != 10 && ${#TSV_FIELDS[@]} != 11 )); then
+      printf '%-4s %-14s %-8s %-10s %-28s %-10s %-8s %-10s %-6s %-12s\n' "${i}" "配置损坏" "-" "-" "字段应为10或11/实际${#TSV_FIELDS[@]}" "-" "-" "-" "-" "-"
       continue
     fi
     group_name="${TSV_FIELDS[0]}"; enabled="${TSV_FIELDS[1]}"; interval_sec="${TSV_FIELDS[2]}"
     target_fqdn="${TSV_FIELDS[5]}"; ttl="${TSV_FIELDS[6]}"; proxied="${TSV_FIELDS[7]}"
     mode="${TSV_FIELDS[8]}"; sources_csv="${TSV_FIELDS[9]}"
     count="$(count_sources_csv "${sources_csv}")"
-    printf '%-4s %-14s %-8s %-10s %-28s %-10s %-8s %-10s %-6s\n' \
-      "${i}" "${group_name}" "${enabled}" "${interval_sec}" "${target_fqdn}" "${mode}" "${ttl}" "${proxied}" "${count}"
+    printf '%-4s %-14s %-8s %-10s %-28s %-10s %-8s %-10s %-6s %-12s\n' \
+      "${i}" "${group_name}" "${enabled}" "${interval_sec}" "${target_fqdn}" "${mode}" "${ttl}" "${proxied}" "${count}" "${TSV_FIELDS[10]:-IPV4}"
   done < "${GROUPS_FILE}"
 
   [[ "${i}" -eq 0 ]] && echo "当前还没有任何组。"
@@ -2400,7 +2471,9 @@ select_group() {
 split_line_to_vars() {
   local line="$1"
   split_tsv_line "${line}"
-  (( ${#TSV_FIELDS[@]} == 10 )) || return 1
+  (( ${#TSV_FIELDS[@]} == 10 || ${#TSV_FIELDS[@]} == 11 )) || return 1
+  GROUP_ADDRESS_FAMILY="${TSV_FIELDS[10]:-IPV4}"
+  (( ${#TSV_FIELDS[@]} == 10 )) || valid_address_family "${TSV_FIELDS[10]}" || return 1
   GROUP_NAME="${TSV_FIELDS[0]}"; GROUP_ENABLED="${TSV_FIELDS[1]}"; GROUP_INTERVAL="${TSV_FIELDS[2]}"
   GROUP_API_TOKEN="${TSV_FIELDS[3]}"; GROUP_ZONE_ID="${TSV_FIELDS[4]}"; GROUP_TARGET_FQDN="${TSV_FIELDS[5]}"
   GROUP_TTL="${TSV_FIELDS[6]}"; GROUP_PROXIED="${TSV_FIELDS[7]}"; GROUP_MODE="${TSV_FIELDS[8]}"; GROUP_SOURCES_CSV="${TSV_FIELDS[9]}"
@@ -2426,18 +2499,29 @@ save_group_line_replace() {
 
 build_group_line() {
   GROUP_SOURCES_CSV="$(normalize_sources_csv "${GROUP_SOURCES_CSV}")"
-  printf '%s	%s	%s	%s	%s	%s	%s	%s	%s	%s' \
-    "${GROUP_NAME}" "${GROUP_ENABLED}" "${GROUP_INTERVAL}" "${GROUP_API_TOKEN}" "${GROUP_ZONE_ID}" "${GROUP_TARGET_FQDN}" "${GROUP_TTL}" "${GROUP_PROXIED}" "${GROUP_MODE}" "${GROUP_SOURCES_CSV}"
+  printf '%s	%s	%s	%s	%s	%s	%s	%s	%s	%s	%s' \
+    "${GROUP_NAME}" "${GROUP_ENABLED}" "${GROUP_INTERVAL}" "${GROUP_API_TOKEN}" "${GROUP_ZONE_ID}" "${GROUP_TARGET_FQDN}" "${GROUP_TTL}" "${GROUP_PROXIED}" "${GROUP_MODE}" "${GROUP_SOURCES_CSV}" "${GROUP_ADDRESS_FAMILY:-IPV4}"
+}
+
+prompt_address_family() {
+  local current="${1:-IPV4}" choice
+  echo "地址族（当前：${current}；回车保持）："
+  echo "1. 仅 IPv4（A）"
+  echo "2. 仅 IPv6（AAAA）"
+  echo "3. IPv4＋IPv6（A＋AAAA）"
+  echo "单IP模式按每个源域名、每个启用地址族分别选择一个IP。未启用的记录类型保持原样。"
+  read -rp "请选择 [1-3]: " choice || return 1
+  case "${choice}" in
+    "") SELECTED_ADDRESS_FAMILY="${current}" ;;
+    1) SELECTED_ADDRESS_FAMILY=IPV4 ;; 2) SELECTED_ADDRESS_FAMILY=IPV6 ;; 3) SELECTED_ADDRESS_FAMILY=DUAL_STACK ;;
+    *) echo "无效选择"; return 1 ;;
+  esac
 }
 
 
+
 valid_health_target() {
-  local value="${1:-}"
-  if [[ "${value}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-    awk -F. 'NF==4{for(i=1;i<=4;i++) if($i!~/^[0-9]+$/ || $i<0 || $i>255) exit 1; exit 0}{exit 1}' <<< "${value}"
-  else
-    valid_domain "${value}"
-  fi
+  valid_domain "${1:-}" || normalize_ip "${1:-}" >/dev/null
 }
 
 get_failover_line_by_group() {
@@ -2483,6 +2567,7 @@ build_failover_line() {
 
 save_failover_line_replace() {
   local old_group="$1" new_line="$2" tmp staged
+  backup_configuration || return 1
   tmp="$(mktemp)" || return 1
   awk -F '\t' -v g="${old_group}" -v replacement="${new_line}" '
     BEGIN{done=0}
@@ -2501,6 +2586,7 @@ save_failover_line_replace() {
 
 delete_failover_config_for_group() {
   local group="$1" tmp
+  backup_configuration || return 1
   [[ -f "${FAILOVER_FILE}" ]] || return 0
   tmp="$(mktemp "${BASE_DIR}/.failover-delete.XXXXXX")" || return 1
   if ! awk -F '\t' -v g="${group}" '/^#/ || (NF>0 && $1!=g)' "${FAILOVER_FILE}" > "${tmp}"; then
@@ -2728,8 +2814,8 @@ validate_failover_ui() {
   validate_sources_csv "${FO_BACKUP_SOURCES}" || { echo "BACKUP 源域名必须为1~20个有效域名"; return 1; }
   overlap="$(csv_overlap_value "${primary_sources}" "${FO_BACKUP_SOURCES}" || true)"
   [[ -z "${overlap}" ]] || { echo "PRIMARY 与 BACKUP 不能包含相同源域名：${overlap}"; return 1; }
-  valid_health_target "${FO_PRIMARY_TARGET}" || { echo "PRIMARY健康检测目标格式错误"; return 1; }
-  valid_health_target "${FO_BACKUP_TARGET}" || { echo "BACKUP健康检测目标格式错误"; return 1; }
+  valid_health_target_for_family "${FO_PRIMARY_TARGET}" "${GROUP_ADDRESS_FAMILY:-IPV4}" || { echo "PRIMARY健康检测目标格式错误"; return 1; }
+  valid_health_target_for_family "${FO_BACKUP_TARGET}" "${GROUP_ADDRESS_FAMILY:-IPV4}" || { echo "BACKUP健康检测目标格式错误"; return 1; }
   [[ "${FO_CHECK_TYPE}" == "PING_ICMP" || "${FO_CHECK_TYPE}" == "PING_TCP" ]] || { echo "检测类型错误"; return 1; }
   if [[ "${FO_CHECK_TYPE}" == "PING_TCP" ]]; then
     [[ "${FO_PORT}" =~ ^[0-9]+$ && "${FO_PORT}" -ge 1 && "${FO_PORT}" -le 65535 ]] || { echo "TCP端口必须为1~65535"; return 1; }
@@ -2828,12 +2914,13 @@ list_failover_status() {
   done < "${FAILOVER_FILE}"
   [[ "${found}" -eq 1 ]] || echo "当前没有配置 Globalping 故障转移的组。现有 groups.tsv 组仍按 PRIMARY 正常同步。"
   echo "说明：只有 主组=true 且 故转=true 的组会执行自动 Globalping 检测。"
+  echo "仅IPv6组使用IPv6探测；双栈默认IPv4探测，切换会同步全部启用的A/AAAA。"
 }
 
 configure_failover_group() {
   echo
   select_group || { echo "序号无效"; return; }
-  split_line_to_vars "${CHOSEN_LINE}" || { echo "该组配置字段数量不是10，请运行菜单24自检"; return 1; }
+  split_line_to_vars "${CHOSEN_LINE}" || { echo "该组配置字段数量或地址族无效（旧10/新11字段），请运行菜单24自检"; return 1; }
   local primary_sources="${GROUP_SOURCES_CSV}" existing=0 input first_primary first_backup choice load_rc
   first_primary="$(first_source_from_csv "${primary_sources}")"
   if load_failover_config_ui "${GROUP_NAME}"; then
@@ -2917,7 +3004,7 @@ configure_failover_group() {
 manage_backup_sources() {
   echo
   select_group || { echo "序号无效"; return; }
-  split_line_to_vars "${CHOSEN_LINE}" || { echo "该组配置字段数量不是10，请运行菜单24自检"; return 1; }
+  split_line_to_vars "${CHOSEN_LINE}" || { echo "该组配置字段数量或地址族无效（旧10/新11字段），请运行菜单24自检"; return 1; }
   load_failover_config_ui "${GROUP_NAME}" || { echo "${FAILOVER_UI_LOAD_ERROR:-该组尚未配置故障转移}"; return; }
   parse_sources_to_array "${FO_BACKUP_SOURCES}"
   local choice input idx
@@ -2960,7 +3047,7 @@ manage_backup_sources() {
 toggle_failover_enabled() {
   echo
   select_group || { echo "序号无效"; return; }
-  split_line_to_vars "${CHOSEN_LINE}" || { echo "该组配置字段数量不是10，请运行菜单24自检"; return 1; }
+  split_line_to_vars "${CHOSEN_LINE}" || { echo "该组配置字段数量或地址族无效（旧10/新11字段），请运行菜单24自检"; return 1; }
   load_failover_config_ui "${GROUP_NAME}" || { echo "${FAILOVER_UI_LOAD_ERROR:-该组尚未配置故障转移，请先配置}"; return; }
 
   local primary_sources="${GROUP_SOURCES_CSV}" rc=0 new_state old_state original_line
@@ -3168,30 +3255,17 @@ show_globalping_limits() {
 }
 
 test_backup_sources_local_dns() {
-  echo
-  select_group || { echo "序号无效"; return; }
-  split_line_to_vars "${CHOSEN_LINE}" || { echo "该组配置字段数量不是10，请运行菜单24自检"; return 1; }
-  load_failover_config_ui "${GROUP_NAME}" || { echo "${FAILOVER_UI_LOAD_ERROR:-该组尚未配置故障转移}"; return; }
-  parse_sources_to_array "${FO_BACKUP_SOURCES}"
-  echo "测试组 ${GROUP_NAME} 的 BACKUP 源域名本机解析情况"
-  printf '%-4s %-45s %-8s %-6s %-60s\n' "序号" "源域名" "状态" "数量" "IPv4结果"
-  printf '%-4s %-45s %-8s %-6s %-60s\n' "----" "---------------------------------------------" "--------" "------" "------------------------------------------------------------"
-  local i=0 domain ips count joined
-  for domain in "${SOURCES_ARRAY[@]}"; do
-    i=$((i+1)); ips="$(ui_resolve_domain_ipv4 "${domain}")"
-    count="$(sed '/^$/d' <<< "${ips}" | wc -l | awk '{print $1}')"; joined="$(paste -sd ',' <<< "${ips}")"
-    if [[ "${count}" -gt 0 ]]; then
-      printf '%-4s %-45s %-8s %-6s %-60s\n' "${i}" "${domain}" "正常" "${count}" "${joined:0:60}"
-    else
-      printf '%-4s %-45s %-8s %-6s %-60s\n' "${i}" "${domain}" "失败" 0 "-"
-    fi
-  done
+  select_group || return 1
+  split_line_to_vars "${CHOSEN_LINE}" || return 1
+  load_failover_config_ui "${GROUP_NAME}" || { echo "${FAILOVER_UI_LOAD_ERROR}"; return 1; }
+  echo "组 ${GROUP_NAME} 的BACKUP源域名（地址族=${GROUP_ADDRESS_FAMILY}）"
+  render_sources_dns "${FO_BACKUP_SOURCES}" "${GROUP_ADDRESS_FAMILY}" "${GROUP_MODE}"
 }
 
 remove_failover_config_ui() {
   echo
   select_group || { echo "序号无效"; return; }
-  split_line_to_vars "${CHOSEN_LINE}" || { echo "该组配置字段数量不是10，请运行菜单24自检"; return 1; }
+  split_line_to_vars "${CHOSEN_LINE}" || { echo "该组配置字段数量或地址族无效（旧10/新11字段），请运行菜单24自检"; return 1; }
   load_failover_config_ui "${GROUP_NAME}" || { echo "${FAILOVER_UI_LOAD_ERROR:-该组没有故障转移配置}"; return; }
   echo "删除故障转移配置前会先切回 PRIMARY 并强制同步。"
   echo "1. ✅ 切回PRIMARY并删除配置"
@@ -3381,6 +3455,8 @@ quick_add_first_group() {
   read -rp "请选择 [1-2]: " mode_choice || return
   case "${mode_choice}" in 1|"") mode="ALL_IPS" ;; 2) mode="SINGLE_IP" ;; *) echo "无效选择"; return ;; esac
 
+  prompt_address_family IPV4 || return 1
+  local address_family="${SELECTED_ADDRESS_FAMILY}"
   echo "请输入源域名，使用英文逗号分隔，最多20个："
   read -rp "源域名列表: " sources_csv || return
   sources_csv="$(normalize_sources_csv "${sources_csv}")"
@@ -3388,8 +3464,8 @@ quick_add_first_group() {
   [[ "${src_count}" -ge 1 && "${src_count}" -le 20 ]] || { echo "源域名数量必须为1~20"; return; }
   validate_sources_csv "${sources_csv}" || { echo "源域名列表中存在格式错误的域名"; return; }
 
-  new_line="$(printf '%s	%s	%s	%s	%s	%s	%s	%s	%s	%s' \
-    "${group_name}" true "${interval_sec}" "${api_token}" "${zone_id}" "${target_fqdn}" "${ttl}" false "${mode}" "${sources_csv}")"
+  new_line="$(printf '%s	%s	%s	%s	%s	%s	%s	%s	%s	%s	%s' \
+    "${group_name}" true "${interval_sec}" "${api_token}" "${zone_id}" "${target_fqdn}" "${ttl}" false "${mode}" "${sources_csv}" "${address_family}")"
   save_group_line_replace "${group_name}" "${new_line}" || { echo "首组配置保存失败"; return 1; }
   invalidate_group_sync_state "${group_name}" || { echo "首组已保存，但旧状态清理失败"; return 1; }
   if activate_after_init "${group_name}"; then
@@ -3499,6 +3575,8 @@ add_group() {
   read -rp "请输入序号 [1]: " proxied_choice || return
   case "${proxied_choice}" in 1|"") proxied=false ;; *) echo "无效选择"; return ;; esac
 
+  prompt_address_family IPV4 || return 1
+  local address_family="${SELECTED_ADDRESS_FAMILY}"
   echo "请输入源域名，使用英文逗号分隔，最多20个："
   read -rp "源域名列表: " sources_csv || return
   sources_csv="$(normalize_sources_csv "${sources_csv}")"
@@ -3506,8 +3584,8 @@ add_group() {
   [[ "${src_count}" -ge 1 && "${src_count}" -le 20 ]] || { echo "源域名数量必须为1~20"; return; }
   validate_sources_csv "${sources_csv}" || { echo "源域名列表中存在格式错误的域名"; return; }
 
-  new_line="$(printf '%s	%s	%s	%s	%s	%s	%s	%s	%s	%s' \
-    "${group_name}" "${enabled}" "${interval_sec}" "${api_token}" "${zone_id}" "${target_fqdn}" "${ttl}" "${proxied}" "${mode}" "${sources_csv}")"
+  new_line="$(printf '%s	%s	%s	%s	%s	%s	%s	%s	%s	%s	%s' \
+    "${group_name}" "${enabled}" "${interval_sec}" "${api_token}" "${zone_id}" "${target_fqdn}" "${ttl}" "${proxied}" "${mode}" "${sources_csv}" "${address_family}")"
   save_group_line_replace "${group_name}" "${new_line}" || { echo "组配置保存失败"; return 1; }
   invalidate_group_sync_state "${group_name}" || { echo "组已保存，但旧状态清理失败"; return 1; }
   if [[ "${enabled}" == "true" ]]; then
@@ -3550,7 +3628,7 @@ delete_group() {
 toggle_group_enabled() {
   echo
   select_group || { echo "序号无效"; return; }
-  split_line_to_vars "${CHOSEN_LINE}" || { echo "该组配置字段数量不是10，请运行菜单24自检"; return 1; }
+  split_line_to_vars "${CHOSEN_LINE}" || { echo "该组配置字段数量或地址族无效（旧10/新11字段），请运行菜单24自检"; return 1; }
   if [[ "${GROUP_ENABLED}" == "true" ]]; then GROUP_ENABLED=false; else GROUP_ENABLED=true; fi
   save_group_line_replace "${CHOSEN_GROUP_NAME}" "$(build_group_line)" || { echo "保存失败"; return; }
   if [[ "${GROUP_ENABLED}" == "true" ]]; then
@@ -3569,7 +3647,7 @@ toggle_group_enabled() {
 set_group_interval() {
   echo
   select_group || { echo "序号无效"; return; }
-  split_line_to_vars "${CHOSEN_LINE}" || { echo "该组配置字段数量不是10，请运行菜单24自检"; return 1; }
+  split_line_to_vars "${CHOSEN_LINE}" || { echo "该组配置字段数量或地址族无效（旧10/新11字段），请运行菜单24自检"; return 1; }
   echo "当前周期：${GROUP_INTERVAL} 秒"
   prompt_interval || return
   GROUP_INTERVAL="${SELECTED_INTERVAL}"
@@ -3607,7 +3685,7 @@ join_sources_array() {
 manage_group_sources() {
   echo
   select_group || { echo "序号无效"; return; }
-  split_line_to_vars "${CHOSEN_LINE}" || { echo "该组配置字段数量不是10，请运行菜单24自检"; return 1; }
+  split_line_to_vars "${CHOSEN_LINE}" || { echo "该组配置字段数量或地址族无效（旧10/新11字段），请运行菜单24自检"; return 1; }
   parse_sources_to_array "${GROUP_SOURCES_CSV}"
 
   while true; do
@@ -3688,7 +3766,7 @@ edit_group_basic() {
   echo
   select_group || { echo "序号无效"; return; }
   local old_group_name="${CHOSEN_GROUP_NAME}" new_line duplicate backup_groups backup_fo backup_fos rollback_failed
-  split_line_to_vars "${CHOSEN_LINE}" || { echo "该组配置字段数量不是10，请运行菜单24自检"; return 1; }
+  split_line_to_vars "${CHOSEN_LINE}" || { echo "该组配置字段数量或地址族无效（旧10/新11字段），请运行菜单24自检"; return 1; }
 
   echo "当前组名: ${GROUP_NAME}"
   read -rp "新组名（回车保持）: " new_group_name || return
@@ -3726,6 +3804,11 @@ edit_group_basic() {
   read -rp "请选择 [1-3]: " mode_choice || return
   case "${mode_choice}" in 1|"") ;; 2) GROUP_MODE=ALL_IPS ;; 3) GROUP_MODE=SINGLE_IP ;; *) echo "无效选择"; return ;; esac
 
+  prompt_address_family "${GROUP_ADDRESS_FAMILY}" || return 1
+  GROUP_ADDRESS_FAMILY="${SELECTED_ADDRESS_FAMILY}"
+  if load_failover_config_ui "${GROUP_NAME}" && ! validate_failover_ui "${GROUP_SOURCES_CSV}"; then
+    echo "地址族与故障转移目标不兼容，请在菜单31调整健康目标后再修改。"; return 1
+  fi
   new_line="$(build_group_line)"
   backup_groups="$(mktemp)" || { echo "无法创建组配置备份"; return 1; }
   backup_fo="$(mktemp)" || { rm -f "${backup_groups}"; echo "无法创建故障转移配置备份"; return 1; }
@@ -3795,7 +3878,7 @@ set_log_level() {
 test_group_token() {
   echo
   select_group || { echo "序号无效"; return; }
-  split_line_to_vars "${CHOSEN_LINE}" || { echo "该组配置字段数量不是10，请运行菜单24自检"; return 1; }
+  split_line_to_vars "${CHOSEN_LINE}" || { echo "该组配置字段数量或地址族无效（旧10/新11字段），请运行菜单24自检"; return 1; }
   echo "正在测试组 ${GROUP_NAME} 的 API Token 与 Zone ID..."
   local resp
   resp="$(ui_cf_get "https://api.cloudflare.com/client/v4/zones/${GROUP_ZONE_ID}" "${GROUP_API_TOKEN}")"
@@ -3810,96 +3893,59 @@ test_group_token() {
 }
 
 
-test_group_sources_dns() {
-  echo
-  select_group || { echo "序号无效"; return; }
-  split_line_to_vars "${CHOSEN_LINE}" || { echo "该组配置字段数量不是10，请运行菜单24自检"; return 1; }
-  parse_sources_to_array "${GROUP_SOURCES_CSV}"
-  echo "测试组 ${GROUP_NAME} 的 PRIMARY 源域名解析情况"
-  printf '%-4s %-45s %-8s %-6s %-60s\n' "序号" "源域名" "状态" "数量" "IPv4结果"
-  printf '%-4s %-45s %-8s %-6s %-60s\n' "----" "---------------------------------------------" "--------" "------" "------------------------------------------------------------"
-  local i=0 domain ips count joined
+render_sources_dns() {
+  local csv="$1" family="$2" mode="${3:-ALL_IPS}" types type domain ips count joined i=0
+  types="$(record_types_for_family "${family}")" || return 1
+  parse_sources_to_array "${csv}"
+  printf '%-4s %-40s %-6s %-8s %s\n' "序号" "源域名" "类型" "数量" "解析结果"
   for domain in "${SOURCES_ARRAY[@]}"; do
-    i=$((i+1)); ips="$(ui_resolve_domain_ipv4 "${domain}")"
-    count="$(sed '/^$/d' <<< "${ips}" | wc -l | awk '{print $1}')"; joined="$(paste -sd ',' <<< "${ips}")"
-    if [[ "${count}" -gt 0 ]]; then
-      printf '%-4s %-45s %-8s %-6s %-60s\n' "${i}" "${domain}" "正常" "${count}" "${joined:0:60}"
-    else
-      printf '%-4s %-45s %-8s %-6s %-60s\n' "${i}" "${domain}" "失败" 0 "-"
-    fi
+    i=$((i+1))
+    while IFS= read -r type; do
+      ips="$(ui_resolve_domain_addresses "${domain}" "${type}" | LC_ALL=C sort -u)"
+      if [[ "${mode}" == SINGLE_IP ]]; then ips="$(sed -n '1p' <<< "${ips}")"; fi
+      count="$(sed '/^$/d' <<< "${ips}" | wc -l)"; joined="$(paste -sd ',' <<< "${ips}")"
+      printf '%-4s %-40s %-6s %-8s %s\n' "${i}" "${domain}" "${type}" "${count}" "${joined:-解析失败，保留旧记录}"
+    done <<< "${types}"
   done
 }
 
+test_group_sources_dns() {
+  select_group || return 1
+  split_line_to_vars "${CHOSEN_LINE}" || return 1
+  echo "组 ${GROUP_NAME} 的PRIMARY源域名（地址族=${GROUP_ADDRESS_FAMILY}）"
+  render_sources_dns "${GROUP_SOURCES_CSV}" "${GROUP_ADDRESS_FAMILY}" "${GROUP_MODE}"
+}
+
 view_group_current_ips() {
-  echo
-  select_group || { echo "序号无效"; return; }
-  split_line_to_vars "${CHOSEN_LINE}" || { echo "该组配置字段数量不是10，请运行菜单24自检"; return 1; }
-  local active_role="PRIMARY" backup_csv="" failover_enabled="false" fo_load_rc
-  load_failover_config_ui "${GROUP_NAME}" >/dev/null 2>&1
-  fo_load_rc=$?
-  if (( fo_load_rc == 0 )) && [[ "${FO_ENABLED}" == "true" ]]; then
-    failover_enabled=true; backup_csv="${FO_BACKUP_SOURCES}"
-    if load_failover_state_ui "${GROUP_NAME}"; then
-      [[ "${FS_ACTIVE_ROLE}" == "BACKUP" ]] && active_role="BACKUP"
-    else
-      active_role="INVALID"
-      echo "警告：故障转移状态损坏或重复，运行时会停止该组同步；请运行菜单24自检。"
-    fi
-  elif (( fo_load_rc > 1 )); then
-    failover_enabled="INVALID"
-    active_role="INVALID"
-    echo "警告：${FAILOVER_UI_LOAD_ERROR}"
+  select_group || return 1
+  split_line_to_vars "${CHOSEN_LINE}" || return 1
+  local active_role=PRIMARY config_rc types type resp encoded page total_pages csv
+  load_failover_config_ui "${GROUP_NAME}"; config_rc=$?
+  if (( config_rc>1 )); then echo "${FAILOVER_UI_LOAD_ERROR}"; return 1; fi
+  if (( config_rc==0 )) && [[ "${FO_ENABLED}" == true ]]; then
+    load_failover_state_ui "${GROUP_NAME}" || { echo "故障转移状态损坏，请运行菜单24。"; return 1; }
+    active_role="${FS_ACTIVE_ROLE}"
   fi
-  local tmp_all i domain ips selected count joined resp encoded csv label
-  tmp_all="$(mktemp)" || { echo "无法创建临时文件"; return 1; }
-  : > "${tmp_all}" || { rm -f "${tmp_all}"; echo "无法初始化临时文件"; return 1; }
-
-  echo "📡 当前组别解析 IP：${GROUP_NAME}"
-  echo "目标域名: ${GROUP_TARGET_FQDN}"
-  echo "解析模式: ${GROUP_MODE}"
-  echo "当前活动线路: ${active_role}；故障转移: ${failover_enabled}"
-  echo "DNS解析器: ${DNS_SERVER:-系统默认}"
-
-  for label in PRIMARY BACKUP; do
-    [[ "${label}" == PRIMARY ]] && csv="${GROUP_SOURCES_CSV}" || csv="${backup_csv}"
-    [[ -n "${csv}" ]] || continue
-    echo; echo "${label} 源域名解析$([[ "${label}" == "${active_role}" ]] && echo '（当前用于同步）' || true)："
-    printf '%-4s %-45s %-6s %-60s\n' "序号" "源域名" "数量" "IPv4结果"
-    printf '%-4s %-45s %-6s %-60s\n' "----" "---------------------------------------------" "------" "------------------------------------------------------------"
-    parse_sources_to_array "${csv}"; i=0
-    for domain in "${SOURCES_ARRAY[@]}"; do
-      i=$((i+1)); ips="$(ui_resolve_domain_ipv4 "${domain}")"
-      if [[ "${GROUP_MODE}" == "SINGLE_IP" ]]; then
-        selected="$(sed '/^$/d' <<< "${ips}" | head -n1)"; count=$([[ -n "${selected}" ]] && echo 1 || echo 0); joined="${selected:-}"
-        [[ "${label}" == "${active_role}" && -n "${selected}" ]] && echo "${selected}" >> "${tmp_all}"
-      else
-        count="$(sed '/^$/d' <<< "${ips}" | wc -l | awk '{print $1}')"; joined="$(paste -sd ',' <<< "${ips}")"
-        [[ "${label}" == "${active_role}" ]] && sed '/^$/d' <<< "${ips}" >> "${tmp_all}"
-      fi
-      [[ -n "${joined}" ]] || joined="-"
-      printf '%-4s %-45s %-6s %-60s\n' "${i}" "${domain}" "${count}" "${joined:0:60}"
-    done
-  done
-
-  echo; echo "去重后当前活动线路将用于同步的 IPv4："
-  sort -u "${tmp_all}" | sed '/^$/d' | nl -w2 -s'. '
-  echo "总数: $(sort -u "${tmp_all}" | sed '/^$/d' | wc -l | awk '{print $1}')"
-
-  echo; echo "Cloudflare 当前目标 A 记录："
+  echo "组=${GROUP_NAME}；目标=${GROUP_TARGET_FQDN}；地址族=${GROUP_ADDRESS_FAMILY}；模式=${GROUP_MODE}；活动线路=${active_role}"
+  render_sources_dns "${GROUP_SOURCES_CSV}" "${GROUP_ADDRESS_FAMILY}" "${GROUP_MODE}"
+  if (( config_rc==0 )); then
+    echo "BACKUP源域名："
+    render_sources_dns "${FO_BACKUP_SOURCES}" "${GROUP_ADDRESS_FAMILY}" "${GROUP_MODE}"
+  fi
+  types="$(record_types_for_family "${GROUP_ADDRESS_FAMILY}")" || return 1
   encoded="$(urlencode "${GROUP_TARGET_FQDN}")"
-  local cf_ips page=1 total_pages=1 cf_failed=0
-  cf_ips="$(mktemp)" || { rm -f "${tmp_all}"; echo "无法创建临时文件"; return 1; }
-  : > "${cf_ips}" || { rm -f "${tmp_all}" "${cf_ips}"; echo "无法初始化临时文件"; return 1; }
-  while (( page <= total_pages )); do
-    resp="$(ui_cf_get "https://api.cloudflare.com/client/v4/zones/${GROUP_ZONE_ID}/dns_records?type=A&name=${encoded}&page=${page}&per_page=100" "${GROUP_API_TOKEN}")"
-    if [[ "$(jq -r '.success // false' <<< "${resp}" 2>/dev/null)" != true ]]; then echo "无法读取 Cloudflare 当前记录：$(jq -c '.errors // []' <<< "${resp}" 2>/dev/null || echo unknown)"; cf_failed=1; break; fi
-    jq -r '.result[]?.content' <<< "${resp}" >> "${cf_ips}" 2>/dev/null || { cf_failed=1; break; }
-    total_pages="$(jq -r '.result_info.total_pages // 1' <<< "${resp}" 2>/dev/null || echo 1)"; [[ "${total_pages}" =~ ^[0-9]+$ ]] || total_pages=1
-    (( total_pages >= 1 && total_pages <= 1000 )) || { echo "Cloudflare 返回异常分页数量：${total_pages}"; cf_failed=1; break; }
-    page=$((page+1))
-  done
-  if [[ "${cf_failed}" -eq 0 ]]; then sort -u "${cf_ips}" | sed '/^$/d' | nl -w2 -s'. '; echo "总数: $(sort -u "${cf_ips}" | sed '/^$/d' | wc -l | awk '{print $1}')"; fi
-  rm -f "${tmp_all}" "${cf_ips}"
+  while IFS= read -r type; do
+    echo "Cloudflare当前目标 ${type} 记录："
+    page=1; total_pages=1
+    while (( page<=total_pages )); do
+      resp="$(ui_cf_get "https://api.cloudflare.com/client/v4/zones/${GROUP_ZONE_ID}/dns_records?type=${type}&name=${encoded}&page=${page}&per_page=100" "${GROUP_API_TOKEN}")"
+      jq -e '.success==true and (.result|type)=="array"' >/dev/null <<< "${resp}" || { echo "无法读取 ${type} 记录。"; return 1; }
+      jq -r '.result[] | [.id,.content,(.ttl|tostring),(.proxied|tostring)] | @tsv' <<< "${resp}"
+      total_pages="$(jq -r '.result_info.total_pages // 1' <<< "${resp}")"
+      [[ "${total_pages}" =~ ^[0-9]+$ ]] && (( total_pages>=1 && total_pages<=1000 )) || return 1
+      page=$((page+1))
+    done
+  done <<< "${types}"
 }
 
 start_sync() {
@@ -4247,7 +4293,7 @@ show_status() {
 show_dep_status() {
   printf '%-18s %-10s\n' "Command" "Status"
   printf '%-18s %-10s\n' "------------------" "----------"
-  for cmd in curl jq dig flock logrotate zcat gzip tac awk sed grep comm mktemp paste cut tr date wc stat find xargs tar install; do
+  for cmd in curl jq dig flock logrotate zcat gzip tac awk sed grep comm mktemp paste cut tr date wc stat find base64 sha256sum ln xargs tar install; do
     if command -v "${cmd}" >/dev/null 2>&1; then
       printf '%-18s %-10s\n' "${cmd}" "OK"
     else
@@ -4441,16 +4487,16 @@ collect_recent_history_to_file() {
 print_history_header() {
   local record_mode="$1"
   if [[ "${record_mode}" == "all" ]]; then
-    printf '%-20s %-14s %-8s %-16s %-28s %-10s %-30s\n' \
+    printf '%-20s %-14s %-8s %-39s %-28s %-10s %-30s\n' \
       "Time" "Group" "Action" "IP" "SourceDomain" "Mode" "Target"
-    printf '%-20s %-14s %-8s %-16s %-28s %-10s %-30s\n' \
-      "--------------------" "--------------" "--------" "----------------" \
+    printf '%-20s %-14s %-8s %-39s %-28s %-10s %-30s\n' \
+      "--------------------" "--------------" "--------" "---------------------------------------" \
       "----------------------------" "----------" "------------------------------"
   else
-    printf '%-20s %-14s %-16s %-28s %-10s %-30s\n' \
+    printf '%-20s %-14s %-39s %-28s %-10s %-30s\n' \
       "Time" "Group" "DeletedIP" "SourceDomain" "Mode" "Target"
-    printf '%-20s %-14s %-16s %-28s %-10s %-30s\n' \
-      "--------------------" "--------------" "----------------" \
+    printf '%-20s %-14s %-39s %-28s %-10s %-30s\n' \
+      "--------------------" "--------------" "---------------------------------------" \
       "----------------------------" "----------" "------------------------------"
   fi
 }
@@ -4464,12 +4510,12 @@ render_history_data_file() {
     [[ -z "${extra:-}" ]] || continue
     target="${metadata%%|*}"
     if [[ "${record_mode}" == "all" ]]; then
-      printf '%-20s %-14s %-8s %-16s %-28s %-10s %-30s\n' \
-        "${record_time:0:20}" "${group:0:14}" "${action:0:8}" "${ip:0:16}" \
+      printf '%-20s %-14s %-8s %-39s %-28s %-10s %-30s\n' \
+        "${record_time:0:20}" "${group:0:14}" "${action:0:8}" "${ip}" \
         "${source_domain:0:28}" "${mode:0:10}" "${target:0:30}"
     else
-      printf '%-20s %-14s %-16s %-28s %-10s %-30s\n' \
-        "${record_time:0:20}" "${group:0:14}" "${ip:0:16}" \
+      printf '%-20s %-14s %-39s %-28s %-10s %-30s\n' \
+        "${record_time:0:20}" "${group:0:14}" "${ip}" \
         "${source_domain:0:28}" "${mode:0:10}" "${target:0:30}"
     fi
     shown=$((shown+1))
@@ -4752,11 +4798,11 @@ history_menu() {
 
 self_check() {
   local errors=0 warnings=0 group_count=0 enabled_count=0 failover_count=0 failover_enabled_count=0
-  local line_no=0 row field_count name enabled interval token zone target ttl proxied mode sources_csv src_count key source_domain
+  local line_no=0 row field_count name enabled interval token zone target ttl proxied mode sources_csv family src_count key source_domain
   local fo_group fo_enabled fo_backup fo_ptarget fo_btarget fo_type fo_port fo_location fo_stable fo_fast fo_pf fo_bs fo_pr
   local primary_sources overlap worst_fast worst_stable group_worst theoretical_total=0 state_group state_role state_phase state_result state_index
   local gp_usage_valid=0 gp_usage_invalid=0 gp_usage_summary
-  declare -A seen_names=() seen_targets=() seen_fo=() seen_state=() group_enabled_map=()
+  declare -A seen_names=() seen_targets=() seen_fo=() seen_state=() group_enabled_map=() group_family_map=()
   echo "🩺 cfdns v${APP_VERSION} 自检"
   line
   check_ok(){ printf '✅ %s\n' "$*"; }
@@ -4771,7 +4817,7 @@ self_check() {
   bash -n /usr/local/bin/cf-dns-sync.sh >/dev/null 2>&1 && check_ok "同步脚本语法正常" || check_fail "同步脚本语法异常"
   grep -Fqx "APP_VERSION=\"${APP_VERSION}\"" /usr/local/bin/cfdns 2>/dev/null && check_ok "管理脚本版本为${APP_VERSION}" || check_fail "管理脚本版本与当前版本不一致"
   grep -Fqx "APP_VERSION=\"${APP_VERSION}\"" /usr/local/bin/cf-dns-sync.sh 2>/dev/null && check_ok "同步脚本版本为${APP_VERSION}" || check_fail "同步脚本版本与当前版本不一致"
-  for cmd in curl jq dig flock logrotate zcat gzip tac awk sed grep comm mktemp paste cut tr date wc cmp systemctl tar install xargs stat sleep; do command -v "${cmd}" >/dev/null 2>&1 && check_ok "依赖：${cmd}" || check_fail "缺少依赖：${cmd}"; done
+  for cmd in curl jq dig flock logrotate zcat gzip tac awk sed grep comm mktemp paste cut tr date wc cmp systemctl tar install base64 sha256sum ln xargs stat sleep; do command -v "${cmd}" >/dev/null 2>&1 && check_ok "依赖：${cmd}" || check_fail "缺少依赖：${cmd}"; done
 
   case "${LOG_LEVEL}" in NONE|OFF|ERROR|INFO|DEBUG) check_ok "日志等级合法：${LOG_LEVEL}" ;; *) check_fail "日志等级非法：${LOG_LEVEL}" ;; esac
   [[ "${FORCE_RECONCILE_SEC}" =~ ^[0-9]+$ && "${FORCE_RECONCILE_SEC}" -ge 60 ]] && check_ok "强制校准周期：${FORCE_RECONCILE_SEC}s" || check_fail "FORCE_RECONCILE_SEC 必须>=60"
@@ -4803,13 +4849,16 @@ self_check() {
     group_count=$((group_count+1))
     split_tsv_line "${row}"
     field_count="${#TSV_FIELDS[@]}"
-    if (( field_count != 10 )); then check_fail "groups.tsv第${line_no}行字段数量应为10，实际=${field_count}"; continue; fi
+    if (( field_count != 10 && field_count != 11 )); then check_fail "groups.tsv第${line_no}行字段数量应为10或11，实际=${field_count}"; continue; fi
     name="${TSV_FIELDS[0]}"; enabled="${TSV_FIELDS[1]}"; interval="${TSV_FIELDS[2]}"; token="${TSV_FIELDS[3]}"
     zone="${TSV_FIELDS[4]}"; target="${TSV_FIELDS[5]}"; ttl="${TSV_FIELDS[6]}"; proxied="${TSV_FIELDS[7]}"
     mode="${TSV_FIELDS[8]}"; sources_csv="${TSV_FIELDS[9]}"
     valid_group_name_field "${name}" || { check_fail "groups.tsv第${line_no}行组名为空、过长或含不安全字符"; continue; }
     [[ "${enabled}" == true ]] && enabled_count=$((enabled_count+1))
     group_enabled_map["${name}"]="${enabled}"
+    family="${TSV_FIELDS[10]:-IPV4}"
+    (( field_count==10 )) || valid_address_family "${TSV_FIELDS[10]}" || check_fail "组 ${name}: 地址族非法"
+    group_family_map["${name}"]="${family}"
     if [[ -n "${seen_names["${name}"]+x}" ]]; then check_fail "组名重复：${name}"; else seen_names["${name}"]=1; fi
     key="${zone,,}|${target,,}"
     if [[ -n "${seen_targets["${key}"]+x}" ]]; then check_fail "目标记录重复管理：${target}（${seen_targets["${key}"]} / ${name}）"; else seen_targets["${key}"]="${name}"; fi
@@ -4847,8 +4896,8 @@ self_check() {
     primary_sources="$(get_group_primary_sources "${fo_group}" 2>/dev/null || true)"
     validate_sources_csv "${fo_backup}" || check_fail "组 ${fo_group}: BACKUP源域名必须为1~20个有效域名"
     overlap="$(csv_overlap_value "${primary_sources}" "${fo_backup}" || true)"; [[ -z "${overlap}" ]] || check_fail "组 ${fo_group}: PRIMARY/BACKUP重复域名=${overlap}"
-    valid_health_target "${fo_ptarget}" || check_fail "组 ${fo_group}: PRIMARY检测目标格式错误"
-    valid_health_target "${fo_btarget}" || check_fail "组 ${fo_group}: BACKUP检测目标格式错误"
+    valid_health_target_for_family "${fo_ptarget}" "${group_family_map["${fo_group}"]:-IPV4}" || check_fail "组 ${fo_group}: PRIMARY检测目标格式错误"
+    valid_health_target_for_family "${fo_btarget}" "${group_family_map["${fo_group}"]:-IPV4}" || check_fail "组 ${fo_group}: BACKUP检测目标格式错误"
     [[ "${fo_type}" == PING_ICMP || "${fo_type}" == PING_TCP ]] || check_fail "组 ${fo_group}: 检测类型非法"
     if [[ "${fo_type}" == PING_TCP ]]; then [[ "${fo_port}" =~ ^[0-9]+$ && "${fo_port}" -ge 1 && "${fo_port}" -le 65535 ]] || check_fail "组 ${fo_group}: TCP端口非法"; fi
     case "${fo_location,,}" in china|china+*|cn|cn+*) ;; *) check_fail "组 ${fo_group}: 位置必须是中国区（China/CN）" ;; esac
@@ -5086,6 +5135,302 @@ clean_logs_menu() {
   done
 }
 
+
+# 私密迁移文件只写入管理员选择的0600文件，内容不打印到终端或项目日志。
+safe_bundle_path() {
+  local path="$1"
+  [[ "${path}" =~ ^[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*$ && "${path}" != . && "${path}" != .. &&
+    "/${path}/" != *"/../"* && "/${path}/" != *"/./"* ]]
+}
+
+portable_settings_json() {
+  jq -nc --arg LOG_LEVEL "${LOG_LEVEL}" --arg FORCE_RECONCILE_SEC "${FORCE_RECONCILE_SEC}" \
+    --arg DNS_SERVER "${DNS_SERVER}" --arg DNS_QUERY_TIMEOUT_SEC "${DNS_QUERY_TIMEOUT_SEC}" \
+    --arg GLOBALPING_API_TOKEN "${GLOBALPING_API_TOKEN}" --arg GLOBALPING_MAX_TESTS_PER_HOUR "${GLOBALPING_MAX_TESTS_PER_HOUR}" \
+    --arg GLOBALPING_MEASUREMENT_TIMEOUT_SEC "${GLOBALPING_MEASUREMENT_TIMEOUT_SEC}" --arg GLOBALPING_POLL_MAX_SEC "${GLOBALPING_POLL_MAX_SEC}" \
+    '$ARGS.named'
+}
+
+export_configuration() {
+  (
+    local destination="$1" work file rel state_name data digest tmp settings
+    [[ "${destination}" == /* && ! -e "${destination}" && ! -L "${destination}" ]] || {
+      echo "请输入尚不存在的绝对文件路径，避免覆盖已有文件。"; return 1;
+    }
+    [[ -f "${SETTINGS_FILE}" && -f "${GROUPS_FILE}" && -f "${FAILOVER_FILE}" ]] || return 1
+    work="$(mktemp -d)" || return 1
+    trap 'rm -rf -- "${work}"' EXIT
+    exec 8>"${HISTORY_LOCK_FILE}" && flock -w 30 8 || { echo "同步任务占用锁，未导出。"; return 1; }
+    : > "${work}/files"
+    while IFS= read -r -d '' file; do
+      rel="${file#"${BASE_DIR}/"}"
+      [[ "${rel}" != .settings.* && "${rel}" != .groups.* && "${rel}" != .failover.* ]] || continue
+      [[ -f "${file}" && ! -L "${file}" ]] && safe_bundle_path "${rel}" || {
+        echo "配置目录含不支持的文件类型或路径，未导出。"; return 1;
+      }
+      data="$(base64 -w 0 -- "${file}")" || return 1
+      digest="$(sha256sum -- "${file}")"; digest="${digest%% *}"
+      jq -nc --arg path "config/${rel}" --arg data "${data}" --arg sha256 "${digest}" \
+        '{path:$path,data:$data,sha256:$sha256}' >> "${work}/files" || return 1
+    done < <(find "${BASE_DIR}" -mindepth 1 ! -type d -print0)
+    for state_name in state.tsv runstate.tsv reconcile.tsv failover-state.tsv globalping-usage.tsv .initialized; do
+      file="${VAR_DIR}/${state_name}"
+      [[ -e "${file}" || -L "${file}" ]] || continue
+      [[ -f "${file}" && ! -L "${file}" ]] || { echo "状态文件类型异常，未导出。"; return 1; }
+      data="$(base64 -w 0 -- "${file}")" || return 1
+      digest="$(sha256sum -- "${file}")"; digest="${digest%% *}"
+      jq -nc --arg path "state/${state_name}" --arg data "${data}" --arg sha256 "${digest}" \
+        '{path:$path,data:$data,sha256:$sha256}' >> "${work}/files" || return 1
+    done
+    # 重载管理员的当前本机设置，确保导出与磁盘配置一致。
+    bash -n "${SETTINGS_FILE}" || return 1
+    # shellcheck disable=SC1090
+    source "${SETTINGS_FILE}" || return 1
+    settings="$(portable_settings_json)" || return 1
+    tmp="$(mktemp "${destination}.tmp.XXXXXX")" || return 1
+    if ! jq -s --arg version "${APP_VERSION}" --arg date "$(date -u '+%FT%TZ')" --argjson settings "${settings}" \
+      '{format:"cfdns-full-config",formatVersion:1,appVersion:$version,createdAt:$date,settings:$settings,files:.}' \
+      "${work}/files" > "${tmp}" || ! chmod 600 "${tmp}"; then rm -f -- "${tmp}"; return 1; fi
+    if (( $(stat -c '%s' "${tmp}")>67108864 || $(wc -l < "${work}/files")>2000 )); then
+      rm -f -- "${tmp}"; echo "完整配置包超过当前导入上限（64MiB或2000文件），未生成不可恢复的备份。"; return 1
+    fi
+    # hard link以独占方式发布结果；目标在确认后被他人创建时不覆盖。
+    if ! ln -- "${tmp}" "${destination}"; then rm -f -- "${tmp}"; return 1; fi
+    rm -f -- "${tmp}"
+    echo "完整配置已导出：${destination}"
+    echo "包含全部配置文件、密钥及运行状态；请以私密文件保管并复制到备用机器，权限为600。"
+  )
+}
+
+validate_configuration_tree() {
+  local root="$1" states="$2" row group domain ip idx family key
+  local GROUPS_FILE="${root}/groups.tsv" FAILOVER_FILE="${root}/failover.tsv" FAILOVER_STATE_FILE="${states}/failover-state.tsv"
+  local -A names=() targets=() families=() sources=() fo_names=() state_names=()
+  while IFS= read -r row || [[ -n "${row}" ]]; do
+    [[ -z "${row}" || "${row}" == \#* ]] && continue
+    split_line_to_vars "${row}" || return 1
+    group="${GROUP_NAME}"
+    valid_group_name_field "${group}" && valid_api_token_field "${GROUP_API_TOKEN}" &&
+      valid_zone_id "${GROUP_ZONE_ID}" && valid_domain "${GROUP_TARGET_FQDN}" && valid_ttl "${GROUP_TTL}" &&
+      validate_sources_csv "${GROUP_SOURCES_CSV}" || return 1
+    [[ "${GROUP_ENABLED}" == true || "${GROUP_ENABLED}" == false ]] || return 1
+    [[ "${GROUP_PROXIED}" == false && ( "${GROUP_MODE}" == ALL_IPS || "${GROUP_MODE}" == SINGLE_IP ) ]] || return 1
+    [[ "${GROUP_INTERVAL}" =~ ^[0-9]+$ ]] && (( GROUP_INTERVAL>=5 )) || return 1
+    key="${GROUP_ZONE_ID,,}|${GROUP_TARGET_FQDN,,}"
+    [[ -z "${names["${group}"]+x}" && -z "${targets["${key}"]+x}" ]] || return 1
+    names["${group}"]=1; targets["${key}"]=1; families["${group}"]="${GROUP_ADDRESS_FAMILY}"; sources["${group}"]="${GROUP_SOURCES_CSV}"
+  done < "${GROUPS_FILE}"
+  while IFS= read -r row || [[ -n "${row}" ]]; do
+    [[ -z "${row}" || "${row}" == \#* ]] && continue
+    split_tsv_line "${row}"; group="${TSV_FIELDS[0]:-}"
+    [[ -n "${group}" && -n "${names["${group}"]+x}" && -z "${fo_names["${group}"]+x}" ]] || return 1
+    fo_names["${group}"]=1; GROUP_ADDRESS_FAMILY="${families["${group}"]}"
+    load_failover_config_ui "${group}" && validate_failover_ui "${sources["${group}"]}" >/dev/null || return 1
+  done < "${FAILOVER_FILE}"
+  while IFS= read -r row || [[ -n "${row}" ]]; do
+    [[ -n "${row}" ]] || continue
+    split_tsv_line "${row}"; group="${TSV_FIELDS[0]:-}"
+    (( ${#TSV_FIELDS[@]}==12 )) && [[ -n "${group}" && -n "${fo_names["${group}"]+x}" && -z "${state_names["${group}"]+x}" ]] || return 1
+    state_names["${group}"]=1
+    load_failover_state_ui "${group}" || return 1
+  done < "${FAILOVER_STATE_FILE}"
+  while IFS= read -r row || [[ -n "${row}" ]]; do
+    [[ -n "${row}" ]] || continue
+    split_tsv_line "${row}"; group="${TSV_FIELDS[0]:-}"
+    (( ${#TSV_FIELDS[@]}==3 )) && [[ -n "${group}" && -n "${names["${group}"]+x}" ]] || return 1
+    domain="${TSV_FIELDS[1]}"; ip="${TSV_FIELDS[2]}"
+    valid_domain "${domain}" && normalize_ip "${ip}" >/dev/null || return 1
+  done < "${states}/state.tsv"
+  awk 'NF && (NF!=1 || $1!~/^[0-9]+$/){bad=1} END{exit bad}' "${states}/globalping-usage.tsv"
+}
+
+decode_configuration_bundle() {
+  local bundle="$1" output="$2" count idx path encoded digest actual key value
+  [[ -f "${bundle}" && ! -L "${bundle}" ]] && (( $(stat -c '%s' "${bundle}")<=67108864 )) || return 1
+  jq -e '
+    .format=="cfdns-full-config" and .formatVersion==1 and (.files|type)=="array" and
+    (.files|length)>0 and (.files|length)<=2000 and ([.files[].path]|length)==([.files[].path]|unique|length) and
+    all(.files[]; (.path|type)=="string" and (.data|type)=="string" and (.sha256|type)=="string" and (.sha256|test("^[0-9a-f]{64}$"))) and
+    (.settings|type)=="object" and
+    (.settings|keys)==["DNS_QUERY_TIMEOUT_SEC","DNS_SERVER","FORCE_RECONCILE_SEC","GLOBALPING_API_TOKEN","GLOBALPING_MAX_TESTS_PER_HOUR","GLOBALPING_MEASUREMENT_TIMEOUT_SEC","GLOBALPING_POLL_MAX_SEC","LOG_LEVEL"] and
+    all(.settings[]; type=="string" and (test("[\u0000-\u001f\u007f]")|not))
+  ' >/dev/null 2>&1 "${bundle}" || return 1
+  mkdir -p "${output}/config" "${output}/state" || return 1
+  count="$(jq '.files|length' "${bundle}")"
+  for ((idx=0;idx<count;idx++)); do
+    path="$(jq -r --argjson i "${idx}" '.files[$i].path' "${bundle}")"
+    safe_bundle_path "${path}" || return 1
+    case "${path}" in
+      config/*) ;;
+      state/state.tsv|state/runstate.tsv|state/reconcile.tsv|state/failover-state.tsv|state/globalping-usage.tsv|state/.initialized) ;;
+      *) return 1 ;;
+    esac
+    mkdir -p "${output}/${path%/*}" || return 1
+    encoded="$(jq -r --argjson i "${idx}" '.files[$i].data' "${bundle}")"
+    printf '%s' "${encoded}" | base64 -d > "${output}/${path}" || return 1
+    digest="$(jq -r --argjson i "${idx}" '.files[$i].sha256' "${bundle}")"
+    actual="$(sha256sum "${output}/${path}")"; [[ "${actual%% *}" == "${digest}" ]] || return 1
+    chmod 600 "${output}/${path}" || return 1
+  done
+  for key in settings.conf groups.tsv failover.tsv; do [[ -f "${output}/config/${key}" ]] || return 1; done
+  # 只按已校验的已知键生成字面赋值，绝不source导入包中的settings.conf。
+  : > "${output}/config/settings.conf"
+  for key in LOG_LEVEL FORCE_RECONCILE_SEC DNS_SERVER DNS_QUERY_TIMEOUT_SEC GLOBALPING_API_TOKEN GLOBALPING_MAX_TESTS_PER_HOUR GLOBALPING_MEASUREMENT_TIMEOUT_SEC GLOBALPING_POLL_MAX_SEC; do
+    value="$(jq -r --arg key "${key}" '.settings[$key]' "${bundle}")"
+    printf '%s=%q\n' "${key}" "${value}" >> "${output}/config/settings.conf" || return 1
+  done
+  local LOG_LEVEL FORCE_RECONCILE_SEC DNS_SERVER DNS_QUERY_TIMEOUT_SEC GLOBALPING_API_TOKEN GLOBALPING_MAX_TESTS_PER_HOUR GLOBALPING_MEASUREMENT_TIMEOUT_SEC GLOBALPING_POLL_MAX_SEC
+  source "${output}/config/settings.conf" || return 1
+  case "${LOG_LEVEL}" in NONE|OFF|ERROR|INFO|DEBUG) ;; *) return 1 ;; esac
+  [[ "${FORCE_RECONCILE_SEC}" =~ ^[0-9]+$ && "${DNS_QUERY_TIMEOUT_SEC}" =~ ^[0-9]+$ &&
+    "${GLOBALPING_MAX_TESTS_PER_HOUR}" =~ ^[0-9]+$ && "${GLOBALPING_MEASUREMENT_TIMEOUT_SEC}" =~ ^[0-9]+$ &&
+    "${GLOBALPING_POLL_MAX_SEC}" =~ ^[0-9]+$ ]] || return 1
+  (( FORCE_RECONCILE_SEC>=60 && DNS_QUERY_TIMEOUT_SEC>=1 && GLOBALPING_MAX_TESTS_PER_HOUR>=1 &&
+    GLOBALPING_MEASUREMENT_TIMEOUT_SEC>=5 && GLOBALPING_MEASUREMENT_TIMEOUT_SEC<=30 &&
+    GLOBALPING_POLL_MAX_SEC>=GLOBALPING_MEASUREMENT_TIMEOUT_SEC+10 && GLOBALPING_POLL_MAX_SEC<=60 )) || return 1
+  for key in state.tsv runstate.tsv reconcile.tsv failover-state.tsv globalping-usage.tsv; do
+    [[ -f "${output}/state/${key}" ]] || : > "${output}/state/${key}"
+  done
+  validate_configuration_tree "${output}/config" "${output}/state"
+}
+
+import_configuration() {
+  (
+    local bundle="$1" work staged rollback="" old_active=0 old_enabled=0 file state_name rc=0
+    local completed=0 scheduler_stopped=0 writes_started=0 new_dir="" old_dir=""
+    work="$(mktemp -d)" || return 1
+    import_cleanup() {
+      local exit_rc="$1" cleanup_state
+      if (( completed==0 && writes_started==1 )); then
+        if [[ -d "${old_dir}" ]]; then
+          local damaged="${old_dir}.incomplete"
+          if mv "${BASE_DIR}" "${damaged}" && mv "${old_dir}" "${BASE_DIR}"; then
+            rm -rf -- "${damaged}"
+          else echo "配置目录回滚失败，请从持久备份恢复。" >&2; exit_rc=1; fi
+        fi
+        for cleanup_state in state.tsv runstate.tsv reconcile.tsv failover-state.tsv globalping-usage.tsv .initialized; do
+          if [[ -f "${rollback}/state/${cleanup_state}" ]]; then
+            install -m 600 "${rollback}/state/${cleanup_state}" "${VAR_DIR}/${cleanup_state}" || exit_rc=1
+          else rm -f -- "${VAR_DIR}/${cleanup_state}"; fi
+        done
+      fi
+      exec 8>&-
+      if (( completed==0 && scheduler_stopped==1 )); then
+        if (( old_enabled==1 )); then systemctl enable "${TIMER_NAME}" >/dev/null 2>&1 || exit_rc=1
+        else systemctl disable "${TIMER_NAME}" >/dev/null 2>&1 || exit_rc=1; fi
+        if (( old_active==1 )); then systemctl start "${TIMER_NAME}" >/dev/null 2>&1 || exit_rc=1
+        else systemctl stop "${TIMER_NAME}" >/dev/null 2>&1 || exit_rc=1; fi
+      fi
+      [[ -z "${new_dir}" || ! -d "${new_dir}" ]] || rm -rf -- "${new_dir}"
+      rm -rf -- "${work}"
+      return "${exit_rc}"
+    }
+    trap 'import_cleanup "$?"' EXIT
+    if ! decode_configuration_bundle "${bundle}" "${work}/new"; then
+      echo "导入包校验失败（格式、校验和、配置或状态异常），现有配置未修改。"; return 1
+    fi
+    staged="${work}/new"
+    echo "导入包验证通过，配置与密钥将完整恢复。"
+    # 先停止自动服务并取得同步锁，防止替换过程中出现混合配置。
+    systemctl is-active --quiet "${TIMER_NAME}" && old_active=1
+    systemctl is-enabled --quiet "${TIMER_NAME}" && old_enabled=1
+    systemctl stop "${TIMER_NAME}" || { echo "无法停止定时器，未导入。"; return 1; }
+    scheduler_stopped=1
+    if ! systemctl stop "${SERVICE_NAME}"; then
+      (( old_active==0 )) || systemctl start "${TIMER_NAME}"
+      echo "无法停止同步服务，未导入。"; return 1
+    fi
+    if ! exec 8>"${HISTORY_LOCK_FILE}" || ! flock -w 30 8; then
+      (( old_active==0 )) || systemctl start "${TIMER_NAME}"
+      echo "未取得同步锁，未导入。"; return 1
+    fi
+    if ! backup_configuration; then
+      flock -u 8; exec 8>&-
+      (( old_active==0 )) || systemctl start "${TIMER_NAME}"
+      return 1
+    fi
+    rollback="${work}/rollback"
+    mkdir -p "${rollback}/config" "${rollback}/state" || return 1
+    cp -a "${BASE_DIR}/." "${rollback}/config/" || return 1
+    for state_name in state.tsv runstate.tsv reconcile.tsv failover-state.tsv globalping-usage.tsv .initialized; do
+      [[ ! -f "${VAR_DIR}/${state_name}" ]] || cp -a "${VAR_DIR}/${state_name}" "${rollback}/state/" || return 1
+    done
+    # 不继承旧机器调度时钟；保留已确认线路和预算，立即从真实DNS状态重新核对。
+    : > "${staged}/state/runstate.tsv"; : > "${staged}/state/reconcile.tsv"
+    awk 'BEGIN{FS=OFS="\t"} NF{$7=0;$8=0;print}' "${staged}/state/failover-state.tsv" > "${work}/fo-reset" || return 1
+    mv "${work}/fo-reset" "${staged}/state/failover-state.tsv" || return 1
+    : > "${staged}/state/.initialized"
+    # 同一文件系统内交换完整配置目录；运行状态逐个原子替换。
+    new_dir="$(mktemp -d "${BASE_DIR}.import.XXXXXX")" || return 1
+    old_dir="${new_dir}.old"
+    cp -a "${staged}/config/." "${new_dir}/" && chmod 700 "${new_dir}" || { rm -rf -- "${new_dir}"; return 1; }
+    writes_started=1
+    if ! mv "${BASE_DIR}" "${old_dir}"; then rm -rf -- "${new_dir}"; return 1; fi
+    if ! mv "${new_dir}" "${BASE_DIR}"; then mv "${old_dir}" "${BASE_DIR}"; rc=1; fi
+    if (( rc==0 )); then
+      for state_name in state.tsv runstate.tsv reconcile.tsv failover-state.tsv globalping-usage.tsv .initialized; do
+        file="$(mktemp "${VAR_DIR}/.import-state.XXXXXX")" || { rc=1; break; }
+        if ! install -m 600 "${staged}/state/${state_name}" "${file}" || ! mv -f "${file}" "${VAR_DIR}/${state_name}"; then rm -f "${file}"; rc=1; break; fi
+      done
+    fi
+    if (( rc!=0 )); then
+      [[ ! -d "${old_dir}" ]] || { rm -rf -- "${BASE_DIR}"; mv "${old_dir}" "${BASE_DIR}" || echo "严重错误：配置目录回滚失败，请使用配置备份恢复。"; }
+      for state_name in state.tsv runstate.tsv reconcile.tsv failover-state.tsv globalping-usage.tsv .initialized; do
+        if [[ -f "${rollback}/state/${state_name}" ]]; then install -m 600 "${rollback}/state/${state_name}" "${VAR_DIR}/${state_name}" || rc=2
+        else rm -f -- "${VAR_DIR}/${state_name}"; fi
+      done
+      flock -u 8; exec 8>&-
+      (( old_enabled==0 )) || systemctl enable "${TIMER_NAME}"
+      (( old_active==0 )) || systemctl start "${TIMER_NAME}"
+      writes_started=0
+      echo "导入未完成，已执行回滚；配置备份：${LAST_CONFIG_BACKUP}"; return 1
+    fi
+    completed=1
+    rm -rf -- "${old_dir}"
+    flock -u 8; exec 8>&-
+    echo "完整配置与密钥已导入；原配置备份：${LAST_CONFIG_BACKUP}"
+    systemctl daemon-reload && systemctl enable --now "${TIMER_NAME}" || { echo "配置已导入，但自动调度启动失败；请运行菜单25修复。"; return 2; }
+    if /usr/local/bin/cf-dns-sync.sh ALL; then
+      echo "已强制核对全部启用组，备用机器已接管自动运行。"
+    else
+      echo "配置已导入，但首次DNS核对不完整；保留导入配置并自动重试，请查看菜单19日志。"; return 2
+    fi
+  )
+}
+
+configuration_transfer_menu() {
+  local choice path confirm rc
+  while true; do
+    echo "📦 完整配置导入/导出（包含密钥）"
+    echo "1. 导出全部配置和运行状态"
+    echo "2. 导入并接管运行"
+    echo "0. 返回"
+    read -rp "请选择: " choice || return
+    case "${choice}" in
+      1)
+        echo "文件包含Cloudflare/Globalping密钥和真实域名，请存放在私密位置。"
+        read -rp "导出文件绝对路径（如 /root/cfdns-backup.json）: " path || return
+        export_configuration "${path}"; pause_wait
+        ;;
+      2)
+        read -rp "导入文件绝对路径: " path || return
+        echo "将覆盖当前配置，操作前自动备份；成功后立即核对DNS并启用定时器。"
+        echo "接管前请确保旧机器已停止cfdns，避免两台机器同时管理同一目标。"
+        read -rp "确认导入请输入 IMPORT: " confirm || return
+        [[ "${confirm}" == IMPORT ]] || { echo "已取消"; continue; }
+        import_configuration "${path}"; rc=$?
+        if (( rc==0 || rc==2 )); then
+          # shellcheck disable=SC1090
+          source "${SETTINGS_FILE}" || { echo "配置重载失败，请重新打开cfdns。"; return 1; }
+        fi
+        pause_wait
+        ;;
+      0) return ;;
+      *) echo "无效选择" ;;
+    esac
+  done
+}
+
 edit_raw_files() {
   echo
   echo "1. 📝 编辑 settings.conf（全局设置/Globalping Token）"
@@ -5093,6 +5438,7 @@ edit_raw_files() {
   echo "3. 🌏 编辑 failover.tsv（BACKUP与故障转移配置）"
   echo "0. ↩️  返回"
   read -rp "请选择: " choice || return
+  [[ "${choice}" == 0 ]] || backup_configuration || return 1
   case "${choice}" in 1) ${EDITOR:-vi} "${SETTINGS_FILE}" ;; 2) ${EDITOR:-vi} "${GROUPS_FILE}" ;; 3) ${EDITOR:-vi} "${FAILOVER_FILE}" ;; 0) ;; *) echo "无效选择" ;; esac
 }
 
@@ -5159,6 +5505,7 @@ menu() {
     echo " 29.  🛠️  编辑原始配置文件（Edit Raw Files / 原始配置）"
     echo " 30.  💣 彻底卸载（Uninstall / 卸载）"
     echo " 31.  🌏 Globalping 中国节点故障转移（Failover / PRIMARY-BACKUP）"
+    echo " 32.  📦 完整配置导入/导出（含密钥 / 跨机恢复）"
     echo "  0.  🚪 退出（Exit / 退出）"
     line
     read -rp "请选择: " choice || exit 0
@@ -5172,7 +5519,7 @@ menu() {
       19) show_logs ;; 20) follow_logs ;; 21) show_group_runtime_logs ;;
       22) show_status; pause_wait ;; 23) show_dep_status; pause_wait ;; 24) self_check; pause_wait ;;
       25) one_key_repair; pause_wait ;; 26) show_runstate; pause_wait ;; 27) history_menu ;;
-      28) clean_logs_menu ;; 29) edit_raw_files ;; 30) uninstall_all ;; 31) failover_menu ;; 0) exit 0 ;;
+      28) clean_logs_menu ;; 29) edit_raw_files ;; 30) uninstall_all ;; 31) failover_menu ;; 32) configuration_transfer_menu ;; 0) exit 0 ;;
       *) echo "无效选择"; sleep 1 ;;
     esac
   done
@@ -5299,7 +5646,7 @@ backup_existing() {
 
 store_installer_copy() {
   mkdir -p "${INSTALL_DIR}"
-  if [[ -f "$0" ]] && grep -q 'cfdns v2.9 installer' "$0" 2>/dev/null; then
+  if [[ -f "$0" ]] && grep -q 'cfdns v3.0 installer' "$0" 2>/dev/null; then
     if [[ -e "${INSTALL_COPY}" && "$0" -ef "${INSTALL_COPY}" ]]; then
       chmod 700 "${INSTALL_COPY}"
     else
@@ -5370,12 +5717,13 @@ main() {
   echo "管理命令: cfdns"
   echo "本机基础调度周期: 5 秒"
   echo "每组按照独立周期查询源域名；源IP未变化时不会调用Cloudflare API。"
+  echo "地址族支持仅IPv4、仅IPv6和双栈；旧组默认仅IPv4，单IP模式按每源每族分别选取。"
   echo "Globalping故障转移为可选模块：现有源域名自动作为PRIMARY，未配置BACKUP的组行为不变。"
   echo "组配置: ${GROUPS_FILE}"
   echo "故障转移配置: ${FAILOVER_FILE}"
   echo "日志目录: ${LOG_DIR}"
   echo "升级备份: ${BACKUP_DIR}"
-  echo "自检/一键修复: cfdns 菜单24/25；故障转移: 菜单31"
+  echo "自检/一键修复: cfdns 菜单24/25；故障转移: 菜单31；完整配置导入/导出: 菜单32"
   if [[ "${CFDNS_NO_START:-0}" != "1" ]]; then
     systemctl status "${APP_NAME}.timer" --no-pager -l || true
   fi

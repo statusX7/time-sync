@@ -2,11 +2,12 @@
 set -euo pipefail
 umask 077
 
-# cfdns v3.0 installer
+# cfdns v3.1 installer
 # Cloudflare DNS multi-group A/AAAA incremental sync tool
+# v3.1: mixed-family dual-stack sources; preserve records for empty address families.
 
 APP_NAME="cf-dns-sync"
-APP_VERSION="3.0"
+APP_VERSION="3.1"
 INSTALL_DIR="/opt/cfdns"
 INSTALL_COPY="${INSTALL_DIR}/cfdns-installer.sh"
 BASE_DIR="/etc/${APP_NAME}"
@@ -262,7 +263,7 @@ write_sync_script() {
 set -uo pipefail
 umask 077
 
-APP_VERSION="3.0"
+APP_VERSION="3.1"
 BASE_DIR="/etc/cf-dns-sync"
 VAR_DIR="/var/lib/cf-dns-sync"
 SETTINGS_FILE="${BASE_DIR}/settings.conf"
@@ -1043,21 +1044,27 @@ mark_group_sync_due() {
 }
 
 route_sources_ready_for_switch() {
-  local group="$1" role="$2" sources_csv="$3" domain type ips types
-  local -a failed=()
+  local group="$1" role="$2" sources_csv="$3" type types tmpdir
   csv_to_sources_array "${sources_csv}"
   (( ${#SOURCES_ARRAY[@]}>=1 )) || return 1
   types="$(record_types_for_family "${SYNC_ADDRESS_FAMILY:-IPV4}")" || return 1
-  for domain in "${SOURCES_ARRAY[@]}"; do
-    while IFS= read -r type; do
-      ips="$(resolve_domain_addresses "${domain}" "${type}")"
-      [[ -n "${ips}" ]] || failed+=("${domain}(${type})")
-    done <<< "${types}"
-  done
-  if (( ${#failed[@]}>0 )); then
-    log ERROR "组 ${group}: ${role} 源域名地址族未全部就绪，阻止切换：$(IFS=,; echo "${failed[*]}")"
+  tmpdir="$(mktemp -d)" || return 1
+  if ! build_group_map ALL_IPS "${tmpdir}/map" "${tmpdir}/failed" "${SOURCES_ARRAY[@]}" ||
+    [[ -s "${tmpdir}/failed" || ! -s "${tmpdir}/map" ]]; then
+    log ERROR "组 ${group}: ${role} 源域名解析未就绪，阻止切换：$(paste -sd ',' "${tmpdir}/failed")"
+    rm -rf -- "${tmpdir}"
     return 1
   fi
+  # 双栈可由不同源提供两族，但完整线路切换仍须每个启用族在组级就绪。
+  while IFS= read -r type; do
+    if ! awk -F '\t' -v t="${type}" '(t=="AAAA" && index($2,":")) || (t=="A" && !index($2,":")) {found=1} END{exit !found}' "${tmpdir}/map"; then
+      log ERROR "组 ${group}: ${role} 整组无 ${type} 有效记录，保留旧线路并阻止不完整切换"
+      rm -rf -- "${tmpdir}"
+      return 1
+    fi
+  done <<< "${types}"
+  rm -rf -- "${tmpdir}"
+  return 0
 }
 
 failover_switch_role() {
@@ -1539,16 +1546,21 @@ csv_to_sources_array() {
 }
 
 resolve_domain_addresses() {
-  local domain="$1" type="$2" answer ip normalized found=0
-  local -a args=(+short "+time=${DNS_QUERY_TIMEOUT_SEC}" +tries=1 "${type}" "${domain}")
+  local domain="$1" type="$2" answer status addresses ip normalized found=0
+  local -a args=(-r +noall +comments +answer "+time=${DNS_QUERY_TIMEOUT_SEC}" +tries=1 "${type}" "${domain}")
   [[ -z "${DNS_SERVER}" ]] || args=("@${DNS_SERVER}" "${args[@]}")
   answer="$(dig "${args[@]}" 2>/dev/null)" || return 1
+  status="$(awk '/^;; ->>HEADER<<-/ {for(i=1;i<NF;i++) if($i=="status:"){s=$(i+1);sub(/,$/,"",s)}} END{print s}' <<< "${answer}")" || return 1
+  # 0=有效地址，2=正常无记录，1=查询或响应异常；不能将SERVFAIL等误当缺少地址族。
+  case "${status}" in NOERROR) ;; NXDOMAIN) return 2 ;; *) return 1 ;; esac
+  addresses="$(awk -v t="${type}" '$3=="IN" && $4==t {if(NF!=5){bad=1;next} print $5} END{exit bad}' <<< "${answer}")" || return 1
   while IFS= read -r ip; do
-    ip="${ip//$'\r'/}"
-    normalized="$(normalize_record_ip "${ip}" "${type}")" || continue
+    [[ -n "${ip}" ]] || continue
+    normalized="$(normalize_record_ip "${ip//$'\r'/}" "${type}")" || return 1
     printf '%s\n' "${normalized}"; found=1
-  done <<< "${answer}"
-  (( found == 1 ))
+  done <<< "${addresses}"
+  (( found == 1 )) && return 0
+  return 2
 }
 
 resolve_domain_ipv4() { resolve_domain_addresses "$1" A; }
@@ -1557,16 +1569,21 @@ resolve_domain_ipv6() { resolve_domain_addresses "$1" AAAA; }
 build_group_map() {
   local mode="$1" map_file="$2" failed_file="$3"
   shift 3
-  local domain type picked ips types
-  types="$(record_types_for_family "${SYNC_ADDRESS_FAMILY:-IPV4}")" || return 1
+  local domain type picked ips types rc found family="${SYNC_ADDRESS_FAMILY:-IPV4}"
+  types="$(record_types_for_family "${family}")" || return 1
   : > "${map_file}" || return 1
   : > "${failed_file}" || return 1
   for domain in "$@"; do
+    found=0
     while IFS= read -r type; do
-      if ! ips="$(resolve_domain_addresses "${domain}" "${type}" | LC_ALL=C sort -u)" || [[ -z "${ips}" ]]; then
+      if ips="$(resolve_domain_addresses "${domain}" "${type}")"; then rc=0; else rc=$?; fi
+      if (( rc == 2 )) && [[ "${family}" == DUAL_STACK ]]; then continue; fi
+      if (( rc != 0 )) || [[ -z "${ips}" ]]; then
         printf '%s(%s)\n' "${domain}" "${type}" >> "${failed_file}" || return 1
         continue
       fi
+      ips="$(LC_ALL=C sort -u <<< "${ips}")" || return 1
+      found=1
       if [[ "${mode}" == SINGLE_IP ]]; then
         picked="$(sed -n '1p' <<< "${ips}")"
         printf '%s\t%s\n' "${domain}" "${picked}" >> "${map_file}" || return 1
@@ -1576,6 +1593,9 @@ build_group_map() {
         done <<< "${ips}"
       fi
     done <<< "${types}"
+    if [[ "${family}" == DUAL_STACK ]] && (( found == 0 )); then
+      printf '%s(A/AAAA)\n' "${domain}" >> "${failed_file}" || return 1
+    fi
   done
   LC_ALL=C sort -u -o "${map_file}" "${map_file}" || return 1
   LC_ALL=C sort -u -o "${failed_file}" "${failed_file}"
@@ -1749,7 +1769,7 @@ sync_one_group() {
   if [[ "${RUN_MODE}" == AUTO ]] && ! should_run_group "${group_name}" "${interval_sec}"; then return 0; fi
   csv_to_sources_array "${sources_csv}"
   (( ${#SOURCES_ARRAY[@]}>=1 && ${#SOURCES_ARRAY[@]}<=20 )) || return 1
-  local domain type types ip id domains old_map map failed tmpdir current desired record_ttl record_proxied first_id
+  local domain type types sync_types="" preserved_type="" ip id domains old_map map failed tmpdir current desired record_ttl record_proxied first_id
   for domain in "${SOURCES_ARRAY[@]}"; do valid_domain "${domain}" || return 1; done
   SYNC_ADDRESS_FAMILY="${family}"
   types="$(record_types_for_family "${family}")" || return 1
@@ -1766,17 +1786,39 @@ sync_one_group() {
     log ERROR "组 ${group_name}: 本地成功状态无法读取，已停止同步"
     rm -rf -- "${tmpdir}"; return 1
   fi
+  # 空地址族绝不能成为删除列表；也不能用仅完成一族的结果确认线路切换或中断恢复。
+  while IFS= read -r type; do
+    desired="${tmpdir}/desired.${type}"
+    awk -F '\t' -v t="${type}" '(t=="AAAA" && index($2,":")) || (t=="A" && !index($2,":")) {print $2}' "${map}" | LC_ALL=C sort -u > "${desired}" || { rm -rf -- "${tmpdir}"; return 1; }
+    if [[ ! -s "${desired}" ]]; then
+      if [[ "${FAILOVER_SWITCH_PENDING}" -eq 1 && "${FAILOVER_SWITCH_GROUP}" == "${group_name}" ]] ||
+        [[ "${FAILOVER_RECOVERY_PENDING}" -eq 1 && "${FAILOVER_RECOVERY_GROUP}" == "${group_name}" ]] ||
+        [[ "${FS_GROUP:-}" == "${group_name}" && "${FS_LAST_RESULT:-}" == SWITCH_PENDING_* ]]; then
+        log ERROR "组 ${group_name}: 整组无 ${type} 有效记录，保留旧记录，无法确认完整线路切换或恢复"
+        rm -rf -- "${tmpdir}"; return 1
+      fi
+      preserved_type="${type}"
+      log INFO "组 ${group_name}: 整组无 ${type} 有效记录，保留Cloudflare该类型旧记录及本地成功状态，未修改该地址族"
+    else
+      sync_types+="${type}"$'\n'
+    fi
+  done <<< "${types}"
+  types="${sync_types%$'\n'}"
+  [[ -n "${types}" ]] || { rm -rf -- "${tmpdir}"; return 1; }
+  if [[ -n "${preserved_type}" ]]; then
+    awk -F '\t' -v t="${preserved_type}" '(t=="AAAA" && index($2,":")) || (t=="A" && !index($2,":"))' "${old_map}" >> "${map}" || { rm -rf -- "${tmpdir}"; return 1; }
+    LC_ALL=C sort -u -o "${map}" "${map}" || { rm -rf -- "${tmpdir}"; return 1; }
+  fi
   if cmp -s "${map}" "${old_map}" && [[ "${FORCE_FLAG}" != 1 ]] && ! reconcile_due "${group_name}"; then
     log DEBUG "组 ${group_name}: 源IP无变化，未访问Cloudflare"
     rm -rf -- "${tmpdir}"; return 0
   fi
-  # 两族分别读取和比较；任一查询失败，在任何写操作之前退出。
+  # 有结果的族分别读取和比较；任一查询失败，在任何写操作之前退出。
   while IFS= read -r type; do
     current="${tmpdir}/current.${type}"; desired="${tmpdir}/desired.${type}"
     if ! fetch_cf_a_records "${group_name}" "${api_token}" "${zone_id}" "${target_fqdn}" "${current}" "${type}"; then
       rm -rf -- "${tmpdir}"; return 1
     fi
-    awk -F '\t' -v t="${type}" '(t=="AAAA" && index($2,":")) || (t=="A" && !index($2,":")) {print $2}' "${map}" | LC_ALL=C sort -u > "${desired}" || { rm -rf -- "${tmpdir}"; return 1; }
     cut -f2 "${current}" | LC_ALL=C sort -u > "${tmpdir}/ips.${type}" || { rm -rf -- "${tmpdir}"; return 1; }
     LC_ALL=C comm -23 "${desired}" "${tmpdir}/ips.${type}" > "${tmpdir}/add.${type}" || { rm -rf -- "${tmpdir}"; return 1; }
     LC_ALL=C comm -13 "${desired}" "${tmpdir}/ips.${type}" > "${tmpdir}/del.${type}" || { rm -rf -- "${tmpdir}"; return 1; }
@@ -1837,6 +1879,8 @@ sync_one_group() {
   if (( op_failed == 0 )); then
     if ! save_group_state "${group_name}" "${map}" || ! set_group_last_reconcile "${group_name}" "$(now_ts)"; then
       op_failed=1; log ERROR "Cloudflare已操作，但本地成功状态保存失败"
+    elif [[ -n "${preserved_type}" ]]; then
+      log INFO "组 ${group_name}: ${types} 同步完成，${preserved_type} 无有效结果、旧记录保持不变，线路=${active_route}"
     else log INFO "组 ${group_name}: ${family} 同步完成，线路=${active_route}"; fi
   else
     log ERROR "组 ${group_name}: ${family} 部分失败，未推进成功状态或确认线路，下轮重新核对"
@@ -1987,7 +2031,7 @@ set -uo pipefail
 umask 077
 
 APP_NAME="cf-dns-sync"
-APP_VERSION="3.0"
+APP_VERSION="3.1"
 BASE_DIR="/etc/${APP_NAME}"
 VAR_DIR="/var/lib/${APP_NAME}"
 SETTINGS_FILE="${BASE_DIR}/settings.conf"
@@ -2330,15 +2374,21 @@ urlencode() {
 }
 
 ui_resolve_domain_addresses() {
-  local domain="$1" type="$2" answer ip normalized found=0
-  local -a args=(+short "+time=${DNS_QUERY_TIMEOUT_SEC}" +tries=1 "${type}" "${domain}")
+  local domain="$1" type="$2" answer status addresses ip normalized found=0
+  local -a args=(-r +noall +comments +answer "+time=${DNS_QUERY_TIMEOUT_SEC}" +tries=1 "${type}" "${domain}")
   [[ -z "${DNS_SERVER}" ]] || args=("@${DNS_SERVER}" "${args[@]}")
   answer="$(dig "${args[@]}" 2>/dev/null)" || return 1
+  status="$(awk '/^;; ->>HEADER<<-/ {for(i=1;i<NF;i++) if($i=="status:"){s=$(i+1);sub(/,$/,"",s)}} END{print s}' <<< "${answer}")" || return 1
+  # 与同步执行器保持相同三态：正常无记录显示缺少类型，真实查询异常仍显示失败。
+  case "${status}" in NOERROR) ;; NXDOMAIN) return 2 ;; *) return 1 ;; esac
+  addresses="$(awk -v t="${type}" '$3=="IN" && $4==t {if(NF!=5){bad=1;next} print $5} END{exit bad}' <<< "${answer}")" || return 1
   while IFS= read -r ip; do
-    normalized="$(normalize_record_ip "${ip//$'\r'/}" "${type}")" || continue
+    [[ -n "${ip}" ]] || continue
+    normalized="$(normalize_record_ip "${ip//$'\r'/}" "${type}")" || return 1
     printf '%s\n' "${normalized}"; found=1
-  done <<< "${answer}"
-  (( found==1 ))
+  done <<< "${addresses}"
+  (( found == 1 )) && return 0
+  return 2
 }
 
 ui_resolve_domain_ipv4() { ui_resolve_domain_addresses "$1" A; }
@@ -3894,17 +3944,22 @@ test_group_token() {
 
 
 render_sources_dns() {
-  local csv="$1" family="$2" mode="${3:-ALL_IPS}" types type domain ips count joined i=0
+  local csv="$1" family="$2" mode="${3:-ALL_IPS}" types type domain ips count joined rc i=0
   types="$(record_types_for_family "${family}")" || return 1
   parse_sources_to_array "${csv}"
   printf '%-4s %-40s %-6s %-8s %s\n' "序号" "源域名" "类型" "数量" "解析结果"
   for domain in "${SOURCES_ARRAY[@]}"; do
     i=$((i+1))
     while IFS= read -r type; do
-      ips="$(ui_resolve_domain_addresses "${domain}" "${type}" | LC_ALL=C sort -u)"
-      if [[ "${mode}" == SINGLE_IP ]]; then ips="$(sed -n '1p' <<< "${ips}")"; fi
-      count="$(sed '/^$/d' <<< "${ips}" | wc -l)"; joined="$(paste -sd ',' <<< "${ips}")"
-      printf '%-4s %-40s %-6s %-8s %s\n' "${i}" "${domain}" "${type}" "${count}" "${joined:-解析失败，保留旧记录}"
+      if ips="$(ui_resolve_domain_addresses "${domain}" "${type}")"; then rc=0; else rc=$?; fi
+      count=0
+      if (( rc == 0 )); then
+        ips="$(LC_ALL=C sort -u <<< "${ips}")" || return 1
+        if [[ "${mode}" == SINGLE_IP ]]; then ips="$(sed -n '1p' <<< "${ips}")"; fi
+        count="$(sed '/^$/d' <<< "${ips}" | wc -l)"; joined="$(paste -sd ',' <<< "${ips}")"
+      elif (( rc == 2 )); then joined="无此类型记录"
+      else joined="解析失败，保留旧记录"; fi
+      printf '%-4s %-40s %-6s %-8s %s\n' "${i}" "${domain}" "${type}" "${count}" "${joined}"
     done <<< "${types}"
   done
 }
@@ -5646,7 +5701,7 @@ backup_existing() {
 
 store_installer_copy() {
   mkdir -p "${INSTALL_DIR}"
-  if [[ -f "$0" ]] && grep -q 'cfdns v3.0 installer' "$0" 2>/dev/null; then
+  if [[ -f "$0" ]] && grep -q 'cfdns v3.1 installer' "$0" 2>/dev/null; then
     if [[ -e "${INSTALL_COPY}" && "$0" -ef "${INSTALL_COPY}" ]]; then
       chmod 700 "${INSTALL_COPY}"
     else

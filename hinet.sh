@@ -773,7 +773,9 @@ write_runner() {
     mkdir -p -- "$(dirname "$RUNNER_PATH")" || { err "创建 worker 目录失败。"; return 1; }
     [[ ! -L "$RUNNER_PATH" ]] || { err "worker 路径不能是符号链接。"; return 1; }
     runner_tmp="$(mktemp "${RUNNER_PATH}.tmp.XXXXXX")" || { err "创建 worker 临时文件失败。"; return 1; }
-    if ! cat > "$runner_tmp" <<'EOF_RUNNER'
+    if ! cat > "$runner_tmp"; then
+        rm -f -- "$runner_tmp"; err "写入 worker 失败。"; return 1
+    fi <<'EOF_RUNNER'
 #!/usr/bin/env bash
 # hinet-gfw-changeip systemd worker
 # 这个 worker 不再回调主脚本 check-once，而是在 worker 内直接完成：
@@ -1347,7 +1349,6 @@ main_worker() (
 )
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main_worker; fi
 EOF_RUNNER
-    then rm -f -- "$runner_tmp"; err "写入 worker 失败。"; return 1; fi
     if ! bash -n "$runner_tmp" || ! chmod 755 "$runner_tmp" || ! mv -f -- "$runner_tmp" "$RUNNER_PATH"; then
         rm -f -- "$runner_tmp"; err "worker 语法校验/权限/安全替换失败。"; return 1
     fi
@@ -1363,7 +1364,9 @@ write_units() {
     timeout_start=$((POST_CHANGE_WAIT_SECONDS + GP_RESULT_WAIT_SECONDS + 6*CURL_TIMEOUT + 180))
     service_tmp="$(mktemp "${SERVICE_FILE}.tmp.XXXXXX")" || { err "创建 service 临时文件失败。"; return 1; }
     timer_tmp="$(mktemp "${TIMER_FILE}.tmp.XXXXXX")" || { rm -f -- "$service_tmp"; err "创建 timer 临时文件失败。"; return 1; }
-    if ! cat > "$service_tmp" <<EOF_SERVICE
+    if ! cat > "$service_tmp"; then
+        rm -f -- "$service_tmp" "$timer_tmp"; err "写入 service 临时文件失败。"; return 1
+    fi <<EOF_SERVICE
 [Unit]
 Description=HiNet GFW Auto Change IP - timer worker Globalping CN check
 Wants=network-online.target
@@ -1380,8 +1383,9 @@ UMask=0077
 StandardOutput=journal
 StandardError=journal
 EOF_SERVICE
-    then rm -f -- "$service_tmp" "$timer_tmp"; err "写入 service 临时文件失败。"; return 1; fi
-    if ! cat > "$timer_tmp" <<EOF_TIMER
+    if ! cat > "$timer_tmp"; then
+        rm -f -- "$service_tmp" "$timer_tmp"; err "写入 timer 临时文件失败。"; return 1
+    fi <<EOF_TIMER
 [Unit]
 Description=Run HiNet GFW Auto Change IP check every ${interval}s
 
@@ -1397,7 +1401,6 @@ Persistent=false
 [Install]
 WantedBy=timers.target
 EOF_TIMER
-    then rm -f -- "$service_tmp" "$timer_tmp"; err "写入 timer 临时文件失败。"; return 1; fi
     if ! chmod 644 "$service_tmp" "$timer_tmp" || ! write_runner; then
         rm -f -- "$service_tmp" "$timer_tmp"; err "systemd 单元准备失败。"; return 1
     fi
@@ -1858,6 +1861,7 @@ ${APP_VERSION}
 换 IP 返回码：0=确认变化，1=请求/业务失败，2=未确认，3=未发送，4=持久化失败。
 check-once/start/restart 会进入自动处理链路；不是无副作用测试命令。
 EOF_HELP
+    return $?
 }
 
 menu() {

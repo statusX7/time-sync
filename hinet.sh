@@ -1,17 +1,21 @@
 #!/usr/bin/env bash
 # ============================================================
-# hinet-gfw-changeip-v2.6.sh
+# hinet-gfw-changeip-v2.7.sh
 # HiNet 被墙检测 + Globalping 中国节点 ping 弱检测 + 双 API 自动换 IP
+# v2.7：支持 curl 流式执行后安装；部署后的 URL/响应完整显示；全量配置导入导出。
+# v2.7：导入先校验、备份和回读核对；可选择恢复定时器，不导入旧失败计数。
 # v2.6：修复配置覆盖，配置/状态安全解析与原子保存；统一请求、换 IP 证据和 Globalping 判定。
 # v2.6：修复 IPv4 局部变量污染、锁未释放及安装/systemd 失败仍显示成功。
 # v2.4：systemd timer 调用独立 worker，worker 内部直接完成 Globalping 检测、连续失败计数和自动换 IP，不再依赖主脚本 check-once 分发
 # 适合上传 GitHub：脚本本身不包含任何敏感信息，敏感 API 写入 /etc 配置文件
 # ============================================================
 
+# 启动封装仅解决流式输入的完整落盘，主体函数及独立 worker 架构保持。
+hinet_program() {
 set -u -o pipefail
 
 APP_NAME="hinet-gfw-changeip"
-APP_VERSION="hinet-gfw-changeip-v2.6"
+APP_VERSION="hinet-gfw-changeip-v2.7"
 INSTALL_PATH="/usr/local/bin/${APP_NAME}"
 CONF_DIR="/etc/${APP_NAME}"
 CONF_FILE="${CONF_DIR}/config.env"
@@ -90,14 +94,8 @@ normalize_choice() {
 
 quote_env() { printf '%q' "$1"; }
 
-mask_url() {
-    local s="${1:-}"
-    [[ -n "$s" ]] || { printf '未配置'; return 0; }
-    if is_domain "$s" || is_public_ipv4 "$s"; then
-        printf '%s' "$s"
-    else
-        printf '已配置（完整地址及认证参数隐藏）'
-    fi
+display_value() {
+    if [[ -n "${1:-}" ]]; then printf '%s' "$1"; else printf '未配置'; fi
 }
 
 install_packages() {
@@ -164,7 +162,10 @@ decode_env_value() {
                     next="${s:i:1}"
                     # 保留旧 %q ANSI-C 编码；拒绝会截断输出的 \c。
                     [[ "$next" != c ]] || return 1
-                    esc+="\\$next"
+                    case "$next" in
+                        "'"|'"'|'?') esc+="$next" ;;
+                        *) esc+="\\$next" ;;
+                    esac
                 else esc+="$ch"; fi ;;
         esac
         i=$((i+1))
@@ -382,7 +383,7 @@ shorten() {
 # 返回 0=传输成功且 HTTP 2xx；非 0=失败。错误信息绝不并入正文。
 # HTTP_SENT 只在 curl 报告实际 HTTP 请求字节时置 1；TLS/DNS 失败不视为已发出 API。
 http_request() {
-    local url="$1" timeout="$2" payload="${3:-}" redirects="${4:-1}" dir meta rc escaped
+    local url="$1" timeout="$2" payload="${3:-}" redirects="${4:-1}" dir meta rc escaped curl_error=""
     HTTP_BODY=""; HTTP_CODE=000; HTTP_CURL_RC=0; HTTP_SENT=0; HTTP_STARTED_AT=0
     is_http_url "$url" && number_in_range "$timeout" 1 180 || { log "❌ HTTP 请求参数无效，未发送。"; return 3; }
     has_cmd curl || { log "❌ curl 不存在，未发送。"; return 3; }
@@ -396,6 +397,7 @@ http_request() {
     [[ -n "$payload" ]] && args+=(-H 'Content-Type: application/json' --data "$payload")
     HTTP_STARTED_AT="$(now_epoch)"
     number_in_range "$HTTP_STARTED_AT" 0 253402300799 || { rm -rf -- "$dir"; log "❌ 读取系统时间失败，未发送。"; return 3; }
+    log "🌐 HTTP 请求地址：${url}"
     meta="$(curl "${args[@]}" 2>"$dir/error")"; rc=$?
     HTTP_CURL_RC="$rc"
     local sent_bytes=0
@@ -405,6 +407,11 @@ http_request() {
     case "$rc" in 3|5|6|7|35|51|58|60|77|83|127) HTTP_SENT=0 ;; esac
     if [[ -f "$dir/body" ]]; then HTTP_BODY="$(cat -- "$dir/body")" || rc=23; fi
     HTTP_CURL_RC="$rc"
+    if [[ -f "$dir/error" ]]; then curl_error="$(cat -- "$dir/error")" || curl_error="无法读取 curl 错误输出"; fi
+    [[ -z "$curl_error" ]] || log "🧾 curl 错误输出（完整）：${curl_error}"
+    if [[ "$url" != "${GLOBALPING_API_BASE}/"* ]] || (( rc != 0 )) || [[ ! "$HTTP_CODE" =~ ^2[0-9]{2}$ ]]; then
+        log "🧾 HTTP 响应正文（完整）：${HTTP_BODY}"
+    fi
     rm -rf -- "$dir" || { log "⚠️ HTTP 临时文件清理失败。"; return 1; }
     if (( rc != 0 )) || [[ ! "$HTTP_CODE" =~ ^2[0-9]{2}$ ]]; then
         log "❌ HTTP 请求失败：curl_rc=${rc}，HTTP=${HTTP_CODE}；未把错误正文作为成功结果。"
@@ -464,7 +471,7 @@ vendor_summary() {
     local kind ip
     kind="$(vendor_response_kind "${1:-}")"
     ip="$(response_public_ipv4 "${1:-}" 2>/dev/null || true)"
-    printf '业务判定=%s，明确IP字段=%s（其余正文隐藏，防止泄露认证信息）' "$kind" "${ip:-无}"
+    printf '业务判定=%s，明确IP字段=%s\n返回正文（完整）：%s' "$kind" "${ip:-无}" "${1:-}"
 }
 
 curl_get() {
@@ -514,7 +521,7 @@ show_current_ip() {
     cecho "----------------------------------------"
     api_ip="$(get_current_ip_from_api 2>/dev/null || true)"
     ddns_ip="$(resolve_target_ip 2>/dev/null || true)"
-    cecho "获取 IP API：$(mask_url "$SHOW_IP_API_URL")"
+    cecho "获取 IP API：$(display_value "$SHOW_IP_API_URL")"
     cecho "API 当前 IP：${api_ip:-获取失败}"
     cecho "检测目标：${CHECK_TARGET}"
     cecho "DDNS 解析 IP：${ddns_ip:-解析失败}"
@@ -694,7 +701,7 @@ test_show_ip_api() {
     local ip
     cecho "🔎 获取当前 IP API / 域名测试"
     cecho "----------------------------------------"
-    cecho "来源：$(mask_url "$SHOW_IP_API_URL")"
+    cecho "来源：$(display_value "$SHOW_IP_API_URL")"
     if ip="$(get_current_ip_from_api)"; then ok "提取公网 IP：${ip}"; else err "没有取得可靠的公网 IPv4。"; return 1; fi
 }
 
@@ -719,6 +726,10 @@ check_once() (
     if ! load_config || ! validate_runtime_config; then log "❌ 配置无效，本轮未检测。"; return 1; fi
     load_status || return 1
     local resolved_ip rc change_rc
+    if [[ -n "$LAST_TARGET" && "$LAST_TARGET" != "$CHECK_TARGET" ]]; then
+        FAILURE_COUNT=0
+        log "ℹ️ 检测目标已变更，旧目标失败计数不计入新目标。"
+    fi
     resolved_ip="$(resolve_target_ip 2>/dev/null || true)"
     LAST_CHECK_EPOCH="$(now_epoch)"; LAST_TARGET="$CHECK_TARGET"; LAST_RESOLVED_IP="$resolved_ip"
     save_status || return 1
@@ -770,7 +781,7 @@ write_runner() {
 set +e
 set -u -o pipefail
 APP_NAME="hinet-gfw-changeip"
-APP_VERSION="hinet-gfw-changeip-v2.6-worker"
+APP_VERSION="hinet-gfw-changeip-v2.7-worker"
 CONF_FILE="/etc/hinet-gfw-changeip/config.env"
 STATE_DIR="/var/lib/hinet-gfw-changeip"
 LOG_DIR="/var/log/hinet-gfw-changeip"
@@ -860,7 +871,10 @@ decode_env_value() {
                     next="${s:i:1}"
                     # 保留旧 %q ANSI-C 编码；拒绝会截断输出的 \c。
                     [[ "$next" != c ]] || return 1
-                    esc+="\\$next"
+                    case "$next" in
+                        "'"|'"'|'?') esc+="$next" ;;
+                        *) esc+="\\$next" ;;
+                    esac
                 else esc+="$ch"; fi ;;
         esac
         i=$((i+1))
@@ -1024,7 +1038,7 @@ extract_public_ipv4() {
 # 返回 0=传输成功且 HTTP 2xx；非 0=失败。错误信息绝不并入正文。
 # HTTP_SENT 只在 curl 报告实际 HTTP 请求字节时置 1；TLS/DNS 失败不视为已发出 API。
 http_request() {
-    local url="$1" timeout="$2" payload="${3:-}" redirects="${4:-1}" dir meta rc escaped
+    local url="$1" timeout="$2" payload="${3:-}" redirects="${4:-1}" dir meta rc escaped curl_error=""
     HTTP_BODY=""; HTTP_CODE=000; HTTP_CURL_RC=0; HTTP_SENT=0; HTTP_STARTED_AT=0
     is_http_url "$url" && number_in_range "$timeout" 1 180 || { wlog "❌ HTTP 请求参数无效，未发送。"; return 3; }
     has_cmd curl || { wlog "❌ curl 不存在，未发送。"; return 3; }
@@ -1038,6 +1052,7 @@ http_request() {
     [[ -n "$payload" ]] && args+=(-H 'Content-Type: application/json' --data "$payload")
     HTTP_STARTED_AT="$(now_epoch)"
     number_in_range "$HTTP_STARTED_AT" 0 253402300799 || { rm -rf -- "$dir"; wlog "❌ 读取系统时间失败，未发送。"; return 3; }
+    wlog "🌐 HTTP 请求地址：${url}"
     meta="$(curl "${args[@]}" 2>"$dir/error")"; rc=$?
     HTTP_CURL_RC="$rc"
     local sent_bytes=0
@@ -1047,6 +1062,11 @@ http_request() {
     case "$rc" in 3|5|6|7|35|51|58|60|77|83|127) HTTP_SENT=0 ;; esac
     if [[ -f "$dir/body" ]]; then HTTP_BODY="$(cat -- "$dir/body")" || rc=23; fi
     HTTP_CURL_RC="$rc"
+    if [[ -f "$dir/error" ]]; then curl_error="$(cat -- "$dir/error")" || curl_error="无法读取 curl 错误输出"; fi
+    [[ -z "$curl_error" ]] || wlog "🧾 curl 错误输出（完整）：${curl_error}"
+    if [[ "$url" != "${GLOBALPING_API_BASE}/"* ]] || (( rc != 0 )) || [[ ! "$HTTP_CODE" =~ ^2[0-9]{2}$ ]]; then
+        wlog "🧾 HTTP 响应正文（完整）：${HTTP_BODY}"
+    fi
     rm -rf -- "$dir" || { wlog "⚠️ HTTP 临时文件清理失败。"; return 1; }
     if (( rc != 0 )) || [[ ! "$HTTP_CODE" =~ ^2[0-9]{2}$ ]]; then
         wlog "❌ HTTP 请求失败：curl_rc=${rc}，HTTP=${HTTP_CODE}；未把错误正文作为成功结果。"
@@ -1106,7 +1126,7 @@ vendor_summary() {
     local kind ip
     kind="$(vendor_response_kind "${1:-}")"
     ip="$(response_public_ipv4 "${1:-}" 2>/dev/null || true)"
-    printf '业务判定=%s，明确IP字段=%s（其余正文隐藏，防止泄露认证信息）' "$kind" "${ip:-无}"
+    printf '业务判定=%s，明确IP字段=%s\n返回正文（完整）：%s' "$kind" "${ip:-无}" "${1:-}"
 }
 
 curl_get() {
@@ -1285,6 +1305,10 @@ main_worker() (
     if ! load_config || ! validate_runtime_config; then wlog "❌ 配置无效，本轮未检测。"; return 1; fi
     load_status || return 1
     local resolved_ip rc change_rc
+    if [[ -n "$LAST_TARGET" && "$LAST_TARGET" != "$CHECK_TARGET" ]]; then
+        FAILURE_COUNT=0
+        wlog "ℹ️ 检测目标已变更，旧目标失败计数不计入新目标。"
+    fi
     resolved_ip="$(resolve_target_ip 2>/dev/null || true)"
     LAST_CHECK_EPOCH="$(now_epoch)"; LAST_TARGET="$CHECK_TARGET"; LAST_RESOLVED_IP="$resolved_ip"
     save_status || return 1
@@ -1389,7 +1413,7 @@ install_self() {
     install_packages || { err "依赖安装失败。"; return 1; }
     mkdirs || { err "创建目录或设置权限失败。"; return 1; }
     local src="${BASH_SOURCE[0]}" tmp backup
-    [[ -f "$src" && -s "$src" ]] || { err "请先下载完整 .sh 文件后执行；不能从已消费的 /dev/fd 流复制安装。"; return 1; }
+    [[ -f "$src" && -s "$src" ]] || { err "完整源码暂存文件不可读，未安装；请重新运行本版脚本。"; return 1; }
     bash -n "$src" || { err "源脚本语法检查失败，未安装。"; return 1; }
     [[ ! -L "$INSTALL_PATH" ]] || { err "安装路径不能是符号链接。"; return 1; }
     if [[ ! "$src" -ef "$INSTALL_PATH" ]]; then
@@ -1451,20 +1475,20 @@ service_status() {
     systemctl --no-pager --full status "${APP_NAME}.service" || true
     cecho ""
     cecho "📌 当前配置："
-    cecho "  检测目标：$(mask_url "${CHECK_TARGET:-}")"
+    cecho "  检测目标：$(display_value "${CHECK_TARGET:-}")"
     cecho "  检测间隔：${CHECK_INTERVAL:-未配置}s"
     cecho "  中国节点：${CN_PROBES:-未配置} 个"
     cecho "  失败阈值：${FAIL_THRESHOLD:-未配置} 次"
     cecho "  冷却时间：${COOLDOWN_SECONDS:-未配置}s"
     cecho "  换 IP 后等待：${POST_CHANGE_WAIT_SECONDS:-未配置}s"
-    cecho "  DNS 解析器：$(mask_url "${DNS_RESOLVER:-}")"
+    cecho "  DNS 解析器：$(display_value "${DNS_RESOLVER:-}")"
     cecho "  API 最小间隔：${MIN_API_INTERVAL:-未配置}s"
     cecho "  Worker：${RUNNER_PATH}"
-    cecho "  获取 IP API：$(mask_url "${SHOW_IP_API_URL:-}")"
-    cecho "  更换 IP API：$(mask_url "${CHANGE_IP_API_URL:-}")"
+    cecho "  获取 IP API：$(display_value "${SHOW_IP_API_URL:-}")"
+    cecho "  更换 IP API：$(display_value "${CHANGE_IP_API_URL:-}")"
     cecho ""
     cecho "📊 最近状态："
-    cecho "  LAST_TARGET=$(mask_url "${LAST_TARGET:-}")"
+    cecho "  LAST_TARGET=$(display_value "${LAST_TARGET:-}")"
     cecho "  LAST_RESOLVED_IP=${LAST_RESOLVED_IP:-unknown}"
     cecho "  LAST_RESULT=${LAST_RESULT:-unknown}"
     cecho "  LAST_MEASUREMENT_ID=${LAST_MEASUREMENT_ID:-unknown}"
@@ -1499,6 +1523,8 @@ read_config_field() {
 # 与检测共用短生命周期锁；提示输入期间不持锁、不复制脚本、不写 unit。
 apply_config_changes() (
     validate_runtime_config || return 1
+    install_packages || { err "依赖准备失败，配置未保存。"; return 1; }
+    [[ -f "${BASH_SOURCE[0]}" && -s "${BASH_SOURCE[0]}" ]] && bash -n "${BASH_SOURCE[0]}" || { err "完整源码不可读或语法错误，配置未保存。"; return 1; }
     exec 8>"$CHANGE_LOCK_FILE" || { err "无法打开配置更新锁。"; return 1; }
     flock -w 10 8 || { err "检测/换 IP 正在运行，本次未保存，请结束后重试。"; return 1; }
     save_config || return 1
@@ -1517,9 +1543,9 @@ quick_init() {
     cecho "🚀 ${APP_VERSION} 快速初始化"
     cecho "----------------------------------------"
     warn "直接回车保留已有值；首次配置使用默认参数。初始化不会测试更换 IP API。"
-    read_config_field SHOW_IP_API_URL "🔎 获取当前 IP API / 域名 [$(mask_url "$SHOW_IP_API_URL")]：" || return 1
-    read_config_field CHANGE_IP_API_URL "🔁 真正更换 IP API [$(mask_url "$CHANGE_IP_API_URL")]：" || return 1
-    read_config_field CHECK_TARGET "🎯 检测目标域名/IP [$(mask_url "$CHECK_TARGET")]：" || return 1
+    read_config_field SHOW_IP_API_URL "🔎 获取当前 IP API / 域名 [$(display_value "$SHOW_IP_API_URL")]：" || return 1
+    read_config_field CHANGE_IP_API_URL "🔁 真正更换 IP API [$(display_value "$CHANGE_IP_API_URL")]：" || return 1
+    read_config_field CHECK_TARGET "🎯 检测目标域名/IP [$(display_value "$CHECK_TARGET")]：" || return 1
     read_config_field CHECK_INTERVAL "⏱️ 检测间隔秒 [${CHECK_INTERVAL}]：" 30 3600 || return 1
     read_config_field CN_PROBES "🇨🇳 中国节点数量 [${CN_PROBES}]：" 1 50 || return 1
     read_config_field FAIL_THRESHOLD "🚨 失败阈值 [${FAIL_THRESHOLD}]：" 1 30 || return 1
@@ -1528,7 +1554,7 @@ quick_init() {
     read_config_field COOLDOWN_SECONDS "🧊 冷却秒数 [${COOLDOWN_SECONDS}]：" 0 86400 || return 1
     read_config_field CURL_TIMEOUT "🌐 curl 超时秒数 [${CURL_TIMEOUT}]：" 5 180 || return 1
     read_config_field POST_CHANGE_WAIT_SECONDS "⏳ 换 IP 后等待秒数 [${POST_CHANGE_WAIT_SECONDS}]：" 0 1800 || return 1
-    read_config_field DNS_RESOLVER "🧭 DNS 服务器 [$(mask_url "$DNS_RESOLVER")]：" || return 1
+    read_config_field DNS_RESOLVER "🧭 DNS 服务器 [$(display_value "$DNS_RESOLVER")]：" || return 1
     read_config_field MIN_API_INTERVAL "🛡️ 更换 API 最小间隔秒 [${MIN_API_INTERVAL}]：" 0 3600 || return 1
     warn_if_showip_action "$CHANGE_IP_API_URL"
     apply_config_changes || return 1
@@ -1546,9 +1572,9 @@ edit_config() {
     load_config || return 1
     cecho "🛠️ 修改已有配置：直接回车保留原值"
     cecho "----------------------------------------"
-    read_config_field SHOW_IP_API_URL "🔎 获取当前 IP API / 域名 [$(mask_url "$SHOW_IP_API_URL")]：" || return 1
-    read_config_field CHANGE_IP_API_URL "🔁 真正更换 IP API [$(mask_url "$CHANGE_IP_API_URL")]：" || return 1
-    read_config_field CHECK_TARGET "🎯 检测目标域名/IP [$(mask_url "$CHECK_TARGET")]：" || return 1
+    read_config_field SHOW_IP_API_URL "🔎 获取当前 IP API / 域名 [$(display_value "$SHOW_IP_API_URL")]：" || return 1
+    read_config_field CHANGE_IP_API_URL "🔁 真正更换 IP API [$(display_value "$CHANGE_IP_API_URL")]：" || return 1
+    read_config_field CHECK_TARGET "🎯 检测目标域名/IP [$(display_value "$CHECK_TARGET")]：" || return 1
     read_config_field CHECK_INTERVAL "⏱️ 检测间隔秒 [${CHECK_INTERVAL}]：" 30 3600 || return 1
     read_config_field CN_PROBES "🇨🇳 中国节点数量 [${CN_PROBES}]：" 1 50 || return 1
     read_config_field FAIL_THRESHOLD "🚨 失败阈值 [${FAIL_THRESHOLD}]：" 1 30 || return 1
@@ -1557,13 +1583,162 @@ edit_config() {
     read_config_field COOLDOWN_SECONDS "🧊 冷却秒数 [${COOLDOWN_SECONDS}]：" 0 86400 || return 1
     read_config_field CURL_TIMEOUT "🌐 curl 超时秒数 [${CURL_TIMEOUT}]：" 5 180 || return 1
     read_config_field POST_CHANGE_WAIT_SECONDS "⏳ 换 IP 后等待秒数 [${POST_CHANGE_WAIT_SECONDS}]：" 0 1800 || return 1
-    read_config_field DNS_RESOLVER "🧭 DNS 服务器 [$(mask_url "$DNS_RESOLVER")]：" || return 1
+    read_config_field DNS_RESOLVER "🧭 DNS 服务器 [$(display_value "$DNS_RESOLVER")]：" || return 1
     read_config_field MIN_API_INTERVAL "🛡️ 更换 API 最小间隔秒 [${MIN_API_INTERVAL}]：" 0 3600 || return 1
     warn_if_showip_action "$CHANGE_IP_API_URL"
     if [[ "$SHOW_IP_API_URL" == "$CHANGE_IP_API_URL" ]]; then warn "获取与更换 IP API 完全相同，请核对用途。"; fi
     apply_config_changes || return 1
     ok "配置已更新，已重新读取核对，systemd 更新已完成。"
 }
+
+
+# -----------------------------
+# 全量配置迁移：只迁移 CONFIG_KEYS，不执行导入文件，不携带运行状态/日志。
+# -----------------------------
+validate_import_file() {
+    local file="$1" line key bytes
+    local -A present=()
+    [[ -f "$file" && -r "$file" && ! -L "$file" ]] || { err "导入文件不存在、不可读或是符号链接：${file}"; return 1; }
+    bytes="$(wc -c < "$file")" || return 1
+    bytes="${bytes//[[:space:]]/}"
+    number_in_range "$bytes" 1 1048576 || { err "导入文件须为 1 字节至 1 MiB 的完整配置。"; return 1; }
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%$'\r'}"
+        [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
+        [[ "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || { err "导入文件有非 KEY=value 内容，未执行也未保存。"; return 1; }
+        key="${BASH_REMATCH[1]}"
+        case " ${CONFIG_KEYS[*]} " in
+            *" ${key} "*) ;;
+            *) err "导入文件包含未知字段 ${key}；请使用本脚本导出的全量配置。"; return 1 ;;
+        esac
+        [[ ! ${present[$key]+yes} ]] || { err "导入文件字段重复：${key}"; return 1; }
+        present["$key"]=1
+    done < "$file" || return 1
+    for key in "${CONFIG_KEYS[@]}"; do
+        [[ ${present[$key]+yes} ]] || { err "导入文件不完整，缺少 ${key}；不会用默认值替代。"; return 1; }
+    done
+    # CONF_FILE 仅在本函数动态作用域内改变，解码后的字段交给调用者。
+    local CONF_FILE="$file"
+    load_config && validate_runtime_config
+}
+
+export_config() (
+    require_root
+    local dest="${1:-}" tmp expected actual dir
+    if [[ -z "$dest" ]]; then
+        dest="${HOME:-/root}/${APP_NAME}-config-$(date +%Y%m%d-%H%M%S)-${BASHPID}.env"
+    fi
+    load_config && validate_runtime_config || return 1
+    [[ ! -e "$dest" && ! -L "$dest" ]] || { err "导出目标已存在，不覆盖：${dest}"; return 1; }
+    dir="$(dirname -- "$dest")"
+    [[ -d "$dir" ]] || { err "导出目录不存在：${dir}"; return 1; }
+    tmp="$(mktemp "${dir}/.hinet-export.XXXXXX")" || { err "创建导出临时文件失败。"; return 1; }
+    trap 'rm -f -- "$tmp"' EXIT
+    expected="$(config_snapshot)" || return 1
+    if ! {
+        printf '# %s 全量配置导出\n# 格式：兼容 config.env；完整明文，不包含运行状态和日志。\n' "$APP_VERSION"
+        config_snapshot
+    } > "$tmp" || ! chmod 600 "$tmp"; then err "写入导出文件失败。"; return 1; fi
+    actual="$(validate_import_file "$tmp" && config_snapshot)" || { err "导出回读校验失败。"; return 1; }
+    [[ "$actual" == "$expected" ]] || { err "导出逐字段校验不一致。"; return 1; }
+    # 同目录硬链接原子发布：目标已存在时失败，不会覆盖另一份备份。
+    ln -- "$tmp" "$dest" || { err "发布导出文件失败，未覆盖原文件。"; return 1; }
+    rm -f -- "$tmp" || { err "导出已生成，但临时文件清理失败：${tmp}"; return 1; }
+    trap - EXIT
+    ok "全量配置已导出并核对：${dest}"
+    info "全部 ${#CONFIG_KEYS[@]} 个字段包含完整 API/认证参数；权限 600。"
+    info "请把此文件保存到其它机器；它是明文备份，不要提交到公开 GitHub。"
+)
+
+export_config_menu() {
+    local dest
+    IFS= read -r -p "📤 导出文件路径（回车使用家目录下自动命名文件）：" dest || return 0
+    export_config "$dest"
+}
+
+import_config() (
+    require_root
+    local source_file="${1:-}" flag mode=ask yes=0 choice stage_dir stage snapshot actual
+    local unit load_state status_backup="" tmp
+    [[ $# -gt 0 ]] && shift
+    for flag in "$@"; do
+        case "$flag" in
+            --start) mode=start ;;
+            --no-start) mode=stopped ;;
+            --yes) yes=1 ;;
+            *) err "未知导入参数：${flag}"; return 64 ;;
+        esac
+    done
+    if [[ -z "$source_file" ]]; then
+        IFS= read -r -p "📥 请输入完整配置备份文件路径：" source_file || return 0
+    fi
+    [[ -n "$source_file" ]] || { warn "未选择文件。"; return 0; }
+    # 先固定导入文件快照，防止预览/确认期间原文件发生变化。
+    [[ -f "$source_file" && -r "$source_file" && ! -L "$source_file" ]] || { err "配置备份文件不可读：${source_file}"; return 1; }
+    stage_dir="$(mktemp -d)" || { err "创建导入临时目录失败。"; return 1; }
+    trap 'rm -rf -- "$stage_dir"' EXIT
+    chmod 700 "$stage_dir" || return 1
+    stage="${stage_dir}/config.env"
+    cp -- "$source_file" "$stage" && chmod 600 "$stage" || { err "读取导入文件失败。"; return 1; }
+    validate_import_file "$stage" || return 1
+    snapshot="$(config_snapshot)" || return 1
+    cecho "📥 待导入的完整配置：${source_file}"
+    (CONF_FILE="$stage"; show_config) || return 1
+    warn "导入将备份并替换配置、安装本版程序和定时器；失败计数重置，日志/历史保留。"
+    if (( yes == 0 )); then
+        if [[ "$mode" == ask ]]; then
+            IFS= read -r -p "输入 1 导入并启动自动检测；2 仅导入暂不启动；回车取消：" choice || return 0
+            choice="$(normalize_choice "$choice")"
+            case "$choice" in 1) mode=start ;; 2) mode=stopped ;; *) warn "已取消。"; return 0 ;; esac
+        else
+            [[ "$mode" == start ]] && warn "本次将启动自动检测，满足失败阈值后会真实换 IP。"
+            IFS= read -r -p "输入 1 确认导入，其它取消：" choice || return 0
+            [[ "$(normalize_choice "$choice")" == 1 ]] || { warn "已取消。"; return 0; }
+        fi
+    elif [[ "$mode" == ask ]]; then
+        mode=stopped
+    fi
+    has_cmd systemctl || { err "缺少 systemctl，未导入。"; return 1; }
+    install_packages || { err "依赖安装失败，未导入。"; return 1; }
+    [[ -f "${BASH_SOURCE[0]}" && -s "${BASH_SOURCE[0]}" ]] && bash -n "${BASH_SOURCE[0]}" || { err "本版完整源码校验失败，未导入。"; return 1; }
+    mkdirs || { err "准备目录失败，未导入。"; return 1; }
+    exec 8>"$CHANGE_LOCK_FILE" || { err "无法打开迁移锁，未导入。"; return 1; }
+    flock -w 10 8 || { err "检测/换 IP 正在进行，未覆盖配置；请稍后重试。"; return 1; }
+    # 持锁后不会终止正在发出商家请求的 worker。导入失败也不自动恢复任务。
+    for unit in "${APP_NAME}.timer" "${APP_NAME}.service"; do
+        load_state="$(systemctl show -p LoadState --value "$unit")" || { err "读取 ${unit} 状态失败，未导入。"; return 1; }
+        case "$load_state" in
+            not-found) continue ;;
+            loaded|masked|error|bad-setting) ;;
+            *) err "无法确认 ${unit} 的 LoadState=${load_state}，未导入。"; return 1 ;;
+        esac
+        if [[ "$unit" == *.timer ]]; then
+            systemctl disable --now "$unit" || { err "停止并禁用旧 timer 失败，未导入。"; return 1; }
+        else
+            systemctl stop "$unit" || { err "停止旧 service 失败，未导入；timer 可能已停止。"; return 1; }
+        fi
+    done
+    load_status || { err "旧状态文件无效，未替换配置；自动任务保持停止。"; return 1; }
+    status_backup="${STATUS_FILE}.bak.$(date +%Y%m%d%H%M%S).${BASHPID}"
+    cp -p -- "$STATUS_FILE" "$status_backup" && chmod 600 "$status_backup" || { err "备份旧状态失败，未替换配置。"; return 1; }
+    save_config || { err "配置导入保存/回读失败；自动任务保持停止。"; return 1; }
+    actual="$(config_snapshot)" || return 1
+    [[ "$actual" == "$snapshot" ]] || { err "导入结果不一致；自动任务保持停止。"; return 1; }
+    # 不迁移远端状态。保留本机实际调用/成功时间，防止同机恢复绕过最小间隔。
+    FAILURE_COUNT=0; LAST_CHECK_EPOCH=0; LAST_TARGET=""; LAST_RESOLVED_IP=""
+    LAST_RESULT="config_imported"; LAST_MEASUREMENT_ID=""
+    save_status || { err "配置已导入，但重置失败计数失败；自动任务保持停止。"; return 1; }
+    install_self || { err "配置已导入，但安装/systemd 应用失败；自动任务保持停止。"; return 1; }
+    exec 8>&-
+    ok "全量配置已导入、回读核对并安装：${CONF_FILE}"
+    if [[ "$mode" == start ]]; then
+        systemctl enable --now "${APP_NAME}.timer" || { err "导入完成，但启用 timer 失败。"; return 1; }
+        systemctl start "${APP_NAME}.service" || { err "导入完成且 timer 已启用，但首次检测失败；请查看中文日志。"; return 1; }
+        ok "自动检测已启动并设置开机自启。"
+    else
+        info "自动检测未启动；确认配置后执行：${APP_NAME} start"
+    fi
+)
 
 view_logs() {
     require_root
@@ -1586,14 +1761,14 @@ view_journal_logs() {
     journalctl -u "${APP_NAME}.service" -u "${APP_NAME}.timer" -n 120 -f -o cat || true
 }
 
-show_config_masked() {
+show_config() {
     require_root
     load_config || return 1
-    cecho "🔐 当前脱敏配置"
+    cecho "🔐 当前完整配置"
     cecho "----------------------------------------"
-    cecho "获取 IP API：$(mask_url "$SHOW_IP_API_URL")"
-    cecho "更换 IP API：$(mask_url "$CHANGE_IP_API_URL")"
-    cecho "检测目标：$(mask_url "${CHECK_TARGET:-}")"
+    cecho "获取 IP API：$(display_value "$SHOW_IP_API_URL")"
+    cecho "更换 IP API：$(display_value "$CHANGE_IP_API_URL")"
+    cecho "检测目标：$(display_value "${CHECK_TARGET:-}")"
     cecho "检测间隔：${CHECK_INTERVAL}s"
     cecho "中国节点：${CN_PROBES}"
     cecho "失败阈值：${FAIL_THRESHOLD}"
@@ -1602,7 +1777,7 @@ show_config_masked() {
     cecho "冷却：${COOLDOWN_SECONDS}s"
     cecho "curl 超时：${CURL_TIMEOUT}s"
     cecho "换 IP 后等待：${POST_CHANGE_WAIT_SECONDS}s"
-    cecho "DNS 服务器：$(mask_url "${DNS_RESOLVER:-}")"
+    cecho "DNS 服务器：$(display_value "${DNS_RESOLVER:-}")"
     cecho "API 最小间隔：${MIN_API_INTERVAL}s"
 }
 
@@ -1671,6 +1846,14 @@ ${APP_VERSION}
   ${APP_NAME} test-show-api           只测试获取当前 IP
   ${APP_NAME} test-api                真实调用更换 IP（需数字确认）
   ${APP_NAME} version                 显示版本
+  ${APP_NAME} export-config [文件]    导出全部 13 个字段（完整明文）
+  ${APP_NAME} import-config 文件      导入全量配置，数字选择是否启动
+  ${APP_NAME} import-config 文件 --yes --no-start  无交互导入，不启动
+  ${APP_NAME} import-config 文件 --yes --start     无交互导入并启动
+
+本地文件、bash <(curl -fsSL URL)、curl -fsSL URL | bash 均支持。
+管道模式的交互输入来自 /dev/tty；无终端时使用带参数的非交互命令。
+备份仅含配置，不包含旧失败计数、冷却状态、日志或 HiNet 端 DDNS 程序。
 
 换 IP 返回码：0=确认变化，1=请求/业务失败，2=未确认，3=未发送，4=持久化失败。
 check-once/start/restart 会进入自动处理链路；不是无副作用测试命令。
@@ -1693,17 +1876,19 @@ menu() {
         cecho "  9. 📜 查看最近三天 IP 更换记录"
         cecho " 10. 🗓️  查看最近一个月 IP 更换记录"
         cecho " 11. 🧾 查看中文实时日志"
-        cecho " 12. 🔐 查看脱敏配置"
+        cecho " 12. 🔐 查看完整配置"
         cecho " 13. 🛠️  修改已有配置"
         cecho " 14. 🔎 手动测试获取当前 IP API（安全）"
         cecho " 15. 🧪 手动测试更换 IP API（可能换 IP，不写正式记录）"
         cecho " 16. 🗑️  卸载脚本"
         cecho " 17. 🩺 脚本自检"
         cecho " 18. 🧾 查看 systemd journal 原始日志"
+        cecho " 19. 📤 导出全量配置（含完整 API）"
+        cecho " 20. 📥 导入全量配置 / 恢复部署"
         cecho "  0. 🚪 退出"
         cecho "========================================"
         local choice
-        IFS= read -r -p "请输入选项 [0-18]：" choice || return 0
+        IFS= read -r -p "请输入选项 [0-20]：" choice || return 0
         choice="$(normalize_choice "$choice")"
         case "$choice" in
             1|init) quick_init ;;
@@ -1717,13 +1902,15 @@ menu() {
             9) history_recent 3 ;;
             10) history_recent 30 ;;
             11|logs|log) view_logs ;;
-            12|config) show_config_masked ;;
+            12|config) show_config ;;
             13|edit|edit-config) edit_config ;;
             14|test-show|test-show-api) test_show_ip_api ;;
             15|test-api|test-change-api) test_vendor_api ;;
             16|uninstall) uninstall_script ;;
             17|doctor) doctor ;;
             18|journal) view_journal_logs ;;
+            19|export|export-config) export_config_menu ;;
+            20|import|import-config) import_config ;;
             0|exit|quit|q) exit 0 ;;
             *) warn "无效输入，请重新输入。" ;;
         esac
@@ -1745,8 +1932,10 @@ main() {
         show|show-ip|6) show_current_ip ;;
         logs|log|11) view_logs ;;
         journal|18) view_journal_logs ;;
+        export|export-config|19) export_config "${2:-}" ;;
+        import|import-config|20) shift; import_config "$@" ;;
         edit|edit-config|13) edit_config ;;
-        config|show-config|12) show_config_masked ;;
+        config|show-config|12) show_config ;;
         test-show-api|test-show|14) test_show_ip_api ;;
         test-api|test-change-api|15) test_vendor_api ;;
         history3|9) history_recent 3 ;;
@@ -1760,4 +1949,53 @@ main() {
     esac
 }
 
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi
+if [[ "${1:-}" != __hinet_definitions__ ]]; then main "$@"; fi
+
+}
+
+# 完整解析主函数后再进入本启动器：/dev/fd、stdin、bash -c 不再回读已消费的流。
+# declare -f 只写出本文件的两个静态函数，不复制运行中的 API/配置变量。
+hinet_launch() (
+    local __hinet_src="${BASH_SOURCE[0]:-}" __hinet_dir="" __hinet_stage="" __hinet_tty __hinet_rc
+    if [[ "$-" != *s* && -z "${BASH_EXECUTION_STRING:-}" && -n "$__hinet_src" && -f "$__hinet_src" && -s "$__hinet_src" ]]; then
+        hinet_program "$@"
+        exit $?
+    fi
+    __hinet_dir="$(mktemp -d)" || { printf '❌ 无法创建完整源码暂存目录。\n' >&2; exit 1; }
+    trap 'rm -rf -- "$__hinet_dir"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
+    chmod 700 "$__hinet_dir" || exit 1
+    __hinet_stage="${__hinet_dir}/hinet-gfw-changeip.sh"
+    if ! {
+        printf '#!/usr/bin/env bash\n# hinet-gfw-changeip-v2.7；由完整静态函数生成的本地安装源。\n'
+        declare -f hinet_program hinet_launch
+        printf '%s\n' 'if [[ -n "${BASH_SOURCE[0]:-}" && "${BASH_SOURCE[0]}" != "$0" ]]; then hinet_program __hinet_definitions__; else hinet_launch "$@"; fi'
+    } > "$__hinet_stage" || ! chmod 700 "$__hinet_stage" || ! bash -n "$__hinet_stage"; then
+        printf '❌ 完整源码暂存/语法校验失败，没有安装或修改配置。\n' >&2; exit 1
+    fi
+    # curl | bash 的 stdin 是源码流；不能把它当菜单输入，也不能读入剩余脚本文本。
+    # bash <(curl) / bash -c 则保留原有 stdin，包括自动化传入的回答。
+    if [[ "$-" == *s* && -z "${BASH_EXECUTION_STRING:-}" ]]; then
+        if { exec {__hinet_tty}</dev/tty; } 2>/dev/null; then
+            bash "$__hinet_stage" "$@" <&"$__hinet_tty"; __hinet_rc=$?
+            exec {__hinet_tty}<&-
+        else
+            case "${1:-menu}" in
+                menu|init|edit|edit-config|13|test-api|test-change-api|15|uninstall|16)
+                    printf '❌ 当前管道没有交互终端。请在 SSH 终端运行，或改用先下载文件再 bash 执行的一行命令。\n' >&2; exit 1 ;;
+            esac
+            bash "$__hinet_stage" "$@" </dev/null; __hinet_rc=$?
+        fi
+    else
+        bash "$__hinet_stage" "$@"; __hinet_rc=$?
+    fi
+    exit "$__hinet_rc"
+)
+
+if [[ -n "${BASH_SOURCE[0]:-}" && "${BASH_SOURCE[0]}" != "$0" ]]; then
+    hinet_program __hinet_definitions__
+else
+    hinet_launch "$@"
+fi

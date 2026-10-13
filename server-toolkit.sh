@@ -1,7 +1,7 @@
 #!/bin/bash
 set -u
 
-SERVER_TOOLKIT_VERSION="v2.9"
+SERVER_TOOLKIT_VERSION="v2.10"
 
 # ---------- v2.9 reinstall state: all globals have defaults under set -u ----------
 REINSTALL_UPSTREAM_URL="https://raw.githubusercontent.com/leitbogioro/Tools/master/Linux_reinstall/InstallNET.sh"
@@ -20,11 +20,12 @@ DOWNLOADED_SCRIPT_URL=""
 
 
 # ============================================================
-# server-toolkit.sh v2.9
+# server-toolkit.sh v2.10
 # 适用：Debian 10/11/12/13/testing/sid、Ubuntu 20.04/22.04/24.04/26.04、
 #      CentOS 7/Stream 8/9/10、RHEL 8/9/10、Alma/Rocky/Oracle、
 #      Fedora、Amazon Linux 2/2023。
 # 原则：先备份、先检测、尽量不破坏当前 SSH 会话；危险操作默认取消并使用数字确认。
+# v2.10 定点修复：仅修复重装 Success 后镜像探测/下载静默等待；其余功能和 UI 保持 v2.9。
 # v2.9 摘要：修复重装/远程执行管道等待，完成后直接返回主菜单；恢复 Linux 重装密码输入；
 #            密码输入和参数摘要明文显示；校验上游密码传递并只修改留档的执行副本；
 #            修复 NTP EOF、端口十进制、GRUB 精确参数、sysctl 写入、cron 状态与卸载残留。
@@ -4134,13 +4135,81 @@ reinstall_password_applicable() {
   esac
 }
 
+reinstall_patch_success_wait() {
+  # Only edit the downloaded execution copy. The original, menus and other modules stay unchanged.
+  # Upstream reference: leitbogioro/Tools Linux_reinstall/InstallNET.sh, verified 2026-10-13.
+  # After Check DIST / Success, verifyUrlValidationOfDdImages used an unbounded silent curl.
+  local file="${1:-}" tmp="" replacement="" probe=""
+  [ -s "$file" ] && [ ! -L "$file" ] || return 1
+  probe=$(cat <<'EOF_STK_DD_PROBE_OLD'
+tmpURLCheck=$(echo $(curl -s -I -X GET $1) | grep -wi "http/[0-9]*" | awk '{print $2}')
+EOF_STK_DD_PROBE_OLD
+)
+  tmp="$(mktemp "${file}.success-fix.XXXXXX")" || return 1
+  replacement="$(mktemp "${file}.probe.XXXXXX")" || { rm -f -- "$tmp"; return 1; }
+  if ! cat > "$replacement" <<'EOF_STK_DD_PROBE_NEW'
+	# server-toolkit: bounded image probe; Success is a stage marker, not installation completion.
+	local _stk_probe_rc=0
+	printf '\n[server-toolkit] 发行版检查已通过，正在检查镜像（每次请求最多 30 秒）：%s\n' "$1" >&2
+	tmpURLCheck="$(curl -sS -L --head --connect-timeout 10 --max-time 30 --retry 0 --max-redirs 5 -o /dev/null -w '%{http_code}' --url "$1")" || _stk_probe_rc=$?
+	if [ "$_stk_probe_rc" -eq 0 ]; then
+		case "$tmpURLCheck" in
+			400|403|405|501)
+				printf '[server-toolkit] 镜像站拒绝 HEAD，改用有限 GET 探测（最多 30 秒）。\n' >&2
+				tmpURLCheck="$(curl -sS -L --range 0-0 --max-filesize 1048576 --connect-timeout 10 --max-time 30 --retry 0 --max-redirs 5 -o /dev/null -w '%{http_code}' --url "$1")" || _stk_probe_rc=$?
+				# A server may ignore Range. Exit 63 is the intentional size cap, not a failed HEAD.
+				if [[ "$_stk_probe_rc" -eq 63 && "$tmpURLCheck" =~ ^2[0-9][0-9]$ ]]; then _stk_probe_rc=0; fi
+				;;
+		esac
+	fi
+	if [[ "$_stk_probe_rc" -ne 0 || ! "$tmpURLCheck" =~ ^2[0-9][0-9]$ ]]; then
+		printf '[Error] 镜像检查失败或超时：curl=%s HTTP=%s URL=%s\n' "$_stk_probe_rc" "${tmpURLCheck:-000}" "$1" >&2
+		printf '[Error] 已停止重装准备，请检查 install.log；不要把 Success 当作安装完成而直接 reboot。\n' >&2
+		exit 1
+	fi
+EOF_STK_DD_PROBE_NEW
+  then
+    rm -f -- "$tmp" "$replacement"
+    return 1
+  fi
+  if ! awk -v probe="$probe" -v replacement="$replacement" '
+    {
+      line=$0; trimmed=line; sub(/^[ \t]+/, "", trimmed); sub(/[ \t]+$/, "", trimmed)
+      if (trimmed ~ /^(function[ \t]+)?verifyUrlValidationOfDdImages[ \t]*\(\)/) definitions++
+      if (trimmed==probe) {
+        while ((read_rc=(getline added < replacement))>0) print added
+        if (read_rc<0) failed=1
+        close(replacement); replaced++; next
+      }
+      # Bound only the preparation-stage boot-file downloads; do not touch generated OS scripts.
+      if (index(trimmed,"# Installation Starting")) downloads=1
+      if (index(trimmed,"# Grub config start")) downloads=0
+      if (downloads && trimmed ~ /^wget --no-check-certificate -qO / &&
+          (index(line,"/tmp/initrd.img") || index(line,"/tmp/vmlinuz") || index(line,"/boot/images/netboot.xyz.iso")))
+        sub(/wget --no-check-certificate -qO /,"wget --no-check-certificate --timeout=30 --tries=2 --no-verbose -O ",line)
+      print line
+    }
+    END {
+      # No such probe: nothing to fix (e.g. native-only/test scripts). Changed/duplicate anchors: stop.
+      if (failed || definitions>1 || replaced>1 || (definitions>0 && replaced!=1) || (replaced>0 && definitions!=1)) exit 42
+    }
+  ' "$file" > "$tmp" || ! bash -n "$tmp"; then
+    rm -f -- "$tmp" "$replacement"
+    echo_error "上游镜像检查代码已变化，无法安全应用 Success 等待修复；未执行重装。"
+    return 1
+  fi
+  rm -f -- "$replacement"
+  if ! chmod 600 "$tmp" || ! mv -- "$tmp" "$file"; then rm -f -- "$tmp"; return 1; fi
+}
+
 reinstall_prepare_runtime_script() {
   local source="${1:-}" dest="${2:-}" temp="" guard="" quoted_word=""
   [ -s "$source" ] && [ -n "$dest" ] && [ "$source" != "$dest" ] || return 1
   [ ! -L "$dest" ] || return 1
   # Keep original byte-for-byte. Fail closed if upstream changes the known anchor.
   if ! reinstall_password_applicable; then
-    cp -p -- "$source" "$dest" && chmod 600 "$dest"
+    cp -p -- "$source" "$dest" && chmod 600 "$dest" || return 1
+    reinstall_patch_success_wait "$dest"
     return $?
   fi
   guard=$(cat <<'EOF_STK_PASSWORD_GUARD'
@@ -4168,6 +4237,7 @@ EOF_STK_PASSWORD_GUARD
   fi
   if ! bash -n "$temp"; then rm -f -- "$temp"; return 1; fi
   chmod 600 "$temp" && mv -- "$temp" "$dest" || { rm -f -- "$temp"; return 1; }
+  reinstall_patch_success_wait "$dest" || return 1
   echo_info "执行副本已修正 Alpine 中转覆盖密码及 OpenSSL 参数引用；下载原件不变。"
 }
 
